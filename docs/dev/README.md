@@ -48,6 +48,7 @@ $ make pr
 ## Contents
 
 - [Architecture](./architecture.md)
+- [IGRA-Kaspa Integration Plan](./igra-kaspa-integration-plan.md)
 - [Cheatcodes](./cheatcodes.md)
 - [Debugging](./debugging.md)
 - [Scripting](./scripting.md)
