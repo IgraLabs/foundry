@@ -32,6 +32,7 @@ use foundry_cli::{
 use foundry_common::{
     CONTRACT_MAX_SIZE, ContractsByArtifact, SELECTOR_LEN,
     abi::{encode_function_args, get_func},
+    igra::ensure_supported_igra_signer_flow,
     shell,
 };
 use foundry_compilers::ArtifactId;
@@ -230,6 +231,7 @@ impl ScriptArgs {
         let script_wallets = Wallets::new(self.wallets.get_multi_wallet().await?, self.evm.sender);
 
         let (config, mut evm_opts) = self.load_config_and_evm_opts()?;
+        self.ensure_supported_igra_write_path_signer_flow(&config)?;
 
         if let Some(sender) = self.maybe_load_private_key()? {
             evm_opts.sender = sender;
@@ -495,6 +497,19 @@ impl ScriptArgs {
     /// We only broadcast transactions if --broadcast, --resume, or --verify was passed.
     fn should_broadcast(&self) -> bool {
         self.broadcast || self.resume || self.verify
+    }
+
+    fn ensure_supported_igra_write_path_signer_flow(&self, config: &Config) -> Result<()> {
+        if !self.should_broadcast() {
+            return Ok(());
+        }
+
+        ensure_supported_igra_signer_flow(
+            config,
+            "forge script",
+            self.unlocked,
+            self.wallets.browser,
+        )
     }
 }
 
@@ -959,5 +974,155 @@ mod tests {
             "SolveTutorial",
         ]);
         assert!(args.with_gas_price.unwrap().is_zero());
+    }
+
+    fn enabled_igra_config() -> Config {
+        let mut config = Config::default();
+        config.igra.enabled = true;
+        config.igra.el_rpc_url = Some("http://127.0.0.1:8545".to_string());
+        config.igra.kaspa_rpc_url = Some("grpc://127.0.0.1:16110".to_string());
+        config.igra.expected_el_chain_id = Some(1337);
+        config.igra.kaspa_network = Some("testnet-10".to_string());
+        config.igra.tx_id_prefix = Some("97b1".to_string());
+        config.igra.el_receipt_timeout_secs = Some(300);
+        config
+    }
+
+    fn disabled_igra_config() -> Config {
+        Config::default()
+    }
+
+    #[test]
+    fn guardrails_reject_unlocked_flow_when_igra_enabled_and_broadcast() {
+        let args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "Contract.sol",
+            "--broadcast",
+            "--sender",
+            "0x4e59b44847b379578588920ca78fbf26c0b4956c",
+            "--unlocked",
+        ]);
+        let err = args
+            .ensure_supported_igra_write_path_signer_flow(&enabled_igra_config())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IGRA_SIG_001"));
+        assert!(err.contains("--unlocked"));
+    }
+
+    #[test]
+    fn guardrails_reject_browser_flow_when_igra_enabled_and_broadcast() {
+        let args =
+            ScriptArgs::parse_from(["foundry-cli", "Contract.sol", "--broadcast", "--browser"]);
+        let err = args
+            .ensure_supported_igra_write_path_signer_flow(&enabled_igra_config())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IGRA_SIG_001"));
+        assert!(err.contains("browser wallet"));
+    }
+
+    #[test]
+    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_resume_without_broadcast()
+    {
+        let unlocked_args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "Contract.sol",
+            "--resume",
+            "--sender",
+            "0x4e59b44847b379578588920ca78fbf26c0b4956c",
+            "--unlocked",
+        ]);
+        assert!(unlocked_args.should_broadcast());
+        let unlocked_err = unlocked_args
+            .ensure_supported_igra_write_path_signer_flow(&enabled_igra_config())
+            .unwrap_err()
+            .to_string();
+        assert!(unlocked_err.contains("IGRA_SIG_001"));
+        assert!(unlocked_err.contains("--unlocked"));
+
+        let browser_args =
+            ScriptArgs::parse_from(["foundry-cli", "Contract.sol", "--resume", "--browser"]);
+        assert!(browser_args.should_broadcast());
+        let browser_err = browser_args
+            .ensure_supported_igra_write_path_signer_flow(&enabled_igra_config())
+            .unwrap_err()
+            .to_string();
+        assert!(browser_err.contains("IGRA_SIG_001"));
+        assert!(browser_err.contains("browser wallet"));
+    }
+
+    #[test]
+    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_verify_without_broadcast()
+    {
+        let mut unlocked_args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "Contract.sol",
+            "--sender",
+            "0x4e59b44847b379578588920ca78fbf26c0b4956c",
+            "--unlocked",
+        ]);
+        unlocked_args.verify = true;
+        assert!(unlocked_args.should_broadcast());
+        let unlocked_err = unlocked_args
+            .ensure_supported_igra_write_path_signer_flow(&enabled_igra_config())
+            .unwrap_err()
+            .to_string();
+        assert!(unlocked_err.contains("IGRA_SIG_001"));
+        assert!(unlocked_err.contains("--unlocked"));
+
+        let mut browser_args = ScriptArgs::parse_from(["foundry-cli", "Contract.sol", "--browser"]);
+        browser_args.verify = true;
+        assert!(browser_args.should_broadcast());
+        let browser_err = browser_args
+            .ensure_supported_igra_write_path_signer_flow(&enabled_igra_config())
+            .unwrap_err()
+            .to_string();
+        assert!(browser_err.contains("IGRA_SIG_001"));
+        assert!(browser_err.contains("browser wallet"));
+    }
+
+    #[test]
+    fn guardrails_allow_supported_signer_flow_when_igra_enabled_and_broadcast() {
+        let args = ScriptArgs::parse_from(["foundry-cli", "Contract.sol", "--broadcast"]);
+        assert!(args.ensure_supported_igra_write_path_signer_flow(&enabled_igra_config()).is_ok());
+    }
+
+    #[test]
+    fn guardrails_allow_flow_when_igra_disabled() {
+        let args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "Contract.sol",
+            "--broadcast",
+            "--sender",
+            "0x4e59b44847b379578588920ca78fbf26c0b4956c",
+            "--unlocked",
+        ]);
+        assert!(args.ensure_supported_igra_write_path_signer_flow(&disabled_igra_config()).is_ok());
+    }
+
+    #[test]
+    fn guardrails_allow_non_broadcast_simulation_with_unlocked_or_browser_flags() {
+        let unlocked_args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "Contract.sol",
+            "--sender",
+            "0x4e59b44847b379578588920ca78fbf26c0b4956c",
+            "--unlocked",
+        ]);
+        assert!(!unlocked_args.should_broadcast());
+        assert!(
+            unlocked_args
+                .ensure_supported_igra_write_path_signer_flow(&enabled_igra_config())
+                .is_ok()
+        );
+
+        let browser_args = ScriptArgs::parse_from(["foundry-cli", "Contract.sol", "--browser"]);
+        assert!(!browser_args.should_broadcast());
+        assert!(
+            browser_args
+                .ensure_supported_igra_write_path_signer_flow(&enabled_igra_config())
+                .is_ok()
+        );
     }
 }

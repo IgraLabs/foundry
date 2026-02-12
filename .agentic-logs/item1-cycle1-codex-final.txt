@@ -1,0 +1,64 @@
+Implemented Item 1 with focused scope (config contract + validation + signer guardrails), without transport interception.
+
+**What changed**
+
+1. IGRA config schema + validation in `foundry-config`
+- Added new config type: `crates/config/src/igra.rs:8`
+  - Fields:
+    - `enabled`
+    - `el_rpc_url`
+    - `kaspa_rpc_url`
+    - `expected_el_chain_id`
+    - `kaspa_network`
+    - `tx_id_prefix`
+    - `el_receipt_timeout_secs`
+- Added fail-fast validation (`IgraConfig::validate`) with explicit IGRA config errors: `crates/config/src/igra.rs:26`
+- Wired into global `Config`:
+  - module export: `crates/config/src/lib.rs:113`
+  - struct field: `crates/config/src/lib.rs:495`
+  - standalone section list (`[igra]` env/toml plumbing): `crates/config/src/lib.rs:704`
+  - helper method: `crates/config/src/lib.rs:761`
+  - default config init: `crates/config/src/lib.rs:2641`
+
+2. Precedence support via existing plumbing
+- By adding `igra` to `STANDALONE_SECTIONS`, existing `FOUNDRY_...` mapping now handles keys like `FOUNDRY_IGRA_ENABLED`, `FOUNDRY_IGRA_EL_RPC_URL`, etc. (`crates/config/src/lib.rs:704`).
+- Added parser/env precedence tests:
+  - `crates/config/src/lib.rs:4889`
+  - `crates/config/src/lib.rs:4918`
+
+3. Startup validation helper + guardrail helper
+- Added shared IGRA startup/guardrail helper module:
+  - `crates/common/src/igra.rs:1`
+  - exported in `crates/common/src/lib.rs:27`
+- Includes explicit guardrail code for unsupported signer flows:
+  - `IGRA_SIG_001` (`crates/common/src/igra.rs:7`)
+
+4. Guardrails in command paths
+- `cast send`:
+  - validation/guardrail check at startup path: `crates/cast/src/cmd/send.rs:123`
+  - command-specific guardrail helper + tests: `crates/cast/src/cmd/send.rs:319`
+- `forge create`:
+  - validation/guardrail check at startup path: `crates/forge/src/cmd/create.rs:115`
+  - command-specific guardrail helper + tests: `crates/forge/src/cmd/create.rs:481`
+  - tests: `crates/forge/src/cmd/create.rs:721`
+
+5. Snapshot/config test updates
+- Updated forge config fixture expectations for new `[igra]` section/default JSON:
+  - `crates/forge/tests/cli/config.rs:218`
+  - `crates/forge/tests/cli/config.rs:1400`
+- Added missing `igra` field in a full `Config` literal used by tests:
+  - `crates/forge/tests/cli/config.rs:362`
+
+**Targeted tests run**
+
+- `cargo test -p foundry-config test_igra_` -> **2 passed**
+- `cargo test -p foundry-config igra::tests::` -> **3 passed**
+- `cargo test -p foundry-common igra::tests::` -> **3 passed**
+- `cargo test -p cast cmd::send::tests::` -> **3 passed**
+- `cargo test -p forge --lib cmd::create::tests::` -> **8 passed**
+- `cargo test -p forge --test cli config::can_extract_config_values -- --exact` -> **1 passed**
+- `cargo test -p forge --test cli config::test_default_config -- --exact` -> **1 passed**
+
+Note: an initial run of `cargo test -p forge cmd::create::tests::` triggered unrelated `forge --test ui` failures; reran with `--lib` for the intended targeted scope.
+
+No transport interception was added.

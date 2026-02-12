@@ -1,0 +1,102 @@
+## Code Review Findings
+
+### **CRITICAL**
+
+**1. crates/cast/src/cmd/send.rs:122** - **Missing error type import**
+```rust
+use foundry_common::igra::ensure_supported_igra_signer_flow;
+```
+- The function returns `Result<()>` but `Result` is not fully qualified
+- **Fix**: Either use `eyre::Result` or fully qualify as `-> eyre::Result<()>`
+
+**2. crates/forge/src/cmd/create.rs:485** - **Same missing error type**
+- Same issue: `Result<()>` without proper import context
+- **Fix**: Use `eyre::Result<()>` consistently
+
+### **HIGH**
+
+**3. Config precedence regression risk** - **crates/config/src/lib.rs:758-763**
+```rust
+pub fn validate_igra(&self) -> Result<(), IgraConfigError> {
+    self.igra.validate()
+}
+```
+- New validation method but **not called during config load**
+- IGRA config can be invalid at runtime despite `Config::load()` succeeding
+- **Fix**: Call `validate_igra()` in `from_provider()` or document why deferred validation is intentional
+
+**4. crates/cast/src/cmd/send.rs:123** - **Validation order**
+```rust
+let config = send_tx.eth.load_config()?;
+validate_igra_send_guardrails(&config, unlocked, send_tx.eth.wallet.browser)?;
+let provider = get_provider_with_curl(&config, send_tx.eth.rpc.curl)?;
+```
+- Guardrails run **after** config load but don't validate IGRA config completeness
+- If `igra.enabled=true` but fields missing, validation happens too late
+- **Fix**: Call `config.validate_igra()?` before guardrails or inside `ensure_supported_igra_signer_flow`
+
+**5. Same issue in crates/forge/src/cmd/create.rs:114**
+- No IGRA config validation before use
+- **Fix**: Add `config.validate_igra()?` after load
+
+### **MEDIUM**
+
+**6. crates/cast/src/cmd/send.rs:318-324** - **Unnecessary wrapper function**
+```rust
+fn validate_igra_send_guardrails(
+    config: &foundry_config::Config,
+    unlocked: bool,
+    browser_wallet: bool,
+) -> Result<()> {
+    ensure_supported_igra_signer_flow(config, "cast send", unlocked, browser_wallet)
+}
+```
+- Adds no value, just delegates to `ensure_supported_igra_signer_flow`
+- **Fix**: Call `ensure_supported_igra_signer_flow` directly at call site
+
+**7. Same in crates/forge/src/cmd/create.rs:481-488**
+- Identical unnecessary wrapper
+- **Fix**: Remove wrapper, call directly
+
+**8. Test duplication** - **Multiple files**
+```rust
+fn enabled_igra_config() -> Config { ... }
+```
+- Duplicated in `crates/cast/src/cmd/send.rs` and `crates/forge/src/cmd/create.rs`
+- **Fix**: Move to test utilities module or make public test helper
+
+### **LOW**
+
+**9. crates/config/src/lib.rs:706** - **Alphabetical ordering broken**
+```rust
+"fuzz",
+"invariant",
+"igra",  // Should be before "invariant"
+"labels",
+```
+- **Fix**: Move "igra" before "invariant" to maintain alphabetical order
+
+**10. Missing tests** - **Config validation edge cases**
+- No test for `igra.enabled=false` with missing fields (should pass)
+- No test for partial config (some fields set, others missing)
+- **Fix**: Add edge case coverage
+
+**11. crates/forge/tests/cli/config.rs:218** - **Incomplete default test**
+```toml
+[igra]
+enabled = false
+```
+- Only tests `enabled=false`, doesn't verify all fields are None
+- **Fix**: Assert other fields are properly defaulted
+
+### **NOTES**
+
+- **API compatibility**: New `Config.igra` field breaks binary compatibility if Config is constructed manually (unlikely in practice due to builder pattern)
+- **Untracked files**: `crates/common/src/igra.rs` and `crates/config/src/igra.rs` not shown - cannot review core implementation
+- **Missing**: No validation that IGRA is called **only** when enabled; tests only check error paths
+
+### **Summary**
+- 2 critical import issues (compilation may fail)
+- Config validation bypassed at load time (runtime failures possible)
+- Unnecessary abstraction layers
+- Test duplication and coverage gaps

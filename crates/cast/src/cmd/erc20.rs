@@ -8,7 +8,7 @@ use crate::{
 use alloy_eips::{BlockId, Encodable2718};
 use alloy_ens::NameOrAddress;
 use alloy_network::{AnyNetwork, EthereumWallet, TransactionBuilder};
-use alloy_primitives::{U64, U256};
+use alloy_primitives::{U64, U256, hex};
 use alloy_provider::Provider;
 use alloy_rpc_types::TransactionRequest;
 use alloy_serde::WithOtherFields;
@@ -125,6 +125,11 @@ async fn send_erc20_tx<P: Provider<AnyNetwork>>(
         let mut raw_tx = Vec::with_capacity(signed_tx.encode_2718_len());
         signed_tx.encode_2718(&mut raw_tx);
 
+        if send_tx.dry_run {
+            sh_println!("{}", hex::encode_prefixed(&raw_tx))?;
+            return Ok(());
+        }
+
         let cast = CastTxSender::new(&provider);
         let pending_tx = cast.send_raw(&raw_tx).await?;
         let tx_hash = pending_tx.inner().tx_hash();
@@ -143,7 +148,16 @@ async fn send_erc20_tx<P: Provider<AnyNetwork>>(
     }
 
     // Use the normal cast_send path for non-Tempo transactions
-    cast_send(provider, tx, send_tx.cast_async, send_tx.sync, send_tx.confirmations, timeout).await
+    cast_send(
+        provider,
+        tx,
+        send_tx.cast_async,
+        send_tx.sync,
+        send_tx.confirmations,
+        timeout,
+        send_tx.dry_run,
+    )
+    .await
 }
 /// Interact with ERC20 tokens.
 #[derive(Debug, Parser, Clone)]

@@ -14,12 +14,14 @@ use alloy_provider::Provider;
 use alloy_rpc_types::{BlockId, BlockNumberOrTag::Latest};
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use foundry_cli::{utils, utils::LoadConfig};
 use foundry_common::{
     abi::{get_error, get_event},
     fmt::{format_tokens, format_uint_exp, serialize_value_as_json},
     fs,
+    igra::error_catalog_entry,
+    igra_store::{IgraStore, IgraStoreConfig},
     selectors::{
         ParsedSignatures, SelectorImportData, SelectorKind, decode_calldata, decode_event_topic,
         decode_function_selector, decode_selectors, import_selectors, parse_signatures,
@@ -524,12 +526,34 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::Receipt { tx_hash, field, cast_async, confirmations, rpc } => {
             let config = rpc.load_config()?;
             let provider = utils::get_provider(&config)?;
-            sh_println!(
-                "{}",
-                CastTxSender::new(provider)
-                    .receipt(tx_hash, field, confirmations, None, cast_async)
-                    .await?
-            )?
+            let timeout =
+                config.igra.enabled.then_some(config.igra.el_receipt_timeout_secs).flatten();
+            let receipt = CastTxSender::new(provider)
+                .receipt(tx_hash.clone(), field.clone(), confirmations, timeout, cast_async)
+                .await?;
+
+            if config.igra.enabled && field.is_none() && shell::is_json() {
+                let mut receipt_json: serde_json::Value =
+                    serde_json::from_str(&receipt).wrap_err("failed to decode receipt JSON")?;
+                let igra_json =
+                    load_igra_status_json(&config, &tx_hash)?.unwrap_or(serde_json::Value::Null);
+                if let Some(obj) = receipt_json.as_object_mut() {
+                    obj.insert("igra".to_string(), igra_json);
+                }
+                sh_println!("{}", serde_json::to_string(&receipt_json)?)?;
+            } else {
+                sh_println!("{receipt}")?;
+            }
+        }
+        CastSubcommand::IgraStatus { tx_hash, rpc } => {
+            let config = rpc.load_config()?;
+            if !config.igra.enabled {
+                eyre::bail!("IGRA mode is not enabled in the active Foundry config")
+            }
+
+            let status = load_igra_status_json(&config, &tx_hash)?
+                .ok_or_else(|| eyre::eyre!("IGRA tx not found in local cache: {tx_hash}"))?;
+            sh_println!("{}", serde_json::to_string(&status)?)?;
         }
         CastSubcommand::Run(cmd) => cmd.run().await?,
         CastSubcommand::SendTx(cmd) => cmd.run().await?,
@@ -784,4 +808,49 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn load_igra_status_json(
+    config: &foundry_config::Config,
+    tx_hash: &str,
+) -> Result<Option<serde_json::Value>> {
+    let store = IgraStore::open_read_only(IgraStoreConfig {
+        kaspa_network: config.igra.kaspa_network.clone(),
+        expected_el_chain_id: config.igra.expected_el_chain_id,
+        el_rpc_url: config.igra.el_rpc_url.clone(),
+        kaspa_rpc_url: config.igra.kaspa_rpc_url.clone(),
+        ..Default::default()
+    })?;
+
+    let Some(record) = store.load_tx(tx_hash)? else {
+        return Ok(None);
+    };
+    let error_catalog =
+        record.last_error_code.as_deref().and_then(error_catalog_entry).map(|entry| {
+            serde_json::json!({
+                "code": entry.code,
+                "message": entry.message,
+                "remediation": entry.remediation
+            })
+        });
+
+    Ok(Some(serde_json::json!({
+        "l2_tx_hash": record.l2_tx_hash,
+        "sender": record.sender,
+        "l2_nonce": record.l2_nonce,
+        "payload_nonce": record.payload_nonce,
+        "kaspa_tx_id": record.kaspa_tx_id,
+        "state": record.state.as_str(),
+        "chain_id": record.chain_id,
+        "kaspa_network": record.kaspa_network,
+        "el_rpc_fingerprint": record.el_rpc_fingerprint,
+        "kaspa_rpc_fingerprint": record.kaspa_rpc_fingerprint,
+        "correlation_id": record.correlation_id,
+        "attempts": record.attempts,
+        "last_error_code": record.last_error_code,
+        "last_error_message": record.last_error_message,
+        "error_catalog": error_catalog,
+        "created_at_ms": record.created_at_ms,
+        "updated_at_ms": record.updated_at_ms
+    })))
 }

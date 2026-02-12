@@ -110,6 +110,9 @@ pub use fuzz::{FuzzConfig, FuzzCorpusConfig, FuzzDictionaryConfig};
 mod invariant;
 pub use invariant::InvariantConfig;
 
+mod igra;
+pub use igra::{IgraConfig, IgraConfigError};
+
 mod inline;
 pub use inline::{InlineConfig, InlineConfigError, NatSpec};
 
@@ -488,6 +491,8 @@ pub struct Config {
     pub doc: DocConfig,
     /// Configuration for `forge bind-json`
     pub bind_json: BindJsonConfig,
+    /// Configuration for IGRA mode.
+    pub igra: IgraConfig,
     /// Configures the permissions of cheat codes that touch the file system.
     ///
     /// This includes what operations can be executed (read, write)
@@ -699,6 +704,7 @@ impl Config {
         "doc",
         "fuzz",
         "invariant",
+        "igra",
         "labels",
         "dependencies",
         "soldeer",
@@ -750,6 +756,11 @@ impl Config {
     #[track_caller]
     pub fn load_with_root(root: impl AsRef<Path>) -> Result<Self, ExtractConfigError> {
         Self::from_provider(Self::figment_with_root(root.as_ref()))
+    }
+
+    /// Validates IGRA settings when IGRA mode is enabled.
+    pub fn validate_igra(&self) -> Result<(), IgraConfigError> {
+        self.igra.validate()
     }
 
     /// Loads the `Config` from the given root directory, allowing profile fallback.
@@ -2630,6 +2641,7 @@ impl Default for Config {
             lint: Default::default(),
             doc: Default::default(),
             bind_json: Default::default(),
+            igra: Default::default(),
             labels: Default::default(),
             unchecked_cheatcode_artifacts: false,
             create2_library_salt: Self::DEFAULT_CREATE2_LIBRARY_SALT,
@@ -4872,6 +4884,57 @@ mod tests {
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_igra_standalone_section_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r"
+                [igra]
+                enabled = false
+                el_rpc_url = 'http://127.0.0.1:8545'
+                kaspa_rpc_url = 'grpc://127.0.0.1:16110'
+                expected_el_chain_id = 1337
+                kaspa_network = 'testnet-10'
+                tx_id_prefix = '97b1'
+                el_receipt_timeout_secs = 300
+            ",
+            )?;
+
+            jail.set_env("FOUNDRY_IGRA_ENABLED", "true");
+            jail.set_env("FOUNDRY_IGRA_EL_RPC_URL", "http://localhost:9545");
+
+            let config = Config::load().unwrap();
+            assert!(config.igra.enabled);
+            assert_eq!(config.igra.el_rpc_url.as_deref(), Some("http://localhost:9545"));
+            assert_eq!(config.igra.kaspa_network.as_deref(), Some("testnet-10"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_igra_validation_from_config() {
+        let mut config = Config::default();
+
+        assert!(config.validate_igra().is_ok());
+
+        config.igra.enabled = true;
+        assert_eq!(
+            config.validate_igra().unwrap_err().to_string(),
+            "IGRA config error: `el_rpc_url` is required when `igra.enabled=true`"
+        );
+
+        config.igra.el_rpc_url = Some("http://127.0.0.1:8545".to_string());
+        config.igra.kaspa_rpc_url = Some("grpc://127.0.0.1:16110".to_string());
+        config.igra.expected_el_chain_id = Some(1337);
+        config.igra.kaspa_network = Some("testnet-10".to_string());
+        config.igra.tx_id_prefix = Some("97b1".to_string());
+        config.igra.el_receipt_timeout_secs = Some(300);
+
+        assert!(config.validate_igra().is_ok());
     }
 
     #[test]

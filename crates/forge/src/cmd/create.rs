@@ -19,6 +19,7 @@ use foundry_cli::{
 use foundry_common::{
     compile::{self},
     fmt::parse_tokens,
+    igra::ensure_supported_igra_signer_flow,
     shell,
 };
 use foundry_compilers::{
@@ -111,6 +112,12 @@ impl CreateArgs {
             // need to re-configure here to also catch additional remappings
             config = self.load_config()?;
         }
+        ensure_supported_igra_signer_flow(
+            &config,
+            "forge create",
+            self.unlocked,
+            self.eth.wallet.browser,
+        )?;
 
         // Find Project & Compile
         let project = config.project()?;
@@ -694,5 +701,69 @@ mod tests {
         let constructor: Constructor = serde_json::from_str(r#"{"type":"constructor","inputs":[{"name":"_name","type":"int256","internalType":"int256"}],"stateMutability":"nonpayable"}"#).unwrap();
         let params = args.parse_constructor_args(&constructor, &args.constructor_args).unwrap();
         assert_eq!(params, vec![DynSolValue::Int(I256::unchecked_from(-5), 256)]);
+    }
+
+    fn enabled_igra_config() -> Config {
+        let mut config = Config::default();
+        config.igra.enabled = true;
+        config.igra.el_rpc_url = Some("http://127.0.0.1:8545".to_string());
+        config.igra.kaspa_rpc_url = Some("grpc://127.0.0.1:16110".to_string());
+        config.igra.expected_el_chain_id = Some(1337);
+        config.igra.kaspa_network = Some("testnet-10".to_string());
+        config.igra.tx_id_prefix = Some("97b1".to_string());
+        config.igra.el_receipt_timeout_secs = Some(300);
+        config
+    }
+
+    fn disabled_igra_config() -> Config {
+        Config::default()
+    }
+
+    #[test]
+    fn guardrails_reject_unlocked_flow() {
+        let err =
+            ensure_supported_igra_signer_flow(&enabled_igra_config(), "forge create", true, false)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("IGRA_SIG_001"));
+        assert!(err.contains("--unlocked"));
+    }
+
+    #[test]
+    fn guardrails_reject_browser_flow() {
+        let err =
+            ensure_supported_igra_signer_flow(&enabled_igra_config(), "forge create", false, true)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("IGRA_SIG_001"));
+        assert!(err.contains("browser wallet"));
+    }
+
+    #[test]
+    fn guardrails_allow_supported_flow() {
+        assert!(
+            ensure_supported_igra_signer_flow(&enabled_igra_config(), "forge create", false, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn guardrails_reject_missing_required_config_when_enabled() {
+        let mut config = enabled_igra_config();
+        config.igra.el_rpc_url = None;
+
+        let err = ensure_supported_igra_signer_flow(&config, "forge create", false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IGRA config error"));
+        assert!(err.contains("el_rpc_url"));
+    }
+
+    #[test]
+    fn guardrails_allow_missing_config_when_disabled() {
+        assert!(
+            ensure_supported_igra_signer_flow(&disabled_igra_config(), "forge create", true, true)
+                .is_ok()
+        );
     }
 }

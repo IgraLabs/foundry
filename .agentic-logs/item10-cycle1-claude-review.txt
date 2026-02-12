@@ -1,0 +1,180 @@
+# Code Review - IGRA Kaspa Integration
+
+## CRITICAL ISSUES (Must Fix)
+
+### 1. **crates/script/src/lib.rs:1088-1098** - Guardrail bypass in simulation mode
+**Severity:** HIGH - Correctness regression  
+**Issue:** `ensure_supported_igra_write_path_signer_flow` only checks guardrails when `should_broadcast()` returns true. However, `should_broadcast()` returns true if `self.resume || self.verify` is set, even without `--broadcast`. A user running `--resume` or `--verify` with unsupported signers would bypass the guardrail.
+
+**Fix:**
+```rust
+fn ensure_supported_igra_write_path_signer_flow(&self, config: &Config) -> Result<()> {
+    // Only skip guardrails for pure simulation (no broadcast, resume, or verify)
+    if !self.broadcast && !self.resume && !self.verify {
+        return Ok(());
+    }
+    
+    ensure_supported_igra_signer_flow(
+        config,
+        "forge script",
+        self.unlocked,
+        self.wallets.browser,
+    )
+}
+```
+
+### 2. **crates/cast/src/tx.rs:504-549** - Receipt polling timeout not enforced atomically
+**Severity:** HIGH - Timeout regression  
+**Issue:** The custom polling loop (lines 520-535) doesn't respect the initial `timeout_duration` properly. After the loop exits, there's a `remaining` calculation (line 542), but if the loop consumes nearly all the timeout, confirmations waiting may get zero/negative time, causing either immediate failure or hanging.
+
+**Fix:**
+```rust
+// Line 542-549: Check remaining time before waiting for confirmations
+let remaining = timeout_duration
+    .checked_sub(start.elapsed())
+    .ok_or_else(|| eyre::eyre!(
+        "timeout exceeded while waiting for tx receipt: {:?}",
+        tx_hash
+    ))?;
+
+if confs > 0 {
+    if remaining.is_zero() {
+        eyre::bail!("timeout exceeded before waiting for confirmations");
+    }
+    PendingTransactionBuilder::new(self.provider.root().clone(), tx_hash)
+        .with_required_confirmations(confs)
+        .with_timeout(Some(remaining))
+        .get_receipt()
+        .await?
+} else {
+    receipt
+}
+```
+
+### 3. **crates/common/src/igra_store.rs:703-727** - Race condition in prune_cache
+**Severity:** MEDIUM - Potential cache corruption  
+**Issue:** `enforce_size_budget` (line 729-769) is called inside `prune_cache` without holding a transaction lock. Between checking `current_size` (line 735) and executing DELETE (line 747), concurrent writes can occur. The loop at line 740 re-checks size, but the DELETE at line 747 and VACUUM at line 766 run outside any transaction.
+
+**Fix:**
+```rust
+fn prune_cache(&self) -> Result<(), IgraStoreError> {
+    let mut conn = self.open_connection()?;
+    let tx = conn.transaction()?;
+    // ... existing time-based pruning queries using tx, not conn ...
+    tx.commit()?;
+    
+    // Size enforcement must be serialized separately due to VACUUM requirement
+    self.enforce_size_budget(&conn)?;
+    Ok(())
+}
+```
+
+## HIGH PRIORITY ISSUES
+
+### 4. **crates/common/src/provider/igra_transport.rs:419-591** - Lock not released on early return paths
+**Severity:** MEDIUM - Deadlock risk  
+**Issue:** If mining times out (line 530), the function returns early with `Self::reject_error`. The lock cleanup at line 612-618 is never reached. Same for submission failure at line 559.
+
+**Fix:** Wrap the entire async block in a guard pattern or ensure lock release happens in all error paths before line 591.
+
+### 5. **crates/cast/src/args.rs:168-169** - Config timeout silently ignored when not enabled
+**Severity:** MEDIUM - Unexpected behavior  
+**Issue:** `timeout` is only set when `config.igra.enabled` is true, but `receipt()` call happens regardless. In non-IGRA mode, timeout will be `None`, causing the old behavior to be used inconsistently.
+
+**Fix:**
+```rust
+let timeout = config.igra.el_receipt_timeout_secs.filter(|_| config.igra.enabled);
+```
+
+### 6. **crates/common/src/igra_store.rs:656-701** - Profile reconciliation deletes all data without warning
+**Severity:** MEDIUM - Data loss risk  
+**Issue:** Profile change detection (lines 669-679) triggers `DELETE FROM tx_map`, `sender_nonce_state`, and `sender_locks` without logging or user notification. This is silent data destruction.
+
+**Fix:** Add structured logging before deletion:
+```rust
+if profile_changed {
+    info!(
+        "IGRA profile changed (chain_id or RPC fingerprint mismatch), \
+         purging local cache for safety"
+    );
+    tx.execute("DELETE FROM tx_map", [])?;
+    // ... rest
+}
+```
+
+## MEDIUM PRIORITY ISSUES
+
+### 7. **crates/common/src/igra_store.rs:522-527** - Nonce initialization doesn't validate state
+**Severity:** MEDIUM - Nonce safety  
+**Issue:** When no `sender_nonce_state` exists (line 521), code initializes `next_expected_nonce` to the incoming nonce. If the first observed nonce is 5, the store now expects 5, but nonces 0-4 were never validated. This could allow nonce gaps to go undetected.
+
+**Recommendation:** Document this as intended "first-seen" semantics or add a warning log.
+
+### 8. **crates/common/src/provider/igra_transport.rs:690-696** - Payload construction doesn't validate tx_type_nibble
+**Severity:** LOW-MEDIUM - Type safety  
+**Issue:** `build_igra_payload` trusts `tx_type_nibble` is in range 0-15. If caller passes invalid nibble (>15), header encoding silently masks it (line 691: `& 0x0f`).
+
+**Fix:** Add validation:
+```rust
+fn build_igra_payload(raw_tx: &[u8], tx_type_nibble: u8, payload_nonce: u32) -> Vec<u8> {
+    assert!(tx_type_nibble <= 0x0f, "tx_type_nibble must fit in 4 bits");
+    // ... rest
+}
+```
+
+### 9. **crates/common/src/igra_store.rs:729-769** - VACUUM runs unconditionally in hot loop
+**Severity:** LOW-MEDIUM - Performance  
+**Issue:** Line 766 runs `VACUUM` after every 1024-row deletion batch. VACUUM is expensive and locks the DB. For large evictions this could stall writes significantly.
+
+**Fix:** Only VACUUM once after all deletions complete, or add a batch counter limit.
+
+## TEST COVERAGE GAPS
+
+### 10. **scripts/igra/deterministic-harness.sh** - Missing error scenario tests
+**Issue:** Harness only runs passing unit tests. No explicit failure injection tests for:
+- Mining timeout behavior
+- Lock timeout recovery
+- Profile change cache invalidation edge cases  
+- Concurrent sender lock contention
+
+**Recommendation:** Add dedicated failure scenario tests in the harness or document them in `igra-kaspa-agentic-tracker.md`.
+
+### 11. **crates/script/src/lib.rs:1123-1187** - Test coverage missing `--resume` and `--verify` paths
+**Issue:** Tests at lines 1123-1164 only check `--broadcast` flag. No tests validate guardrails trigger when `--resume` or `--verify` are used without `--broadcast`.
+
+**Fix:** Add test cases:
+```rust
+#[test]
+fn guardrails_reject_unlocked_flow_with_resume() {
+    let args = ScriptArgs::parse_from([
+        "foundry-cli", "Contract.sol", "--resume", "--unlocked"
+    ]);
+    let err = args
+        .ensure_supported_igra_write_path_signer_flow(&enabled_igra_config())
+        .unwrap_err();
+    assert!(err.to_string().contains("IGRA_SIG_001"));
+}
+```
+
+## MINOR ISSUES (Nice to Have)
+
+### 12. **crates/config/src/igra.rs:73-77** - Odd-length prefix validation has misleading error
+**Issue:** Error says "even number of hex characters" but doesn't clarify whether `0x` prefix should be counted. Documentation ambiguous.
+
+### 13. **crates/cast/src/opts.rs:459** - Command alias `is` conflicts with shell keyword
+**Issue:** `visible_alias = "is"` for `igra-status` will fail in some shell contexts where `is` is reserved.
+
+---
+
+## Summary Statistics
+- **Critical:** 3 issues (correctness/timeout regressions)
+- **High:** 3 issues (deadlock, unexpected behavior, data loss)  
+- **Medium:** 3 issues (nonce safety, type safety, perf)
+- **Low/Coverage:** 5 issues (test gaps, minor UX)
+
+**Priority Order:**
+1. Fix script.rs guardrail bypass (#1)
+2. Fix tx.rs receipt timeout race (#2)  
+3. Fix igra_transport lock leak (#4)
+4. Add transaction guards to prune_cache (#3)
+5. Address remaining medium/low issues

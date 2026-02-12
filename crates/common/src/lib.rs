@@ -24,6 +24,8 @@ pub mod constants;
 pub mod contracts;
 pub mod errors;
 pub mod fs;
+pub mod igra;
+pub mod igra_store;
 pub mod iter;
 pub mod mapping_slots;
 mod preprocessor;

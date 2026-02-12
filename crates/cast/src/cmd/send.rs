@@ -3,6 +3,7 @@ use std::{path::PathBuf, str::FromStr, time::Duration};
 use alloy_eips::Encodable2718;
 use alloy_ens::NameOrAddress;
 use alloy_network::{AnyNetwork, EthereumWallet, TransactionBuilder};
+use alloy_primitives::hex;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::TransactionRequest;
 use alloy_serde::WithOtherFields;
@@ -13,6 +14,7 @@ use foundry_cli::{
     opts::TransactionOpts,
     utils::{LoadConfig, get_provider_with_curl},
 };
+use foundry_common::igra::ensure_supported_igra_signer_flow;
 use foundry_wallets::WalletSigner;
 
 use crate::tx::{self, CastTxBuilder, CastTxSender, SendTxOpts};
@@ -120,6 +122,12 @@ impl SendTxArgs {
         };
 
         let config = send_tx.eth.load_config()?;
+        ensure_supported_igra_signer_flow(
+            &config,
+            "cast send",
+            unlocked,
+            send_tx.eth.wallet.browser,
+        )?;
         let provider = get_provider_with_curl(&config, send_tx.eth.rpc.curl)?;
 
         if let Some(interval) = send_tx.poll_interval {
@@ -177,6 +185,7 @@ impl SendTxArgs {
                 send_tx.sync,
                 send_tx.confirmations,
                 timeout,
+                send_tx.dry_run,
             )
             .await
         // Case 2:
@@ -195,6 +204,10 @@ impl SendTxArgs {
                 && let WalletSigner::Browser(ref browser_signer) = signer
             {
                 let (tx_request, _) = builder.build(from).await?;
+                if send_tx.dry_run {
+                    sh_println!("{}", serde_json::to_string(&tx_request.into_inner())?)?;
+                    return Ok(());
+                }
                 let tx_hash =
                     browser_signer.send_transaction_via_browser(tx_request.into_inner()).await?;
 
@@ -229,6 +242,11 @@ impl SendTxArgs {
                 // Encode and send raw
                 let mut raw_tx = Vec::with_capacity(signed_tx.encode_2718_len());
                 signed_tx.encode_2718(&mut raw_tx);
+
+                if send_tx.dry_run {
+                    sh_println!("{}", hex::encode_prefixed(&raw_tx))?;
+                    return Ok(());
+                }
 
                 let cast = CastTxSender::new(&provider);
                 let pending_tx = cast.send_raw(&raw_tx).await?;
@@ -278,6 +296,7 @@ impl SendTxArgs {
                 send_tx.sync,
                 send_tx.confirmations,
                 timeout,
+                send_tx.dry_run,
             )
             .await
         }
@@ -291,8 +310,14 @@ pub(crate) async fn cast_send<P: Provider<AnyNetwork>>(
     sync: bool,
     confs: u64,
     timeout: u64,
+    dry_run: bool,
 ) -> Result<()> {
     let cast = CastTxSender::new(&provider);
+
+    if dry_run {
+        sh_println!("{}", serde_json::to_string(&tx)?)?;
+        return Ok(());
+    }
 
     if sync {
         // Send transaction and wait for receipt synchronously
@@ -312,4 +337,74 @@ pub(crate) async fn cast_send<P: Provider<AnyNetwork>>(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use foundry_common::igra::ensure_supported_igra_signer_flow;
+    use foundry_config::Config;
+
+    fn enabled_igra_config() -> Config {
+        let mut config = Config::default();
+        config.igra.enabled = true;
+        config.igra.el_rpc_url = Some("http://127.0.0.1:8545".to_string());
+        config.igra.kaspa_rpc_url = Some("grpc://127.0.0.1:16110".to_string());
+        config.igra.expected_el_chain_id = Some(1337);
+        config.igra.kaspa_network = Some("testnet-10".to_string());
+        config.igra.tx_id_prefix = Some("97b1".to_string());
+        config.igra.el_receipt_timeout_secs = Some(300);
+        config
+    }
+
+    fn disabled_igra_config() -> Config {
+        Config::default()
+    }
+
+    #[test]
+    fn guardrails_reject_unlocked_flow() {
+        let err =
+            ensure_supported_igra_signer_flow(&enabled_igra_config(), "cast send", true, false)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("IGRA_SIG_001"));
+        assert!(err.contains("--unlocked"));
+    }
+
+    #[test]
+    fn guardrails_reject_browser_flow() {
+        let err =
+            ensure_supported_igra_signer_flow(&enabled_igra_config(), "cast send", false, true)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("IGRA_SIG_001"));
+        assert!(err.contains("browser wallet"));
+    }
+
+    #[test]
+    fn guardrails_allow_supported_flow() {
+        assert!(
+            ensure_supported_igra_signer_flow(&enabled_igra_config(), "cast send", false, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn guardrails_reject_missing_required_config_when_enabled() {
+        let mut config = enabled_igra_config();
+        config.igra.el_rpc_url = None;
+
+        let err = ensure_supported_igra_signer_flow(&config, "cast send", false, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("IGRA config error"));
+        assert!(err.contains("el_rpc_url"));
+    }
+
+    #[test]
+    fn guardrails_allow_missing_config_when_disabled() {
+        assert!(
+            ensure_supported_igra_signer_flow(&disabled_igra_config(), "cast send", true, true)
+                .is_ok()
+        );
+    }
 }

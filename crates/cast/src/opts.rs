@@ -542,6 +542,16 @@ pub enum CastSubcommand {
         rpc: RpcOpts,
     },
 
+    /// Get IGRA lifecycle status from the local tx-map cache.
+    #[command(name = "igra-status", visible_alias = "is")]
+    IgraStatus {
+        /// The L2 transaction hash.
+        tx_hash: String,
+
+        #[command(flatten)]
+        rpc: RpcOpts,
+    },
+
     /// Sign and publish a transaction.
     #[command(name = "send", visible_alias = "s")]
     SendTx(SendTxArgs),

@@ -215,6 +215,9 @@ show_metrics = true
 show_solidity = false
 check_interval = 1
 
+[igra]
+enabled = false
+
 [labels]
 
 [vyper]
@@ -356,6 +359,7 @@ forgetest!(can_extract_config_values, |prj, cmd| {
         lint: Default::default(),
         doc: Default::default(),
         bind_json: Default::default(),
+        igra: Default::default(),
         fs_permissions: Default::default(),
         labels: Default::default(),
         isolate: true,
@@ -1392,6 +1396,15 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "out": "utils/JsonBindings.sol",
     "include": [],
     "exclude": []
+  },
+  "igra": {
+    "enabled": false,
+    "el_rpc_url": null,
+    "kaspa_rpc_url": null,
+    "expected_el_chain_id": null,
+    "kaspa_network": null,
+    "tx_id_prefix": null,
+    "el_receipt_timeout_secs": null
   },
   "fs_permissions": [
     {

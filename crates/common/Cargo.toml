@@ -61,6 +61,7 @@ num-format.workspace = true
 path-slash.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 semver.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

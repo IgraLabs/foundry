@@ -1,0 +1,42 @@
+## Code Review - `.agentic-logs/item10-cycle2.diff`
+
+### Severity: **MEDIUM**
+
+**Issue 1: Missing null safety check (lines 26-37)**
+- **Location**: `crates/script/src/lib.rs:498-510` (new function `ensure_supported_igra_write_path_signer_flow`)
+- **Problem**: The function calls `ensure_supported_igra_signer_flow` with `self.unlocked` and `self.wallets.browser`, but there's no verification that `self.wallets` is properly initialized before accessing its `browser` field.
+- **Fix**: Verify that `self.wallets` exists or handle potential panics. Based on the struct definition, this should be safe if `wallets` is always initialized, but confirm the invariant.
+
+### Severity: **LOW**
+
+**Issue 2: Test maintainability (lines 46-60)**
+- **Location**: Test helper functions `enabled_igra_config()` and `disabled_igra_config()`
+- **Problem**: Hardcoded configuration values in `enabled_igra_config()` (lines 48-55) could become stale. If default configuration changes, these tests may not reflect realistic configurations.
+- **Suggestion**: Consider using builder pattern or constants for test configurations to improve maintainability.
+
+**Issue 3: Test assertion coverage (lines 153-156)**
+- **Location**: `guardrails_allow_supported_signer_flow_when_igra_enabled_and_broadcast` test
+- **Problem**: This positive test only verifies `is_ok()` but doesn't validate *why* it's okay or what the expected behavior should be. It's a shallow assertion.
+- **Suggestion**: Add assertion explaining the expected supported flow (e.g., neither unlocked nor browser is set).
+
+### Severity: **INFO**
+
+**Observation 1: Consistent guard pattern**
+- The early return pattern (lines 27-29) correctly implements the intended behavior: guardrails only apply when `should_broadcast()` is true.
+- This aligns with the stated requirement that "write-path guardrails are intended when any of --broadcast, --resume, or --verify is active, while pure simulation bypasses them."
+
+**Observation 2: Test coverage**
+- Comprehensive test coverage for the guardrail logic:
+  - ✅ Rejects unsupported flows when IGRA enabled + broadcast
+  - ✅ Rejects unsupported flows for resume/verify paths
+  - ✅ Allows flows when IGRA disabled
+  - ✅ Allows simulation mode regardless of flags
+  - Good coverage of edge cases
+
+**Observation 3: Integration point**
+- The guardrail is called at line 17 in `preprocess()`, which is appropriate—it's early enough to fail fast before heavy computation, but after config loading.
+
+---
+
+### Summary
+**NO_BLOCKING_FINDINGS** - The implementation correctly enforces write-path guardrails per requirements. Medium-severity issue about potential null access needs verification but likely safe given struct design. Low-severity issues are maintainability improvements. The logic is sound and well-tested.

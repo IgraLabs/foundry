@@ -1,11 +1,17 @@
 //! Provider-related instantiation and usage utilities.
 
 pub mod curl_transport;
+pub mod igra_transport;
 pub mod runtime_transport;
 
 use crate::{
     ALCHEMY_FREE_TIER_CUPS, REQUEST_TIMEOUT,
-    provider::{curl_transport::CurlTransport, runtime_transport::RuntimeTransportBuilder},
+    igra_store::IgraStoreConfig,
+    provider::{
+        curl_transport::CurlTransport,
+        igra_transport::{IgraTransport, IgraTransportConfig},
+        runtime_transport::RuntimeTransportBuilder,
+    },
 };
 use alloy_chains::NamedChain;
 use alloy_network::{Network, NetworkWallet};
@@ -97,6 +103,12 @@ pub struct ProviderBuilder<N: Network = AnyNetwork> {
     no_proxy: bool,
     /// Whether to output curl commands instead of making requests.
     curl_mode: bool,
+    /// Whether to enable IGRA transport interception.
+    igra_enabled: bool,
+    /// IGRA persistence settings for the tx-map store.
+    igra_store_config: IgraStoreConfig,
+    /// IGRA runtime transport settings for raw tx submission.
+    igra_transport_config: IgraTransportConfig,
     /// Phantom data for the network type.
     _network: PhantomData<N>,
 }
@@ -151,6 +163,9 @@ impl<N: Network> ProviderBuilder<N> {
             accept_invalid_certs: false,
             no_proxy: false,
             curl_mode: false,
+            igra_enabled: false,
+            igra_store_config: IgraStoreConfig::default(),
+            igra_transport_config: IgraTransportConfig::default(),
             _network: PhantomData,
         }
     }
@@ -159,6 +174,8 @@ impl<N: Network> ProviderBuilder<N> {
     ///
     /// Defaults to `http://localhost:8545` and `Mainnet`.
     pub fn from_config(config: &Config) -> Result<Self> {
+        config.igra.validate().wrap_err("invalid IGRA configuration")?;
+
         let url = config.get_rpc_url_or_localhost_http()?;
         let mut builder = Self::new(url.as_ref());
 
@@ -179,6 +196,28 @@ impl<N: Network> ProviderBuilder<N> {
         if let Some(rpc_headers) = config.eth_rpc_headers.clone() {
             builder = builder.headers(rpc_headers);
         }
+
+        builder = builder.igra_enabled(config.igra.enabled);
+        builder = builder.igra_store_config(IgraStoreConfig {
+            kaspa_network: config.igra.kaspa_network.clone(),
+            expected_el_chain_id: config.igra.expected_el_chain_id,
+            el_rpc_url: config.igra.el_rpc_url.clone(),
+            kaspa_rpc_url: config.igra.kaspa_rpc_url.clone(),
+            sender_lock_timeout_secs: config.igra.sender_lock_timeout_secs,
+            completed_retention_hours: config.igra.completed_retention_hours,
+            failed_retention_hours: config.igra.failed_retention_hours,
+            max_db_size_mb: config.igra.max_db_size_mb,
+            ..Default::default()
+        });
+        builder = builder.igra_transport_config(IgraTransportConfig {
+            tx_id_prefix: config.igra.tx_id_prefix.clone(),
+            mining_timeout_secs: config
+                .igra
+                .mining_timeout_secs
+                .or(config.igra.el_receipt_timeout_secs),
+            kaspa_rpc_url: config.igra.kaspa_rpc_url.clone(),
+            kaspa_network: config.igra.kaspa_network.clone(),
+        });
 
         Ok(builder)
     }
@@ -301,6 +340,24 @@ impl<N: Network> ProviderBuilder<N> {
         self
     }
 
+    /// Sets whether to enable IGRA transport interception.
+    pub fn igra_enabled(mut self, igra_enabled: bool) -> Self {
+        self.igra_enabled = igra_enabled;
+        self
+    }
+
+    /// Sets IGRA persistence settings for the tx-map store.
+    pub fn igra_store_config(mut self, igra_store_config: IgraStoreConfig) -> Self {
+        self.igra_store_config = igra_store_config;
+        self
+    }
+
+    /// Sets IGRA runtime transport settings for payload mining/submission.
+    pub fn igra_transport_config(mut self, igra_transport_config: IgraTransportConfig) -> Self {
+        self.igra_transport_config = igra_transport_config;
+        self
+    }
+
     /// Constructs the `RetryProvider` taking all configs into account.
     pub fn build(self) -> Result<RetryProvider<N>> {
         let Self {
@@ -316,6 +373,9 @@ impl<N: Network> ProviderBuilder<N> {
             accept_invalid_certs,
             no_proxy,
             curl_mode,
+            igra_enabled,
+            igra_store_config,
+            igra_transport_config,
             ..
         } = self;
         let url = url?;
@@ -325,7 +385,13 @@ impl<N: Network> ProviderBuilder<N> {
 
         // If curl_mode is enabled, use CurlTransport instead of RuntimeTransport
         if curl_mode {
-            let transport = CurlTransport::new(url).with_headers(headers).with_jwt(jwt);
+            let transport = IgraTransport::new(
+                CurlTransport::new(url).with_headers(headers).with_jwt(jwt),
+                igra_enabled,
+            )
+            .with_transport_config(igra_transport_config.clone())
+            .try_with_store_config(igra_store_config.clone())
+            .map_err(|err| eyre::eyre!("failed to initialize IGRA store: {err}"))?;
             let client = ClientBuilder::default().layer(retry_layer).transport(transport, is_local);
 
             let provider = AlloyProviderBuilder::<_, _, N>::default()
@@ -334,13 +400,19 @@ impl<N: Network> ProviderBuilder<N> {
             return Ok(provider);
         }
 
-        let transport = RuntimeTransportBuilder::new(url)
-            .with_timeout(timeout)
-            .with_headers(headers)
-            .with_jwt(jwt)
-            .accept_invalid_certs(accept_invalid_certs)
-            .no_proxy(no_proxy)
-            .build();
+        let transport = IgraTransport::new(
+            RuntimeTransportBuilder::new(url)
+                .with_timeout(timeout)
+                .with_headers(headers)
+                .with_jwt(jwt)
+                .accept_invalid_certs(accept_invalid_certs)
+                .no_proxy(no_proxy)
+                .build(),
+            igra_enabled,
+        )
+        .with_transport_config(igra_transport_config)
+        .try_with_store_config(igra_store_config)
+        .map_err(|err| eyre::eyre!("failed to initialize IGRA store: {err}"))?;
         let client = ClientBuilder::default().layer(retry_layer).transport(transport, is_local);
 
         if !is_local {
@@ -384,6 +456,9 @@ impl<N: Network> ProviderBuilder<N> {
             accept_invalid_certs,
             no_proxy,
             curl_mode,
+            igra_enabled,
+            igra_store_config,
+            igra_transport_config,
             ..
         } = self;
         let url = url?;
@@ -393,7 +468,13 @@ impl<N: Network> ProviderBuilder<N> {
 
         // If curl_mode is enabled, use CurlTransport instead of RuntimeTransport
         if curl_mode {
-            let transport = CurlTransport::new(url).with_headers(headers).with_jwt(jwt);
+            let transport = IgraTransport::new(
+                CurlTransport::new(url).with_headers(headers).with_jwt(jwt),
+                igra_enabled,
+            )
+            .with_transport_config(igra_transport_config.clone())
+            .try_with_store_config(igra_store_config.clone())
+            .map_err(|err| eyre::eyre!("failed to initialize IGRA store: {err}"))?;
             let client = ClientBuilder::default().layer(retry_layer).transport(transport, is_local);
 
             let provider = AlloyProviderBuilder::<_, _, N>::default()
@@ -404,13 +485,19 @@ impl<N: Network> ProviderBuilder<N> {
             return Ok(provider);
         }
 
-        let transport = RuntimeTransportBuilder::new(url)
-            .with_timeout(timeout)
-            .with_headers(headers)
-            .with_jwt(jwt)
-            .accept_invalid_certs(accept_invalid_certs)
-            .no_proxy(no_proxy)
-            .build();
+        let transport = IgraTransport::new(
+            RuntimeTransportBuilder::new(url)
+                .with_timeout(timeout)
+                .with_headers(headers)
+                .with_jwt(jwt)
+                .accept_invalid_certs(accept_invalid_certs)
+                .no_proxy(no_proxy)
+                .build(),
+            igra_enabled,
+        )
+        .with_transport_config(igra_transport_config)
+        .try_with_store_config(igra_store_config)
+        .map_err(|err| eyre::eyre!("failed to initialize IGRA store: {err}"))?;
 
         let client = ClientBuilder::default().layer(retry_layer).transport(transport, is_local);
 
@@ -469,5 +556,30 @@ mod tests {
 
         let url = builder.url.unwrap();
         assert_eq!(url, Url::parse("http://localhost:8545").unwrap());
+    }
+
+    #[test]
+    fn from_config_validates_igra_settings() {
+        let mut config = Config::default();
+        config.igra.enabled = true;
+
+        let err = ProviderBuilder::<AnyNetwork>::from_config(&config).unwrap_err();
+        assert!(err.to_string().contains("invalid IGRA configuration"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn from_config_uses_explicit_mining_timeout() {
+        let mut config = Config::default();
+        config.igra.enabled = true;
+        config.igra.el_rpc_url = Some("http://127.0.0.1:8545".to_string());
+        config.igra.kaspa_rpc_url = Some("grpc://127.0.0.1:16110".to_string());
+        config.igra.expected_el_chain_id = Some(1337);
+        config.igra.kaspa_network = Some("testnet-10".to_string());
+        config.igra.tx_id_prefix = Some("97b1".to_string());
+        config.igra.el_receipt_timeout_secs = Some(300);
+        config.igra.mining_timeout_secs = Some(42);
+
+        let builder = ProviderBuilder::<AnyNetwork>::from_config(&config).unwrap();
+        assert_eq!(builder.igra_transport_config.mining_timeout_secs, Some(42));
     }
 }

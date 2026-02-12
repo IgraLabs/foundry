@@ -49,6 +49,7 @@ $ make pr
 
 - [Architecture](./architecture.md)
 - [IGRA-Kaspa Integration Plan](./igra-kaspa-integration-plan.md)
+- [IGRA Deterministic Harness](./igra-deterministic-harness.md)
 - [Cheatcodes](./cheatcodes.md)
 - [Debugging](./debugging.md)
 - [Scripting](./scripting.md)

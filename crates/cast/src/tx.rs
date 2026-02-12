@@ -27,7 +27,12 @@ use foundry_primitives::{FoundryTransactionRequest, FoundryTypedTx};
 use foundry_wallets::{WalletOpts, WalletSigner};
 use itertools::Itertools;
 use serde_json::value::RawValue;
-use std::{fmt::Write, str::FromStr, time::Duration};
+use std::{
+    fmt::Write,
+    str::FromStr,
+    time::{Duration, Instant},
+};
+use tokio::time::sleep;
 
 #[derive(Debug, Clone, Args)]
 pub struct SendTxOpts {
@@ -51,6 +56,10 @@ pub struct SendTxOpts {
     /// Polling interval for transaction receipts (in seconds).
     #[arg(long, alias = "poll-interval", env = "ETH_POLL_INTERVAL")]
     pub poll_interval: Option<u64>,
+
+    /// Build and validate the transaction, print payload, and exit without broadcasting.
+    #[arg(long, alias = "simulate")]
+    pub dry_run: bool,
 
     /// Ethereum options
     #[command(flatten)]
@@ -258,6 +267,8 @@ impl<P: Provider<AnyNetwork>> CastTxSender<P> {
         cast_async: bool,
     ) -> Result<String> {
         let tx_hash = TxHash::from_str(&tx_hash).wrap_err("invalid tx hash")?;
+        let timeout_secs = timeout.unwrap_or(300);
+        let start = Instant::now();
 
         let mut receipt: TransactionReceiptWithRevertReason =
             match self.provider.get_transaction_receipt(tx_hash).await? {
@@ -268,11 +279,38 @@ impl<P: Provider<AnyNetwork>> CastTxSender<P> {
                     if cast_async {
                         eyre::bail!("tx not found: {:?}", tx_hash)
                     } else {
-                        PendingTransactionBuilder::new(self.provider.root().clone(), tx_hash)
-                            .with_required_confirmations(confs)
-                            .with_timeout(timeout.map(Duration::from_secs))
-                            .get_receipt()
-                            .await?
+                        let mut backoff = Duration::from_secs(1);
+                        let timeout_duration = Duration::from_secs(timeout_secs);
+                        let receipt = loop {
+                            if let Some(r) = self.provider.get_transaction_receipt(tx_hash).await? {
+                                break r;
+                            }
+
+                            if start.elapsed() >= timeout_duration {
+                                eyre::bail!(
+                                    "tx not found after polling for {}s: {:?}",
+                                    timeout_secs,
+                                    tx_hash
+                                );
+                            }
+
+                            sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(10));
+                        };
+
+                        if confs == 0 {
+                            receipt
+                        } else {
+                            let remaining =
+                                timeout_duration.checked_sub(start.elapsed()).ok_or_else(|| {
+                                    eyre::eyre!("timeout exceeded while waiting for confirmations")
+                                })?;
+                            PendingTransactionBuilder::new(self.provider.root().clone(), tx_hash)
+                                .with_required_confirmations(confs)
+                                .with_timeout(Some(remaining))
+                                .get_receipt()
+                                .await?
+                        }
                     }
                 }
             }

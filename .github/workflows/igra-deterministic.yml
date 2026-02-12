@@ -1,0 +1,53 @@
+name: igra-deterministic
+
+permissions: {}
+
+on:
+  pull_request:
+    paths:
+      - "crates/common/src/provider/**"
+      - "crates/common/src/igra_store.rs"
+      - "crates/config/src/igra.rs"
+      - "crates/cast/src/cmd/send.rs"
+      - "crates/forge/src/cmd/create.rs"
+      - "scripts/igra/**"
+      - "docs/dev/igra-*.md"
+      - ".github/workflows/igra-deterministic.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/common/src/provider/**"
+      - "crates/common/src/igra_store.rs"
+      - "crates/config/src/igra.rs"
+      - "crates/cast/src/cmd/send.rs"
+      - "crates/forge/src/cmd/create.rs"
+      - "scripts/igra/**"
+      - "docs/dev/igra-*.md"
+      - ".github/workflows/igra-deterministic.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: igra-deterministic-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+
+jobs:
+  deterministic-harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Run IGRA deterministic harness
+        run: ./scripts/igra/deterministic-harness.sh
