@@ -3,7 +3,7 @@
 use alloy_primitives::{hex, utils::keccak256};
 use eyre::{Context, Result};
 use foundry_config::Config;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use std::{
     fs,
     path::PathBuf,
@@ -255,7 +255,9 @@ impl IgraStore {
         let mut conn = self.open_connection()?;
         let timeout_ms = self.sender_lock_timeout_secs.saturating_mul(1000);
         let deadline_ms = now_ms().saturating_add(timeout_ms);
-        let lease_ms = timeout_ms;
+        // The lease should outlive the acquisition timeout. Otherwise, a contending sender could
+        // "wait out" the lease and succeed within the same call, which breaks determinism.
+        let lease_ms = timeout_ms.saturating_mul(2);
 
         loop {
             let now = now_ms();
@@ -263,8 +265,11 @@ impl IgraStore {
                 return Err(IgraStoreError::LockTimeout { sender: sender.to_string() });
             }
 
-            if self.try_acquire_sender_lock_once(&mut conn, sender, owner_id, now, lease_ms)? {
-                return Ok(());
+            match self.try_acquire_sender_lock_once(&mut conn, sender, owner_id, now, lease_ms) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(err) if is_retryable_busy_error(&err) => {}
+                Err(err) => return Err(err),
             }
 
             thread::sleep(Duration::from_millis(LOCK_POLL_INTERVAL_MS));
@@ -290,7 +295,8 @@ impl IgraStore {
         let mut conn = self.open_connection()?;
         let timeout_ms = self.sender_lock_timeout_secs.saturating_mul(1000);
         let deadline_ms = now_ms().saturating_add(timeout_ms);
-        let lease_ms = timeout_ms;
+        // Keep lease > timeout; see `acquire_sender_lock`.
+        let lease_ms = timeout_ms.saturating_mul(2);
 
         loop {
             let now = now_ms();
@@ -298,10 +304,13 @@ impl IgraStore {
                 return Err(IgraStoreError::LockTimeout { sender: sender.to_string() });
             }
 
-            if let Some(ordering) = self.try_acquire_sender_lock_and_classify_once(
+            match self.try_acquire_sender_lock_and_classify_once(
                 &mut conn, sender, owner_id, nonce, l2_tx_hash, now, lease_ms,
-            )? {
-                return Ok(ordering);
+            ) {
+                Ok(Some(ordering)) => return Ok(ordering),
+                Ok(None) => {}
+                Err(err) if is_retryable_busy_error(&err) => {}
+                Err(err) => return Err(err),
             }
 
             thread::sleep(Duration::from_millis(LOCK_POLL_INTERVAL_MS));
@@ -314,7 +323,7 @@ impl IgraStore {
         nonce: u64,
     ) -> Result<NonceOrdering, IgraStoreError> {
         let mut conn = self.open_connection()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let ordering = self.classify_nonce_in_tx(&tx, sender, nonce, None)?;
         tx.commit()?;
         Ok(ordering)
@@ -329,7 +338,7 @@ impl IgraStore {
             .checked_add(1)
             .ok_or_else(|| IgraStoreError::NonceOverflow { sender: sender.to_string(), nonce })?;
         let mut conn = self.open_connection()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
 
         let expected: Option<i64> = tx
@@ -365,7 +374,7 @@ impl IgraStore {
 
     pub fn persist_transition(&self, update: &TxLifecycleUpdate) -> Result<(), IgraStoreError> {
         let mut conn = self.open_connection()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let existing: Option<(u32, u64)> = tx
             .query_row(
@@ -552,7 +561,7 @@ impl IgraStore {
         now_ms: u64,
         lease_ms: u64,
     ) -> Result<bool, IgraStoreError> {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let existing: Option<(String, i64)> = tx
             .query_row(
@@ -596,7 +605,7 @@ impl IgraStore {
         now_ms: u64,
         lease_ms: u64,
     ) -> Result<Option<NonceOrdering>, IgraStoreError> {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<(String, i64)> = tx
             .query_row(
                 "SELECT owner_id, expires_at_ms FROM sender_locks WHERE sender = ?1",
@@ -863,6 +872,15 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn is_retryable_busy_error(err: &IgraStoreError) -> bool {
+    match err {
+        IgraStoreError::Sqlite(rusqlite::Error::SqliteFailure(sqlite_err, _)) => {
+            matches!(sqlite_err.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        }
+        _ => false,
+    }
+}
+
 fn fingerprint(url: Option<&str>, chain_id: u64, network: Option<&str>) -> Option<String> {
     let url = url?.trim();
     if url.is_empty() {
@@ -1002,7 +1020,8 @@ mod tests {
         assert!(matches!(timeout_err, IgraStoreError::LockTimeout { .. }));
         assert_eq!(timeout_err.code(), Some(IGRA_NONCE_LOCK_TIMEOUT_ERROR_CODE));
 
-        thread::sleep(Duration::from_millis(1_100));
+        // Lease is 2x the configured timeout (see `acquire_sender_lock`).
+        thread::sleep(Duration::from_millis(2_100));
         store
             .acquire_sender_lock(sender, "owner-b")
             .expect("owner-b should acquire lock after lease expiry");
@@ -1036,7 +1055,8 @@ mod tests {
             .expect_err("owner-b should still time out while renewed lease is active");
         assert!(matches!(timeout_err, IgraStoreError::LockTimeout { .. }));
 
-        thread::sleep(Duration::from_millis(2_100));
+        // Lease is 2x the configured timeout, so with a 2s timeout we wait >4s.
+        thread::sleep(Duration::from_millis(4_100));
         store
             .acquire_sender_lock(sender, "owner-b")
             .expect("owner-b should acquire lock after renewed lease expires");

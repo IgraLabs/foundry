@@ -1,0 +1,360 @@
+diff --git a/crates/cast/src/cmd/send.rs b/crates/cast/src/cmd/send.rs
+index 197836b24..27807ba5f 100644
+--- a/crates/cast/src/cmd/send.rs
++++ b/crates/cast/src/cmd/send.rs
+@@ -121,7 +121,8 @@ pub async fn run(self) -> eyre::Result<()> {
+             None
+         };
+ 
+-        let config = send_tx.eth.load_config()?;
++        let mut config = send_tx.eth.load_config()?;
++        send_tx.eth.wallet.apply_igra_kaspa_wallet_overrides(&mut config);
+         ensure_supported_igra_signer_flow(
+             &config,
+             "cast send",
+diff --git a/crates/config/src/igra.rs b/crates/config/src/igra.rs
+index f3c974621..e54373091 100644
+--- a/crates/config/src/igra.rs
++++ b/crates/config/src/igra.rs
+@@ -4,6 +4,41 @@
+ use serde::{Deserialize, Serialize};
+ use thiserror::Error;
+ 
++/// Kaspa signer source configuration for IGRA write-path submission.
++#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++pub struct IgraKaspaWalletConfig {
++    /// Kaspa private key in hex format.
++    pub private_key: Option<String>,
++    /// Kaspa mnemonic phrase.
++    pub mnemonic: Option<String>,
++    /// Optional BIP39 passphrase for the mnemonic.
++    pub mnemonic_passphrase: Option<String>,
++    /// Optional derivation path override.
++    pub mnemonic_derivation_path: Option<String>,
++    /// Mnemonic index override.
++    pub mnemonic_index: Option<u32>,
++    /// Optional keystore path.
++    pub keystore: Option<String>,
++    /// Optional keystore account alias.
++    pub keystore_account: Option<String>,
++    /// Optional keystore password value.
++    pub password: Option<String>,
++}
++
++impl IgraKaspaWalletConfig {
++    /// Returns true when no explicit Kaspa signer source was configured.
++    pub fn is_empty(&self) -> bool {
++        self.private_key.is_none() &&
++            self.mnemonic.is_none() &&
++            self.mnemonic_passphrase.is_none() &&
++            self.mnemonic_derivation_path.is_none() &&
++            self.mnemonic_index.is_none() &&
++            self.keystore.is_none() &&
++            self.keystore_account.is_none() &&
++            self.password.is_none()
++    }
++}
++
+ /// IGRA-specific configuration.
+ #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct IgraConfig {
+@@ -31,6 +66,9 @@ pub struct IgraConfig {
+     pub failed_retention_hours: Option<u64>,
+     /// Max size of IGRA tx-map database in MB.
+     pub max_db_size_mb: Option<u64>,
++    /// Optional Kaspa signer source configuration for in-process submission.
++    #[serde(default, skip_serializing_if = "IgraKaspaWalletConfig::is_empty")]
++    pub kaspa_wallet: IgraKaspaWalletConfig,
+ }
+ 
+ impl IgraConfig {
+@@ -164,7 +202,7 @@ pub enum IgraConfigError {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::IgraConfig;
++    use super::{IgraConfig, IgraKaspaWalletConfig};
+ 
+     fn valid_config() -> IgraConfig {
+         IgraConfig {
+@@ -180,6 +218,7 @@ fn valid_config() -> IgraConfig {
+             completed_retention_hours: Some(168),
+             failed_retention_hours: Some(720),
+             max_db_size_mb: Some(512),
++            kaspa_wallet: IgraKaspaWalletConfig::default(),
+         }
+     }
+ 
+diff --git a/crates/config/src/lib.rs b/crates/config/src/lib.rs
+index aee7b3b31..fe55a5b5c 100644
+--- a/crates/config/src/lib.rs
++++ b/crates/config/src/lib.rs
+@@ -111,7 +111,7 @@
+ pub use invariant::InvariantConfig;
+ 
+ mod igra;
+-pub use igra::{IgraConfig, IgraConfigError};
++pub use igra::{IgraConfig, IgraConfigError, IgraKaspaWalletConfig};
+ 
+ mod inline;
+ pub use inline::{InlineConfig, InlineConfigError, NatSpec};
+diff --git a/crates/forge/src/cmd/create.rs b/crates/forge/src/cmd/create.rs
+index 97753a4b5..cd7f53b73 100644
+--- a/crates/forge/src/cmd/create.rs
++++ b/crates/forge/src/cmd/create.rs
+@@ -105,6 +105,7 @@ impl CreateArgs {
+     /// Executes the command to create a contract
+     pub async fn run(mut self) -> Result<()> {
+         let mut config = self.load_config()?;
++        self.eth.wallet.apply_igra_kaspa_wallet_overrides(&mut config);
+ 
+         // Install missing dependencies.
+         if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
+diff --git a/crates/script/src/lib.rs b/crates/script/src/lib.rs
+index a556c1ce3..cfe8a99e6 100644
+--- a/crates/script/src/lib.rs
++++ b/crates/script/src/lib.rs
+@@ -230,7 +230,8 @@ impl ScriptArgs {
+     pub async fn preprocess(self) -> Result<PreprocessedState> {
+         let script_wallets = Wallets::new(self.wallets.get_multi_wallet().await?, self.evm.sender);
+ 
+-        let (config, mut evm_opts) = self.load_config_and_evm_opts()?;
++        let (mut config, mut evm_opts) = self.load_config_and_evm_opts()?;
++        self.wallets.apply_igra_kaspa_wallet_overrides(&mut config);
+         self.ensure_supported_igra_write_path_signer_flow(&config)?;
+ 
+         if let Some(sender) = self.maybe_load_private_key()? {
+diff --git a/crates/wallets/src/lib.rs b/crates/wallets/src/lib.rs
+index e29e6484e..70a1c8f49 100644
+--- a/crates/wallets/src/lib.rs
++++ b/crates/wallets/src/lib.rs
+@@ -19,7 +19,7 @@
+ pub mod wallet_multi;
+ pub mod wallet_raw;
+ 
+-pub use opts::WalletOpts;
++pub use opts::{KaspaWalletOpts, WalletOpts};
+ pub use signer::{PendingSigner, WalletSigner};
+ pub use wallet_multi::MultiWalletOpts;
+ pub use wallet_raw::RawWalletOpts;
+diff --git a/crates/wallets/src/opts.rs b/crates/wallets/src/opts.rs
+index 9265a7c79..81ceddc2c 100644
+--- a/crates/wallets/src/opts.rs
++++ b/crates/wallets/src/opts.rs
+@@ -2,6 +2,7 @@
+ use alloy_primitives::Address;
+ use clap::Parser;
+ use eyre::Result;
++use foundry_config::{Config, IgraKaspaWalletConfig};
+ use serde::Serialize;
+ 
+ /// The wallet options can either be:
+@@ -29,6 +30,9 @@ pub struct WalletOpts {
+     #[command(flatten)]
+     pub raw: RawWalletOpts,
+ 
++    #[command(flatten)]
++    pub kaspa: KaspaWalletOpts,
++
+     /// Use the keystore in the given folder or file.
+     #[arg(
+         long = "keystore",
+@@ -134,6 +138,99 @@ pub struct WalletOpts {
+     pub browser_development: bool,
+ }
+ 
++/// Kaspa key source options used by IGRA mode.
++#[derive(Clone, Debug, Default, Serialize, Parser)]
++#[command(next_help_heading = "Wallet options - kaspa", about = None, long_about = None)]
++pub struct KaspaWalletOpts {
++    /// Use the provided Kaspa private key.
++    #[arg(
++        long = "private-key-kaspa",
++        env = "KASPA_PRIVATE_KEY",
++        value_name = "RAW_PRIVATE_KEY",
++        hide_env_values = true
++    )]
++    pub private_key_kaspa: Option<String>,
++
++    /// Use the Kaspa mnemonic phrase.
++    #[arg(
++        long = "mnemonic-kaspa",
++        env = "KASPA_MNEMONIC",
++        value_name = "MNEMONIC",
++        hide_env_values = true
++    )]
++    pub mnemonic_kaspa: Option<String>,
++
++    /// Use a BIP39 passphrase for the Kaspa mnemonic.
++    #[arg(
++        long = "mnemonic-passphrase-kaspa",
++        env = "KASPA_MNEMONIC_PASSPHRASE",
++        value_name = "PASSPHRASE",
++        hide_env_values = true
++    )]
++    pub mnemonic_passphrase_kaspa: Option<String>,
++
++    /// Kaspa mnemonic derivation path override.
++    #[arg(
++        long = "mnemonic-derivation-path-kaspa",
++        env = "KASPA_MNEMONIC_DERIVATION_PATH",
++        value_name = "PATH"
++    )]
++    pub mnemonic_derivation_path_kaspa: Option<String>,
++
++    /// Kaspa mnemonic index override.
++    #[arg(long = "mnemonic-index-kaspa", env = "KASPA_MNEMONIC_INDEX", value_name = "INDEX")]
++    pub mnemonic_index_kaspa: Option<u32>,
++
++    /// Use a Kaspa keystore file.
++    #[arg(long = "keystore-kaspa", env = "KASPA_KEYSTORE", value_name = "PATH")]
++    pub keystore_kaspa: Option<String>,
++
++    /// Use a Kaspa keystore account alias.
++    #[arg(
++        long = "keystore-account-kaspa",
++        env = "KASPA_KEYSTORE_ACCOUNT",
++        value_name = "ACCOUNT_NAME"
++    )]
++    pub keystore_account_kaspa: Option<String>,
++
++    /// Kaspa keystore password.
++    #[arg(
++        long = "password-kaspa",
++        env = "KASPA_PASSWORD",
++        value_name = "PASSWORD",
++        hide_env_values = true
++    )]
++    pub password_kaspa: Option<String>,
++}
++
++impl KaspaWalletOpts {
++    /// Returns true when explicit Kaspa signer source was provided.
++    pub fn is_set(&self) -> bool {
++        self.private_key_kaspa.is_some() ||
++            self.mnemonic_kaspa.is_some() ||
++            self.mnemonic_passphrase_kaspa.is_some() ||
++            self.mnemonic_derivation_path_kaspa.is_some() ||
++            self.mnemonic_index_kaspa.is_some() ||
++            self.keystore_kaspa.is_some() ||
++            self.keystore_account_kaspa.is_some() ||
++            self.password_kaspa.is_some()
++    }
++
++    /// Converts CLI/env Kaspa options to config shape.
++    pub fn as_config(&self) -> IgraKaspaWalletConfig {
++        IgraKaspaWalletConfig {
++            private_key: self.private_key_kaspa.clone(),
++            mnemonic: self.mnemonic_kaspa.clone(),
++            mnemonic_passphrase: self.mnemonic_passphrase_kaspa.clone(),
++            mnemonic_derivation_path: self.mnemonic_derivation_path_kaspa.clone(),
++            mnemonic_index: self.mnemonic_index_kaspa,
++            keystore: self.keystore_kaspa.clone(),
++            keystore_account: self.keystore_account_kaspa.clone(),
++            password: self.password_kaspa.clone(),
++        }
++    }
++}
++
+ impl WalletOpts {
+     pub async fn signer(&self) -> Result<WalletSigner> {
+         trace!("start finding signer");
+@@ -223,6 +320,13 @@ pub async fn signer(&self) -> Result<WalletSigner> {
+ 
+         Ok(signer)
+     }
++
++    /// Applies CLI/env Kaspa wallet overrides into IGRA config with highest precedence.
++    pub fn apply_igra_kaspa_wallet_overrides(&self, config: &mut Config) {
++        if self.kaspa.is_set() {
++            config.igra.kaspa_wallet = self.kaspa.as_config();
++        }
++    }
+ }
+ 
+ impl From<RawWalletOpts> for WalletOpts {
+@@ -285,6 +389,7 @@ async fn illformed_private_key_generates_user_friendly_error() {
+             browser_port: 9545,
+             browser_development: false,
+             browser_disable_open: false,
++            kaspa: KaspaWalletOpts::default(),
+         };
+         match wallet.signer().await {
+             Ok(_) => {
+@@ -298,4 +403,45 @@ async fn illformed_private_key_generates_user_friendly_error() {
+             }
+         }
+     }
++
++    #[test]
++    fn parses_kaspa_wallet_opts_from_cli() {
++        let wallet: WalletOpts = WalletOpts::parse_from([
++            "foundry-cli",
++            "--private-key-kaspa",
++            "0x1234",
++            "--mnemonic-index-kaspa",
++            "7",
++        ]);
++
++        assert_eq!(wallet.kaspa.private_key_kaspa.as_deref(), Some("0x1234"));
++        assert_eq!(wallet.kaspa.mnemonic_index_kaspa, Some(7));
++        assert!(wallet.kaspa.is_set());
++    }
++
++    #[test]
++    fn applies_kaspa_wallet_overrides_to_igra_config() {
++        let wallet: WalletOpts = WalletOpts::parse_from([
++            "foundry-cli",
++            "--private-key-kaspa",
++            "0xabcd",
++            "--mnemonic-kaspa",
++            "test test test test test test test test test test test junk",
++            "--mnemonic-derivation-path-kaspa",
++            "m/44'/111111'/0'/0/0",
++        ]);
++
++        let mut config = Config::default();
++        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
++
++        assert_eq!(config.igra.kaspa_wallet.private_key.as_deref(), Some("0xabcd"));
++        assert_eq!(
++            config.igra.kaspa_wallet.mnemonic.as_deref(),
++            Some("test test test test test test test test test test test junk")
++        );
++        assert_eq!(
++            config.igra.kaspa_wallet.mnemonic_derivation_path.as_deref(),
++            Some("m/44'/111111'/0'/0/0")
++        );
++    }
+ }
+diff --git a/crates/wallets/src/wallet_multi/mod.rs b/crates/wallets/src/wallet_multi/mod.rs
+index 3a03646e7..16875e005 100644
+--- a/crates/wallets/src/wallet_multi/mod.rs
++++ b/crates/wallets/src/wallet_multi/mod.rs
+@@ -1,4 +1,5 @@
+ use crate::{
++    opts::KaspaWalletOpts,
+     signer::{PendingSigner, WalletSigner},
+     utils,
+ };
+@@ -259,9 +260,20 @@ pub struct MultiWalletOpts {
+     /// **WARNING**: This should only be used in a development environment.
+     #[arg(long, help_heading = "Wallet options - browser", hide = true)]
+     pub browser_development: bool,
++
++    #[command(flatten)]
++    #[builder(default = "KaspaWalletOpts::default()")]
++    pub kaspa: KaspaWalletOpts,
+ }
+ 
+ impl MultiWalletOpts {
++    /// Applies CLI/env Kaspa wallet overrides into IGRA config with highest precedence.
++    pub fn apply_igra_kaspa_wallet_overrides(&self, config: &mut Config) {
++        if self.kaspa.is_set() {
++            config.igra.kaspa_wallet = self.kaspa.as_config();
++        }
++    }
++
+     /// Returns [MultiWallet] container configured with provided options.
+     pub async fn get_multi_wallet(&self) -> Result<MultiWallet> {
+         let mut pending = Vec::new();

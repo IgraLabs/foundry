@@ -21,6 +21,7 @@ members = [
     "crates/evm/traces/",
     "crates/fmt/",
     "crates/forge/",
+    "crates/igra-kaspa-derive/",
     "crates/lint/",
     "crates/macros/",
     "crates/primitives/",
@@ -429,6 +430,17 @@ vergen = { package = "vergen-gitcl", version = "10.0.0-beta.5", default-features
     "build",
     "cargo",
 ] }
+
+# Kaspa / IGRA in-process submission stack
+kaswallet-common = { path = "../kaswallet/common", package = "kaswallet-common" }
+kaspa-addresses = { path = "../rusty-kaspa/crypto/addresses" }
+kaspa-bip32 = { path = "../rusty-kaspa/wallet/bip32" }
+# Compatibility: some environments still derive Kaspa addresses using older kaspa-bip32 semantics.
+# We keep this pinned so IGRA can interop with wallets created by those versions.
+kaspa-consensus-core = { path = "../rusty-kaspa/consensus/core" }
+kaspa-grpc-client = { path = "../rusty-kaspa/rpc/grpc/client" }
+kaspa-rpc-core = { path = "../rusty-kaspa/rpc/core" }
+kaspa-txscript = { path = "../rusty-kaspa/crypto/txscript" }
 yansi = { version = "1.0", features = ["detect-tty", "detect-env"] }
 path-slash = "0.2"
 jiff = { version = "0.2", default-features = false, features = [

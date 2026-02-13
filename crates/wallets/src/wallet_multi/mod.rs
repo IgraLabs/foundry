@@ -1,4 +1,5 @@
 use crate::{
+    opts::KaspaWalletOpts,
     signer::{PendingSigner, WalletSigner},
     utils,
 };
@@ -10,6 +11,7 @@ use eyre::Result;
 use foundry_config::Config;
 use serde::Serialize;
 use std::path::PathBuf;
+use tracing::warn;
 
 /// Container for multiple wallets.
 #[derive(Debug, Default)]
@@ -259,9 +261,92 @@ pub struct MultiWalletOpts {
     /// **WARNING**: This should only be used in a development environment.
     #[arg(long, help_heading = "Wallet options - browser", hide = true)]
     pub browser_development: bool,
+
+    #[command(flatten)]
+    #[builder(default = "KaspaWalletOpts::default()")]
+    pub kaspa: KaspaWalletOpts,
 }
 
 impl MultiWalletOpts {
+    /// Applies CLI/env Kaspa wallet overrides into IGRA config with highest precedence.
+    pub fn apply_igra_kaspa_wallet_overrides(&self, config: &mut Config) {
+        if self.kaspa.is_set() {
+            config.igra.kaspa_wallet = self.kaspa.as_config();
+            return;
+        }
+
+        if !config.igra.kaspa_wallet.is_empty() {
+            return;
+        }
+
+        if let Some(fallback) = self.evm_fallback_kaspa_config() {
+            warn!(
+                "IGRA Kaspa wallet fallback is reusing EVM signer key material; prefer explicit --private-key-kaspa or --mnemonic-kaspa for key separation"
+            );
+            config.igra.kaspa_wallet = fallback;
+        }
+    }
+
+    fn evm_fallback_kaspa_config(&self) -> Option<foundry_config::IgraKaspaWalletConfig> {
+        if let Some(private_key) = self.private_key.clone().or_else(|| {
+            self.private_keys
+                .as_ref()
+                .and_then(|private_keys| private_keys.first().cloned())
+        }) {
+            return Some(foundry_config::IgraKaspaWalletConfig {
+                private_key: Some(private_key),
+                ..Default::default()
+            });
+        }
+
+        if let Some(mnemonic) =
+            self.mnemonics.as_ref().and_then(|mnemonics| mnemonics.first().cloned())
+        {
+            let mnemonic_passphrase = self
+                .mnemonic_passphrases
+                .as_ref()
+                .and_then(|phrases| phrases.first().cloned());
+            let mnemonic_derivation_path =
+                self.hd_paths.as_ref().and_then(|paths| paths.first().cloned());
+            let mnemonic_index = self
+                .mnemonic_indexes
+                .as_ref()
+                .and_then(|indexes| indexes.first().copied())
+                .or(Some(0));
+
+            return Some(foundry_config::IgraKaspaWalletConfig {
+                mnemonic: Some(mnemonic),
+                mnemonic_passphrase,
+                mnemonic_derivation_path,
+                mnemonic_index,
+                ..Default::default()
+            });
+        }
+
+        let keystore = self
+            .keystore_paths
+            .as_ref()
+            .and_then(|paths| paths.first().cloned());
+        let keystore_account = self
+            .keystore_account_names
+            .as_ref()
+            .and_then(|names| names.first().cloned());
+        if keystore.is_some() || keystore_account.is_some() {
+            let password = self
+                .keystore_passwords
+                .as_ref()
+                .and_then(|passwords| passwords.first().cloned());
+            return Some(foundry_config::IgraKaspaWalletConfig {
+                keystore,
+                keystore_account,
+                password,
+                ..Default::default()
+            });
+        }
+
+        None
+    }
+
     /// Returns [MultiWallet] container configured with provided options.
     pub async fn get_multi_wallet(&self) -> Result<MultiWallet> {
         let mut pending = Vec::new();
@@ -652,5 +737,41 @@ mod tests {
                 test_case.2
             )
         }
+    }
+
+    #[test]
+    fn falls_back_to_evm_private_key_when_kaspa_key_missing() {
+        let wallet: MultiWalletOpts = MultiWalletOpts::parse_from([
+            "foundry-cli",
+            "--private-key",
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        ]);
+
+        let mut config = Config::default();
+        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
+
+        assert_eq!(
+            config.igra.kaspa_wallet.private_key.as_deref(),
+            Some("0x1111111111111111111111111111111111111111111111111111111111111111")
+        );
+    }
+
+    #[test]
+    fn explicit_kaspa_key_overrides_multi_wallet_fallback() {
+        let wallet: MultiWalletOpts = MultiWalletOpts::parse_from([
+            "foundry-cli",
+            "--private-key",
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "--private-key-kaspa",
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+        ]);
+
+        let mut config = Config::default();
+        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
+
+        assert_eq!(
+            config.igra.kaspa_wallet.private_key.as_deref(),
+            Some("0x2222222222222222222222222222222222222222222222222222222222222222")
+        );
     }
 }

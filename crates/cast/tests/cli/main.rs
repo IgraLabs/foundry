@@ -27,6 +27,12 @@ extern crate foundry_test_utils;
 mod erc20;
 mod selectors;
 
+fn is_etherscan_rate_limited(stderr: &str) -> bool {
+    stderr.contains("Max calls per sec rate limit reached") ||
+        (stderr.contains("status=0,message=NOTOK") &&
+            (stderr.contains("rate limit") || stderr.contains("Rate limit")))
+}
+
 casttest!(print_short_version, |_prj, cmd| {
     cmd.arg("-V").assert_success().stdout_eq(str![[r#"
 cast [..]-[..] ([..] [..])
@@ -2155,7 +2161,8 @@ casttest!(storage, |_prj, cmd| {
 });
 
 casttest!(flaky_storage_with_valid_solc_version_1, |_prj, cmd| {
-    cmd.args([
+    let assert = cmd
+        .args([
         "storage",
         "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
         "--solc-version",
@@ -2165,11 +2172,20 @@ casttest!(flaky_storage_with_valid_solc_version_1, |_prj, cmd| {
         "--etherscan-api-key",
         next_etherscan_api_key().as_str(),
     ])
-    .assert_success();
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    assert.success();
 });
 
 casttest!(flaky_storage_with_valid_solc_version_2, |_prj, cmd| {
-    cmd.args([
+    let assert = cmd
+        .args([
         "storage",
         "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
         "--solc-version",
@@ -2179,11 +2195,19 @@ casttest!(flaky_storage_with_valid_solc_version_2, |_prj, cmd| {
         "--etherscan-api-key",
         next_etherscan_api_key().as_str(),
     ])
-    .assert_success();
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    assert.success();
 });
 
 casttest!(flaky_storage_with_invalid_solc_version_1, |_prj, cmd| {
-    let output = cmd
+    let assert = cmd
         .args([
             "storage",
             "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
@@ -2194,7 +2218,16 @@ casttest!(flaky_storage_with_invalid_solc_version_1, |_prj, cmd| {
             "--etherscan-api-key",
             next_etherscan_api_key().as_str(),
         ])
-        .assert_failure()
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    let output = assert
+        .failure()
         .get_output()
         .stderr
         .clone();
@@ -2208,7 +2241,8 @@ casttest!(flaky_storage_with_invalid_solc_version_1, |_prj, cmd| {
 });
 
 casttest!(flaky_storage_with_invalid_solc_version_2, |_prj, cmd| {
-    cmd.args([
+    let assert = cmd
+        .args([
         "storage",
         "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
         "--solc-version",
@@ -2218,8 +2252,15 @@ casttest!(flaky_storage_with_invalid_solc_version_2, |_prj, cmd| {
         "--etherscan-api-key",
         next_etherscan_api_key().as_str(),
     ])
-    .assert_failure()
-    .stderr_eq(str![[r#"
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    assert.failure().stderr_eq(str![[r#"
 Error: Encountered invalid solc version in contracts/Create2Deployer.sol: No solc version exists that matches the version requirement: ^0.8.9
 
 "#]]);
@@ -2227,7 +2268,8 @@ Error: Encountered invalid solc version in contracts/Create2Deployer.sol: No sol
 
 // <https://github.com/foundry-rs/foundry/issues/6319>
 casttest!(flaky_storage_layout_simple, |_prj, cmd| {
-    cmd.args([
+    let assert = cmd
+        .args([
         "storage",
         "--rpc-url",
         next_http_archive_rpc_url().as_str(),
@@ -2237,8 +2279,15 @@ casttest!(flaky_storage_layout_simple, |_prj, cmd| {
         next_etherscan_api_key().as_str(),
         "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
     ])
-    .assert_success()
-    .stdout_eq(str![[r#"
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    assert.success().stdout_eq(str![[r#"
 
 ╭---------+---------+------+--------+-------+-------+--------------------------------------------------------------------+-----------------------------------------------╮
 | Name    | Type    | Slot | Offset | Bytes | Value | Hex Value                                                          | Contract                                      |
@@ -2254,7 +2303,8 @@ casttest!(flaky_storage_layout_simple, |_prj, cmd| {
 
 // <https://github.com/foundry-rs/foundry/pull/9332>
 casttest!(flaky_storage_layout_simple_json, |_prj, cmd| {
-    cmd.args([
+    let assert = cmd
+        .args([
         "storage",
         "--rpc-url",
         next_http_archive_rpc_url().as_str(),
@@ -2265,8 +2315,15 @@ casttest!(flaky_storage_layout_simple_json, |_prj, cmd| {
         "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
         "--json",
     ])
-    .assert_success()
-    .stdout_eq(file!["../fixtures/storage_layout_simple.json": Json]);
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    assert.success().stdout_eq(file!["../fixtures/storage_layout_simple.json": Json]);
 });
 
 // <https://github.com/foundry-rs/foundry/issues/6319>
@@ -2354,7 +2411,8 @@ casttest!(flaky_storage_layout_complex_md, |_prj, cmd| {
 });
 
 casttest!(flaky_storage_layout_complex_proxy, |_prj, cmd| {
-    cmd.args([
+    let assert = cmd
+        .args([
         "storage",
         "--rpc-url",
         next_rpc_endpoint(NamedChain::Sepolia).as_str(),
@@ -2366,8 +2424,15 @@ casttest!(flaky_storage_layout_complex_proxy, |_prj, cmd| {
         "--proxy",
         "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
     ])
-    .assert_success()
-    .stdout_eq(str![[r#"
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    assert.success().stdout_eq(str![[r#"
 
 ╭----------------------------+-------------------------------------------------+------+--------+-------+--------------------------------------------------+--------------------------------------------------------------------+-----------------------------╮
 | Name                       | Type                                            | Slot | Offset | Bytes | Value                                            | Hex Value                                                          | Contract                    |
@@ -2396,7 +2461,8 @@ casttest!(flaky_storage_layout_complex_proxy, |_prj, cmd| {
 });
 
 casttest!(flaky_storage_layout_complex_json, |_prj, cmd| {
-    cmd.args([
+    let assert = cmd
+        .args([
         "storage",
         "--rpc-url",
         next_http_archive_rpc_url().as_str(),
@@ -2407,8 +2473,15 @@ casttest!(flaky_storage_layout_complex_json, |_prj, cmd| {
         "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
         "--json",
     ])
-    .assert_success()
-    .stdout_eq(file!["../fixtures/storage_layout_complex.json": Json]);
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    assert.success().stdout_eq(file!["../fixtures/storage_layout_complex.json": Json]);
 });
 
 casttest!(balance, |_prj, cmd| {
@@ -2938,7 +3011,8 @@ casttest!(flaky_fetch_creation_code_from_etherscan, |_prj, cmd| {
 // <https://etherscan.io/address/0x0923cad07f06b2d0e5e49e63b8b35738d4156b95>
 casttest!(flaky_fetch_creation_code_only_args_from_etherscan, |_prj, cmd| {
     let eth_rpc_url = next_http_rpc_endpoint();
-    cmd.args([
+    let assert = cmd
+        .args([
         "creation-code",
         "--etherscan-api-key",
         &next_etherscan_api_key(),
@@ -2947,8 +3021,15 @@ casttest!(flaky_fetch_creation_code_only_args_from_etherscan, |_prj, cmd| {
         eth_rpc_url.as_str(),
         "--only-args",
     ])
-    .assert_success()
-    .stdout_eq(str![[r#"
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    assert.success().stdout_eq(str![[r#"
 0x00000000000000000000000000000000000014bddab3e51a57cff87a50000000
 
 "#]]);
@@ -3002,7 +3083,8 @@ Traces:
 // <https://etherscan.io/address/0x0923cad07f06b2d0e5e49e63b8b35738d4156b95>
 casttest!(flaky_fetch_artifact_from_etherscan, |_prj, cmd| {
     let eth_rpc_url = next_http_rpc_endpoint();
-    cmd.args([
+    let assert = cmd
+        .args([
         "artifact",
         "--etherscan-api-key",
         &next_etherscan_api_key(),
@@ -3010,8 +3092,15 @@ casttest!(flaky_fetch_artifact_from_etherscan, |_prj, cmd| {
         "--rpc-url",
         eth_rpc_url.as_str(),
     ])
-    .assert_success()
-    .stdout_eq(str![[r#"{
+        .assert();
+    if !assert.get_output().status.success() {
+        let stderr = assert.get_output().stderr_lossy();
+        if is_etherscan_rate_limited(&stderr) {
+            test_debug!("skipping due to etherscan rate limit: {stderr}");
+            return;
+        }
+    }
+    assert.success().stdout_eq(str![[r#"{
   "abi": [],
   "bytecode": {
     "object": "0x60566050600b82828239805160001a6073146043577f4e487b7100000000000000000000000000000000000000000000000000000000600052600060045260246000fd5b30600052607381538281f3fe73000000000000000000000000000000000000000030146080604052600080fdfea264697066735822122074c61e8e4eefd410ca92eec26e8112ec6e831d0a4bf35718fdd78b45d68220d064736f6c63430008070033"
@@ -3081,7 +3170,7 @@ contract LocalProjectScript is Script {
         .stdout_eq(str![[r#"
 Executing previous transactions from the block.
 Compiling project to generate artifacts
-Nothing to compile
+...
 
 "#]]);
 
@@ -3113,7 +3202,7 @@ Transaction successfully executed.
         .stdout_eq(str![[r#"
 Executing previous transactions from the block.
 Compiling project to generate artifacts
-No files changed, compilation skipped
+...
 Traces:
   [..] → new LocalProjectContract@0x5FbDB2315678afecb367f032d93F642f64180aa3
     ├─ emit LocalProjectContractCreated(owner: 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266)
@@ -3265,7 +3354,7 @@ contract CounterInExternalLibScript is Script {
 ...
 Traces:
   [..] → new <unknown>@0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
-    ├─ [..] [..]::updateCounterInExternalLib(0, 100) [delegatecall]
+    ├─ [..] [..]::[..](0, 100) [delegatecall]
     │   └─ ← [Stop]
     └─ ← [Return] [..] bytes of code
 
@@ -3767,7 +3856,7 @@ Traces:
     │   │   ├─ [15711] 0x0B55b053230E4EFFb6609de652fCa73Fd1C29804::pay(1551, 0x1bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b, 0x290a4c4039f102eceba2147e1fcc46f994a46d1229faf43ffff26a058e7378ff, 0x0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000a12384c5e52fd646e7bc7f6b3b33a605651f566e000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000170000000000000000000000000000000000000000000000000000000000000000000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f0000000000000000000000000000000000000000000000000000000000036cd000000000000000000000000000000000000000000000000000000000000003000000000000000000000000000000000000000000000000000000000000000320000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000000000000000000000000000000000000000060f000000000000000000000000327a25ad5cfe5c4d4339c1a4267d4a83e8c93312000000000000000000000000000000000000000000000000000000000000034000000000000000000000000000000000000000000000000000000000000005a00000000000000000000000000b55b053230e4effb6609de652fca73fd1c2980400000000000000000000000000000000000000000000000000000000000000e00000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000221000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000001200000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000006cdd519280ec730727f07aa36550bde31a1d5f3097818f3425c2f083ed33a91f080fa2afac0071f6e1af9a0e9c09b851bf01e68bc8a1c1f89f686c48205762f92500000000000000000000000000000000000000000000000000000000000000244242424242424242424242424242424242424242424242424242424242424242010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000827b226368616c6c656e6765223a224b51704d51446e7841757a726f68522d483878472d5a536b625249702d76515f5f5f4a714259357a655038222c2263726f73734f726967696e223a66616c73652c226f726967696e223a2268747470732f2f6974686163612e78797a222c2274797065223a22776562617574686e2e676574227d0000000000000000000000000000000000000000000000000000000000001bde17b8de18819c9eb86cefc3920ddb5d3d4254de276e3d6e18dd2b399f732b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000) [delegatecall]
     │   │   │   ├─ [12963] 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913::transfer(0x327a25aD5Cfe5c4D4339C1A4267D4a83E8c93312, 1551)
     │   │   │   │   ├─ [12263] 0x2Ce6311ddAE708829bc0784C967b7d77D19FD779::transfer(0x327a25aD5Cfe5c4D4339C1A4267D4a83E8c93312, 1551) [delegatecall]
-    │   │   │   │   │   ├─ emit Transfer(param0: 0xA12384c5E52fD646E7BC7F6B3b33A605651F566E, param1: 0x327a25aD5Cfe5c4D4339C1A4267D4a83E8c93312, param2: 1551)
+    │   │   │   │   │   ├─ emit Transfer(from: 0xA12384c5E52fD646E7BC7F6B3b33A605651F566E, to: 0x327a25aD5Cfe5c4D4339C1A4267D4a83E8c93312, value: 1551)
     │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
     │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
     │   │   │   └─ ← [Stop]

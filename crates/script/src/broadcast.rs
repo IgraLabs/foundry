@@ -375,13 +375,45 @@ impl BundledState {
                     ),
                     (false, _, _) => {
                         let mut fees = provider.estimate_eip1559_fees().await.wrap_err("Failed to estimate EIP1559 fees. This chain might not support EIP1559, try adding --legacy to your command.")?;
+                        // IGRA adapter enforces a minimum fee policy for EIP-1559 txs via
+                        // `maxPriorityFeePerGas`. On IGRA networks, `eth_gasPrice` reflects this
+                        // minimum better than `eth_feeHistory` percentiles, so when IGRA mode is
+                        // enabled we use it as a floor for default fee filling.
+                        if self.script_config.config.igra.enabled {
+                            let floor = provider.get_gas_price().await?;
+                            fees.max_fee_per_gas = fees.max_fee_per_gas.max(floor);
+                            fees.max_priority_fee_per_gas =
+                                fees.max_priority_fee_per_gas.max(floor);
+                        }
 
                         if let Some(gas_price) = self.args.with_gas_price {
-                            fees.max_fee_per_gas = gas_price.to();
+                            let value = gas_price.to();
+                            if self.script_config.config.igra.enabled {
+                                let floor = provider.get_gas_price().await?;
+                                if value < floor {
+                                    eyre::bail!(
+                                        "IGRA requires maxFeePerGas >= eth_gasPrice ({} < {}); set --gas-price accordingly",
+                                        value,
+                                        floor
+                                    );
+                                }
+                            }
+                            fees.max_fee_per_gas = value;
                         }
 
                         if let Some(priority_gas_price) = self.args.priority_gas_price {
-                            fees.max_priority_fee_per_gas = priority_gas_price.to();
+                            let value = priority_gas_price.to();
+                            if self.script_config.config.igra.enabled {
+                                let floor = provider.get_gas_price().await?;
+                                if value < floor {
+                                    eyre::bail!(
+                                        "IGRA requires maxPriorityFeePerGas >= eth_gasPrice ({} < {}); set --priority-gas-price accordingly",
+                                        value,
+                                        floor
+                                    );
+                                }
+                            }
+                            fees.max_priority_fee_per_gas = value;
                         }
 
                         (None, Some(fees))

@@ -1,0 +1,229 @@
+## Rust Code Review - Severity-Ordered Findings
+
+### **CRITICAL - UTXO Race Condition After Cache Invalidation**
+
+**File**: `crates/common/src/provider/igra_transport.rs:146-174`
+
+**Issue**: The UTXO cache invalidation occurs **after** the transaction is built in `spawn_blocking`, creating a race window where concurrent requests can read stale UTXOs that are about to be spent.
+
+```rust
+// Line 161-171: Transaction built using utxos
+let transaction = tokio::task::spawn_blocking(move || {
+    build_signed_payload_transaction(
+        &private_key_for_build,
+        &source_address_for_build,
+        network_type,
+        &payload_bytes_for_build,
+        &utxos,  // ← Using potentially stale UTXOs
+    )
+})
+.await
+// Line 174: Cache invalidated ONLY AFTER tx is built
+self.invalidate_utxo_cache().await;
+```
+
+**Concrete Fix**: Move cache invalidation to occur **immediately after** fetching UTXOs and **before** building the transaction:
+
+```rust
+let utxos = self
+    .load_utxos(
+        &mut client,
+        rpc_url,
+        network,
+        &source_address,
+        force_refresh,
+    )
+    .await?;
+
+// Invalidate IMMEDIATELY after load, before spending
+self.invalidate_utxo_cache().await;
+
+let private_key_for_build = private_key;
+// ... rest of transaction building
+```
+
+---
+
+### **CRITICAL - Sender Lock Released Before Mark Submitted**
+
+**File**: `crates/common/src/provider/igra_transport.rs:774-940`
+
+**Issue**: The sender lock is acquired at line 774 via `acquire_sender_lock_and_classify_nonce` in `spawn_blocking`, but there is **no visible lock release** before the async block ends at line 945. The lock must be released **after** `mark_submitted_in_order_nonce` (line 928) completes, otherwise concurrent transactions can acquire the lock before nonce advancement occurs.
+
+**Expected Pattern**:
+```rust
+// 1. Acquire lock (line 774-786)
+store.acquire_sender_lock_and_classify_nonce(...)
+
+// 2. Submit transaction (line 900)
+submitter.submit_payload(&submit_request).await
+
+// 3. Advance nonce (line 928)
+store.mark_submitted_in_order_nonce(&sender, nonce)
+
+// 4. MISSING: Release lock
+store.release_sender_lock(&sender, &lock_owner_id)
+```
+
+**Concrete Fix**: Add explicit lock release in a `defer`-style pattern or ensure the lock holder is dropped correctly:
+
+```rust
+// After line 940 (after mark_submitted branch), add:
+if lock_acquired {
+    let store = tracked.store.clone();
+    let sender = tracked.sender.clone();
+    let lock_owner_id = tracked.lock_owner_id.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        store.release_sender_lock(&sender, &lock_owner_id)
+    })
+    .await;
+}
+```
+
+Alternatively, use RAII guard pattern in the store layer.
+
+---
+
+### **HIGH - UTXO Cache Epoch Race Allows Stale Writes**
+
+**File**: `crates/common/src/provider/igra_transport.rs:200-235`
+
+**Issue**: The cache write logic at lines 225-233 has a TOCTOU race:
+
+```rust
+// Line 209: Read epoch
+let read_epoch = self.utxo_cache_epoch.load(Ordering::Relaxed);
+
+// Line 220-224: Fetch UTXOs (slow network call)
+let entries = client.get_utxos_by_addresses(...)
+
+// Line 225-233: Write to cache if epoch matches
+let mut cache_guard = self.utxo_cache.lock().await;
+let current_epoch = self.utxo_cache_epoch.load(Ordering::Relaxed);
+if force_refresh || current_epoch == read_epoch {
+    *cache_guard = Some(CachedUtxoSet { ... });
+}
+```
+
+**Race Scenario**:
+1. Thread A: Loads `read_epoch=1`, fetches UTXOs
+2. Thread B: Invalidates cache (`epoch=2`), fetches fresh UTXOs, writes cache
+3. Thread A: Checks `current_epoch=2 != read_epoch=1`, **correctly** skips write
+4. **BUT**: If `force_refresh=true`, Thread A **unconditionally writes** stale data over Thread B's fresh cache
+
+**Concrete Fix**: Remove `force_refresh` from the cache write condition:
+
+```rust
+let current_epoch = self.utxo_cache_epoch.load(Ordering::Relaxed);
+if current_epoch == read_epoch {  // ← Remove force_refresh from this check
+    *cache_guard = Some(CachedUtxoSet {
+        cache_key,
+        fetched_at: Instant::now(),
+        entries: entries.clone(),
+    });
+}
+```
+
+---
+
+### **HIGH - Fee Calculation Does Not Account for Signature Size**
+
+**File**: `crates/common/src/provider/igra_transport.rs:437-444`
+
+**Issue**: The fee estimation uses a simplified formula that does **not** account for the actual signature mass overhead. Kaspa transaction mass includes signature data, which scales with the number of inputs.
+
+```rust
+fn estimated_fee_sompi(payload_len: usize, inputs: usize) -> u64 {
+    let kib = payload_len.div_ceil(1024);
+    let input_tail = u64::try_from(inputs.saturating_sub(1)).unwrap_or(u64::MAX);
+    BASE_SUBMIT_FEE_SOMPI
+        .saturating_add(kib.saturating_mul(FEE_PER_KIB_SOMPI))
+        .saturating_add(input_tail.saturating_mul(EXTRA_INPUT_FEE_SOMPI))
+}
+```
+
+**Consequence**: For transactions with many inputs, the actual transaction mass (calculated at line 389-393) may exceed what the fee covers, causing network rejection.
+
+**Concrete Fix**: Use the Kaspa mass calculator **during** fee estimation:
+
+```rust
+fn estimated_fee_sompi(
+    payload_len: usize,
+    inputs: usize,
+    network_type: KaspaNetworkType,
+) -> u64 {
+    let mass_calculator = KaspaMassCalculator::new_with_consensus_params(
+        &KaspaParams::from(network_type)
+    );
+    // Build dummy transaction to estimate mass
+    let dummy_tx = build_dummy_transaction(payload_len, inputs);
+    let mass = mass_calculator.calc_non_contextual_masses(&dummy_tx);
+    mass.saturating_mul(FEE_PER_MASS_SOMPI)
+}
+```
+
+---
+
+### **MEDIUM - Blocking Calls in Async Context Without Timeout**
+
+**File**: `crates/common/src/igra_store.rs:254-275, 286-315`
+
+**Issue**: Both `acquire_sender_lock` and `acquire_sender_lock_and_classify_nonce` are synchronous blocking functions that loop with `thread::sleep`. When called from async context via `spawn_blocking` (line 774), they can block the blocking thread pool for extended periods.
+
+```rust
+loop {
+    // ...
+    thread::sleep(Duration::from_millis(LOCK_POLL_INTERVAL_MS)); // ← Blocks thread
+}
+```
+
+**Concrete Fix**: Add an upper bound on iterations or total elapsed time:
+
+```rust
+let max_iterations = timeout_ms / LOCK_POLL_INTERVAL_MS;
+let mut iteration = 0;
+loop {
+    iteration += 1;
+    if iteration > max_iterations {
+        return Err(IgraStoreError::LockTimeout { sender: sender.to_string() });
+    }
+    // ... rest of loop
+}
+```
+
+---
+
+### **LOW - Fallback Key Material Warning Only**
+
+**Files**: 
+- `crates/wallets/src/opts.rs:518-341`
+- `crates/wallets/src/wallet_multi/mod.rs:282-287`
+
+**Issue**: The EVM-to-Kaspa key fallback only issues a `warn!()` log. Users may miss this warning in production environments, leading to unintended key reuse.
+
+**Non-Blocking Recommendation**: Consider making this an **error** instead of a warning if key separation is critical for security:
+
+```rust
+if let Some(fallback) = self.evm_fallback_kaspa_config() {
+    return Err(anyhow!(
+        "IGRA Kaspa wallet not configured. Refusing to reuse EVM keys. \
+         Please set --private-key-kaspa or --mnemonic-kaspa explicitly."
+    ));
+}
+```
+
+Or add a confirmation flag like `--allow-kaspa-evm-key-reuse`.
+
+---
+
+## Summary
+
+**Blocking Issues**:
+1. ✅ UTXO race condition (cache invalidation timing)
+2. ✅ Sender lock not released after nonce advancement
+3. ✅ UTXO cache epoch race with `force_refresh`
+4. ✅ Fee calculation missing signature mass
+
+**Non-Blocking Issues**:
+1. Blocking thread pool exhaustion risk (lock loops)
+2. Fallback key warning insufficient for security-critical deployments

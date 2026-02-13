@@ -111,7 +111,7 @@ mod invariant;
 pub use invariant::InvariantConfig;
 
 mod igra;
-pub use igra::{IgraConfig, IgraConfigError};
+pub use igra::{IgraConfig, IgraConfigError, IgraKaspaWalletConfig};
 
 mod inline;
 pub use inline::{InlineConfig, InlineConfigError, NatSpec};

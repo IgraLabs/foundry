@@ -230,7 +230,8 @@ impl ScriptArgs {
     pub async fn preprocess(self) -> Result<PreprocessedState> {
         let script_wallets = Wallets::new(self.wallets.get_multi_wallet().await?, self.evm.sender);
 
-        let (config, mut evm_opts) = self.load_config_and_evm_opts()?;
+        let (mut config, mut evm_opts) = self.load_config_and_evm_opts()?;
+        self.wallets.apply_igra_kaspa_wallet_overrides(&mut config);
         self.ensure_supported_igra_write_path_signer_flow(&config)?;
 
         if let Some(sender) = self.maybe_load_private_key()? {

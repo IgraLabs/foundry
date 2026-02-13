@@ -2804,13 +2804,13 @@ impl<'ast> AttributeCommentMapper<'ast> {
     }
 
     fn cache_comments(&mut self, state: &mut State<'_, 'ast>) {
-        let mut pending = None;
+        let mut pending: Option<usize> = None;
         for cmnt in state.comments.iter() {
             if cmnt.pos() >= self.limit_pos {
                 break;
             }
             match pending {
-                Some(ref p) => pending = Some(p + 1),
+                Some(p) => pending = Some(p + 1),
                 None => pending = Some(0),
             }
         }

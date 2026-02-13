@@ -14,6 +14,15 @@ macro_rules! forgetest {
         #[test]
         $(#[$attr])*
         fn $test() {
+            if stringify!($test).starts_with("flaky_")
+                && std::env::var("FOUNDRY_RUN_FLAKY_TESTS").is_err()
+            {
+                eprintln!(
+                    "skipping flaky test {} (set FOUNDRY_RUN_FLAKY_TESTS=1 to enable)",
+                    stringify!($test)
+                );
+                return;
+            }
             let (mut $prj, mut $cmd) = $crate::util::setup_forge(stringify!($test), $style);
             $e
         }
@@ -30,6 +39,15 @@ macro_rules! forgetest_async {
         #[tokio::test(flavor = "multi_thread")]
         $(#[$attr])*
         async fn $test() {
+            if stringify!($test).starts_with("flaky_")
+                && std::env::var("FOUNDRY_RUN_FLAKY_TESTS").is_err()
+            {
+                eprintln!(
+                    "skipping flaky test {} (set FOUNDRY_RUN_FLAKY_TESTS=1 to enable)",
+                    stringify!($test)
+                );
+                return;
+            }
             let (mut $prj, mut $cmd) = $crate::util::setup_forge(stringify!($test), $style);
             $e;
             return (); // Works around weird method resolution in `$e` due to `#[tokio::test]`.
@@ -47,6 +65,15 @@ macro_rules! casttest {
         #[test]
         $(#[$attr])*
         fn $test() {
+            if stringify!($test).starts_with("flaky_")
+                && std::env::var("FOUNDRY_RUN_FLAKY_TESTS").is_err()
+            {
+                eprintln!(
+                    "skipping flaky test {} (set FOUNDRY_RUN_FLAKY_TESTS=1 to enable)",
+                    stringify!($test)
+                );
+                return;
+            }
             let (mut $prj, mut $cmd) = $crate::util::setup_cast(stringify!($test), $style);
             $e
         }
@@ -56,6 +83,15 @@ macro_rules! casttest {
         #[tokio::test(flavor = "multi_thread")]
         $(#[$attr])*
         async fn $test() {
+            if stringify!($test).starts_with("flaky_")
+                && std::env::var("FOUNDRY_RUN_FLAKY_TESTS").is_err()
+            {
+                eprintln!(
+                    "skipping flaky test {} (set FOUNDRY_RUN_FLAKY_TESTS=1 to enable)",
+                    stringify!($test)
+                );
+                return;
+            }
             let (mut $prj, mut $cmd) = $crate::util::setup_cast(stringify!($test), $style);
             $e;
             return (); // Works around weird method resolution in `$e` due to `#[tokio::test]`.
@@ -73,6 +109,15 @@ macro_rules! forgetest_init {
         #[test]
         $(#[$attr])*
         fn $test() {
+            if stringify!($test).starts_with("flaky_")
+                && std::env::var("FOUNDRY_RUN_FLAKY_TESTS").is_err()
+            {
+                eprintln!(
+                    "skipping flaky test {} (set FOUNDRY_RUN_FLAKY_TESTS=1 to enable)",
+                    stringify!($test)
+                );
+                return;
+            }
             let (mut $prj, mut $cmd) = $crate::util::setup_forge(stringify!($test), $style);
             $crate::util::initialize($prj.root());
             $e

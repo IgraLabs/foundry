@@ -218,6 +218,8 @@ check_interval = 1
 [igra]
 enabled = false
 
+[igra.kaspa_wallet]
+
 [labels]
 
 [vyper]
@@ -1188,7 +1190,7 @@ forgetest_init!(test_default_config, |prj, cmd| {
     prj.write_config(Config::default());
     cmd.forge_fuse().args(["config"]).assert_success().stdout_eq(DEFAULT_CONFIG);
 
-    cmd.forge_fuse().args(["config", "--json"]).assert_success().stdout_eq(str![[r#"
+    cmd.forge_fuse().args(["config", "--json"]).assert_json_stdout(str![[r#"
 {
   "src": "src",
   "test": "test",
@@ -1397,15 +1399,31 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "include": [],
     "exclude": []
   },
-  "igra": {
-    "enabled": false,
-    "el_rpc_url": null,
-    "kaspa_rpc_url": null,
-    "expected_el_chain_id": null,
-    "kaspa_network": null,
-    "tx_id_prefix": null,
-    "el_receipt_timeout_secs": null
-  },
+	  "igra": {
+	    "enabled": false,
+	    "el_rpc_url": null,
+	    "kaspa_rpc_url": null,
+	    "expected_el_chain_id": null,
+	    "kaspa_network": null,
+	    "tx_id_prefix": null,
+	    "el_receipt_timeout_secs": null,
+	    "mining_timeout_secs": null,
+	    "payload_compression": null,
+	    "sender_lock_timeout_secs": null,
+	    "completed_retention_hours": null,
+	    "failed_retention_hours": null,
+	    "max_db_size_mb": null,
+	    "kaspa_wallet": {
+	      "private_key": null,
+	      "mnemonic": null,
+	      "mnemonic_passphrase": null,
+	      "mnemonic_derivation_path": null,
+	      "mnemonic_index": null,
+	      "keystore": null,
+	      "keystore_account": null,
+	      "password": null
+	    }
+	  },
   "fs_permissions": [
     {
       "access": "read",
@@ -1432,7 +1450,7 @@ forgetest_init!(test_default_config, |prj, cmd| {
   "script_execution_protection": true
 }
 
-"#]]);
+    "#]]);
 });
 
 forgetest_init!(test_optimizer_config, |prj, cmd| {

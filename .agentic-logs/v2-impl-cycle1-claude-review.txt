@@ -1,0 +1,212 @@
+## CRITICAL FINDINGS
+
+### 1. **BLOCKING: Submit No Longer Runs in Blocking Context** 
+**File**: `crates/common/src/provider/igra_transport.rs:656-658`
+
+**Issue**: The submitter trait changed from sync to async (`fn submit_payload` → `async fn submit_payload`), but the call site **removed** the `spawn_blocking` wrapper that was protecting against blocking the async runtime. The new code directly `.await`s the async trait method in an async context.
+
+**Risk**: If the underlying implementation (or any transitive dependency) performs blocking I/O without proper async instrumentation, this will block the Tokio runtime thread pool.
+
+**Original (safe)**:
+```rust
+let kaspa_tx_id = tokio::task::spawn_blocking(move || {
+    submitter.submit_payload(&submit_request)
+})
+.await
+.map_err(|err| {
+    Self::reject_error(&format!("IGRA submit task join failure: {err}"))
+})?
+```
+
+**New (potentially blocking)**:
+```rust
+let kaspa_tx_id = submitter
+    .submit_payload(&submit_request)
+    .await
+    .map_err(|err| Self::reject_error(&err))?;
+```
+
+**Concrete Fix**: If `InProcessKaspaPayloadSubmitter::submit_payload` contains any CPU-intensive work (signing, mining) or uses non-async I/O, either:
+1. Keep `spawn_blocking` and make the trait sync again, OR
+2. Ensure all blocking operations inside `submit_payload` are wrapped in their own `spawn_blocking` calls.
+
+Reviewing the implementation (lines 290-338), I see:
+- `GrpcClient::connect` - async RPC (OK)
+- `build_signed_payload_transaction` - **CPU-intensive signing/mass calculation** (line 318) - **THIS NEEDS SPAWN_BLOCKING**
+- `client.submit_transaction` - async RPC (OK)
+
+---
+
+### 2. **BLOCKING: Sender Lock Retry Logic May Spin on Non-Busy Errors**
+**File**: `crates/common/src/igra_store.rs:83-84`
+
+**Issue**: The new retry logic only checks for `DatabaseBusy | DatabaseLocked` errors, but swallows them silently and continues the loop. If a *persistent* database error occurs (e.g., corruption, disk full), the loop will spin until timeout.
+
+**Lines**:
+```rust
+Err(err) if is_retryable_busy_error(&err) => {}
+Err(err) => return Err(err),
+```
+
+**Risk**: Silent failure mode. If `try_acquire_sender_lock_once` returns an error that *should* be retried (e.g., transient I/O error), but isn't `DatabaseBusy/DatabaseLocked`, it will immediately abort instead of retrying.
+
+**Concrete Fix**: Add logging for retryable errors:
+```rust
+Err(err) if is_retryable_busy_error(&err) => {
+    trace!("Sender lock acquisition retrying on busy error: {err}");
+}
+Err(err) => return Err(err),
+```
+
+Also verify that `TransactionBehavior::Immediate` (lines 110, 119) is correct for your locking semantics. `Immediate` locks immediately but allows concurrent readers. If you need exclusive writes, consider `Exclusive`.
+
+---
+
+### 3. **MODERATE: Key Resolution Fallback Order May Leak EVM Keys to Kaspa**
+**File**: `crates/wallets/src/opts.rs:1004-1047` and `crates/wallets/src/wallet_multi/mod.rs:1161-1233`
+
+**Issue**: The fallback logic silently uses EVM private keys/mnemonics as Kaspa keys if no explicit Kaspa key is provided. While this is documented as intentional (design spec says "fallback to EVM signer"), it creates a **critical key hygiene violation**:
+
+- **EVM keys are secp256k1 ECDSA keys**
+- **Kaspa keys are secp256k1 Schnorr keys**
+
+While the underlying curve is the same, **using the same private key for both ECDSA and Schnorr signatures on different chains is cryptographically unsafe** and violates standard key separation practices.
+
+**Lines**:
+- `crates/wallets/src/opts.rs:1019-1025` (EVM private_key fallback)
+- `crates/wallets/src/wallet_multi/mod.rs:1177-1185` (EVM private_key fallback)
+
+**Risk**: 
+1. **Cross-chain replay attacks** if the key is compromised
+2. **Key exposure** if one chain's signature scheme has a flaw
+3. **User confusion** - users may not realize they're using the same key on both chains
+
+**Concrete Fix**:
+1. **Add a loud warning** when fallback occurs:
+```rust
+if let Some(fallback) = self.evm_fallback_kaspa_config() {
+    warn!("IGRA mode: Using EVM signer as Kaspa key. This is insecure for production. Set --private-key-kaspa explicitly.");
+    config.igra.kaspa_wallet = fallback;
+}
+```
+
+2. **Require explicit opt-in** via config flag:
+```rust
+if config.igra.allow_evm_kaspa_key_fallback.unwrap_or(false) {
+    // fallback logic
+} else {
+    return Err(IGRA_KEY_RESOLUTION_ERROR);
+}
+```
+
+---
+
+### 4. **MODERATE: UTXO Cache Correctness Issue**
+**File**: `crates/common/src/provider/igra_transport.rs:351-359`
+
+**Issue**: The UTXO cache uses `TokioMutex` (async mutex) but the cache key doesn't include the `source_address` public key - only the **string representation**. If address formatting changes or if multiple addresses map to the same string (unlikely but possible with different network prefixes), cache corruption occurs.
+
+**More Critical**: The cache is **NOT invalidated** after a successful transaction submission (line 326). This means:
+1. Submit TX 1 → uses UTXO A
+2. UTXO A is now spent
+3. Submit TX 2 within 20 seconds → **reuses stale UTXO A** → transaction fails
+
+**Lines**:
+```rust
+let cache_key = format!("{rpc_url}|{network}|{source_address}");
+```
+
+**Concrete Fix**: Invalidate cache after successful submission:
+```rust
+match client.submit_transaction(rpc_transaction, false).await {
+    Ok(tx_id) => {
+        // CRITICAL: Invalidate UTXO cache since we just spent UTXOs
+        let mut cache_guard = self.utxo_cache.lock().await;
+        *cache_guard = None;
+        return Ok(tx_id.to_string());
+    }
+```
+
+---
+
+### 5. **MODERATE: Missing Test Coverage for Cross-Process Lock Correctness**
+**File**: `crates/common/src/provider/igra_transport.rs:1127-end`
+
+**Issue**: The test suite includes a `RecordingSubmitter` mock (lines 1202-1233) but **no tests for concurrent sender lock acquisition** across multiple in-flight submissions. The critical `acquire_sender_lock` retry logic (lines 263-291) is untested.
+
+**Missing Tests**:
+1. Concurrent lock acquisition from multiple tasks
+2. Lock timeout behavior
+3. Retry on `DatabaseBusy` errors
+4. Lock release on transaction failure
+
+**Concrete Fix**: Add integration tests:
+```rust
+#[tokio::test]
+async fn test_concurrent_sender_lock_acquisition() {
+    // Spawn 10 tasks trying to acquire same sender lock
+    // Verify only one succeeds at a time
+    // Verify no deadlocks
+}
+
+#[tokio::test]
+async fn test_sender_lock_timeout() {
+    // Hold lock for longer than timeout
+    // Verify second acquisition fails with LockTimeout
+}
+```
+
+---
+
+### 6. **LOW: Inconsistent Error Handling in Key Resolution**
+**File**: `crates/common/src/provider/igra_transport.rs:411-498`
+
+**Issue**: Key resolution functions return `Result<[u8; 32], String>` instead of proper error types. This makes error handling fragile and prevents structured error reporting.
+
+**Example**: Line 432-435:
+```rust
+let key = private_key.parse::<B256>().map_err(|_| {
+    format!("{IGRA_KEY_RESOLUTION_ERROR}: provided --private-key-kaspa value is invalid hex")
+})?;
+```
+
+**Concrete Fix**: Define proper error enum:
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum KeyResolutionError {
+    #[error("Invalid private key hex: {0}")]
+    InvalidHex(String),
+    #[error("Mnemonic file not found: {0}")]
+    MnemonicFileNotFound(#[from] std::io::Error),
+    // ... etc
+}
+```
+
+---
+
+### 7. **LOW: Hardcoded Fee Constants May Underestimate Fees**
+**File**: `crates/common/src/provider/igra_transport.rs:209-216`
+
+**Issue**: Fee calculation uses hardcoded constants:
+```rust
+const BASE_SUBMIT_FEE_SOMPI: u64 = 200_000;
+const FEE_PER_KIB_SOMPI: u64 = 20_000;
+```
+
+These may become outdated if Kaspa network fees increase. No fallback to query current fee rates from RPC.
+
+**Concrete Fix**: Add RPC call to fetch current fee rate and use as multiplier:
+```rust
+let fee_rate = client.get_fee_estimate().await.unwrap_or(FEE_PER_KIB_SOMPI);
+```
+
+---
+
+## SUMMARY OF BLOCKING ISSUES
+
+1. **CRITICAL**: Submit no longer runs in blocking context - will block Tokio runtime during signing
+2. **CRITICAL**: UTXO cache not invalidated after submission - will cause double-spend failures
+3. **MODERATE**: Cross-chain key reuse creates security risk
+4. **MODERATE**: Missing concurrency tests for sender lock
+
+**RECOMMENDATION**: Fix issues #1 and #2 before merging. Issues #3-7 should be addressed in follow-up PRs with proper design review.

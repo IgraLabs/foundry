@@ -105,6 +105,7 @@ impl CreateArgs {
     /// Executes the command to create a contract
     pub async fn run(mut self) -> Result<()> {
         let mut config = self.load_config()?;
+        self.eth.wallet.apply_igra_kaspa_wallet_overrides(&mut config);
 
         // Install missing dependencies.
         if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
@@ -173,6 +174,7 @@ impl CreateArgs {
 
         // Whether to broadcast the transaction or not
         let dry_run = !self.broadcast;
+        let igra_enabled = config.igra.enabled;
 
         if self.unlocked {
             // Deploy with unlocked account
@@ -186,6 +188,7 @@ impl CreateArgs {
                 sender,
                 config.transaction_timeout,
                 id,
+                igra_enabled,
                 dry_run,
             )
             .await
@@ -205,6 +208,7 @@ impl CreateArgs {
                 deployer,
                 config.transaction_timeout,
                 id,
+                igra_enabled,
                 dry_run,
             )
             .await
@@ -285,6 +289,7 @@ impl CreateArgs {
         deployer_address: Address,
         timeout: u64,
         id: ArtifactId,
+        igra_enabled: bool,
         dry_run: bool,
     ) -> Result<()> {
         let bin = bin.into_bytes().unwrap_or_default();
@@ -338,17 +343,52 @@ impl CreateArgs {
             deployer.tx.set_gas_price(gas_price);
         } else {
             let estimate = provider.estimate_eip1559_fees().await.wrap_err("Failed to estimate EIP1559 fees. This chain might not support EIP1559, try adding --legacy to your command.")?;
+            // IGRA adapter enforces a minimum fee policy for EIP-1559 txs via
+            // `maxPriorityFeePerGas`. On IGRA networks, `eth_gasPrice` reflects this minimum
+            // better than `eth_feeHistory` percentiles, so when IGRA mode is enabled we use it as
+            // a floor for default fee filling.
+            let floor = if igra_enabled { Some(provider.get_gas_price().await?) } else { None };
+
             let priority_fee = if let Some(priority_fee) = self.tx.priority_gas_price {
-                priority_fee.to()
+                let value = priority_fee.to();
+                if let Some(floor) = floor {
+                    if value < floor {
+                        eyre::bail!(
+                            "IGRA requires maxPriorityFeePerGas >= eth_gasPrice ({} < {}); set --priority-gas-price accordingly",
+                            value,
+                            floor
+                        );
+                    }
+                }
+                value
             } else {
-                estimate.max_priority_fee_per_gas
+                let mut value = estimate.max_priority_fee_per_gas;
+                if let Some(floor) = floor {
+                    value = value.max(floor);
+                }
+                value
             };
             let max_fee = if let Some(max_fee) = self.tx.gas_price {
-                max_fee.to()
+                let value = max_fee.to();
+                if let Some(floor) = floor {
+                    if value < floor {
+                        eyre::bail!(
+                            "IGRA requires maxFeePerGas >= eth_gasPrice ({} < {}); set --gas-price accordingly",
+                            value,
+                            floor
+                        );
+                    }
+                }
+                value
             } else {
-                estimate.max_fee_per_gas
+                let mut value = estimate.max_fee_per_gas;
+                if let Some(floor) = floor {
+                    value = value.max(floor);
+                }
+                value
             };
 
+            let max_fee = max_fee.max(priority_fee);
             deployer.tx.set_max_fee_per_gas(max_fee);
             deployer.tx.set_max_priority_fee_per_gas(priority_fee);
         }

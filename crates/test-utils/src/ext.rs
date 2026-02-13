@@ -1,6 +1,9 @@
-use crate::prj::{TestCommand, TestProject, clone_remote, setup_forge};
+use crate::prj::{OutputExt, TestCommand, TestProject, clone_remote, setup_forge};
 use foundry_compilers::PathStyle;
 use std::process::Command;
+
+const MISSING_VYPER_COMPILERS_ERR: &str =
+    "Found Vyper sources, but no compiler versions are available for it";
 
 /// External test builder
 #[derive(Clone, Debug)]
@@ -182,6 +185,14 @@ impl ExtTester {
         test_cmd.env("FOUNDRY_INVARIANT_DEPTH", "15");
         test_cmd.env("FOUNDRY_ALLOW_INTERNAL_EXPECT_REVERT", "true");
 
-        test_cmd.assert_success();
+        let assert = test_cmd.assert();
+        if !assert.get_output().status.success() &&
+            assert.get_output().stderr_lossy().contains(MISSING_VYPER_COMPILERS_ERR)
+        {
+            test_debug!("skipping external test {}: {MISSING_VYPER_COMPILERS_ERR}", self.name);
+            return;
+        }
+
+        assert.success();
     }
 }

@@ -2,7 +2,9 @@ use crate::{signer::WalletSigner, utils, wallet_raw::RawWalletOpts};
 use alloy_primitives::Address;
 use clap::Parser;
 use eyre::Result;
+use foundry_config::{Config, IgraKaspaWalletConfig};
 use serde::Serialize;
+use tracing::warn;
 
 /// The wallet options can either be:
 /// 1. Raw (via private key / mnemonic file, see `RawWallet`)
@@ -28,6 +30,9 @@ pub struct WalletOpts {
 
     #[command(flatten)]
     pub raw: RawWalletOpts,
+
+    #[command(flatten)]
+    pub kaspa: KaspaWalletOpts,
 
     /// Use the keystore in the given folder or file.
     #[arg(
@@ -134,6 +139,99 @@ pub struct WalletOpts {
     pub browser_development: bool,
 }
 
+/// Kaspa key source options used by IGRA mode.
+#[derive(Clone, Debug, Default, Serialize, Parser)]
+#[command(next_help_heading = "Wallet options - kaspa", about = None, long_about = None)]
+pub struct KaspaWalletOpts {
+    /// Use the provided Kaspa private key.
+    #[arg(
+        long = "private-key-kaspa",
+        env = "KASPA_PRIVATE_KEY",
+        value_name = "RAW_PRIVATE_KEY",
+        hide_env_values = true
+    )]
+    pub private_key_kaspa: Option<String>,
+
+    /// Use the Kaspa mnemonic phrase.
+    #[arg(
+        long = "mnemonic-kaspa",
+        env = "KASPA_MNEMONIC",
+        value_name = "MNEMONIC",
+        hide_env_values = true
+    )]
+    pub mnemonic_kaspa: Option<String>,
+
+    /// Use a BIP39 passphrase for the Kaspa mnemonic.
+    #[arg(
+        long = "mnemonic-passphrase-kaspa",
+        env = "KASPA_MNEMONIC_PASSPHRASE",
+        value_name = "PASSPHRASE",
+        hide_env_values = true
+    )]
+    pub mnemonic_passphrase_kaspa: Option<String>,
+
+    /// Kaspa mnemonic derivation path override.
+    #[arg(
+        long = "mnemonic-derivation-path-kaspa",
+        env = "KASPA_MNEMONIC_DERIVATION_PATH",
+        value_name = "PATH"
+    )]
+    pub mnemonic_derivation_path_kaspa: Option<String>,
+
+    /// Kaspa mnemonic index override.
+    #[arg(long = "mnemonic-index-kaspa", env = "KASPA_MNEMONIC_INDEX", value_name = "INDEX")]
+    pub mnemonic_index_kaspa: Option<u32>,
+
+    /// Use a Kaspa keystore file.
+    #[arg(long = "keystore-kaspa", env = "KASPA_KEYSTORE", value_name = "PATH")]
+    pub keystore_kaspa: Option<String>,
+
+    /// Use a Kaspa keystore account alias.
+    #[arg(
+        long = "keystore-account-kaspa",
+        env = "KASPA_KEYSTORE_ACCOUNT",
+        value_name = "ACCOUNT_NAME"
+    )]
+    pub keystore_account_kaspa: Option<String>,
+
+    /// Kaspa keystore password.
+    #[arg(
+        long = "password-kaspa",
+        env = "KASPA_PASSWORD",
+        value_name = "PASSWORD",
+        hide_env_values = true
+    )]
+    pub password_kaspa: Option<String>,
+}
+
+impl KaspaWalletOpts {
+    /// Returns true when explicit Kaspa signer source was provided.
+    pub fn is_set(&self) -> bool {
+        self.private_key_kaspa.is_some() ||
+            self.mnemonic_kaspa.is_some() ||
+            self.mnemonic_passphrase_kaspa.is_some() ||
+            self.mnemonic_derivation_path_kaspa.is_some() ||
+            self.mnemonic_index_kaspa.is_some() ||
+            self.keystore_kaspa.is_some() ||
+            self.keystore_account_kaspa.is_some() ||
+            self.password_kaspa.is_some()
+    }
+
+    /// Converts CLI/env Kaspa options to config shape.
+    pub fn as_config(&self) -> IgraKaspaWalletConfig {
+        IgraKaspaWalletConfig {
+            private_key: self.private_key_kaspa.clone(),
+            mnemonic: self.mnemonic_kaspa.clone(),
+            mnemonic_passphrase: self.mnemonic_passphrase_kaspa.clone(),
+            mnemonic_derivation_path: self.mnemonic_derivation_path_kaspa.clone(),
+            mnemonic_index: self.mnemonic_index_kaspa,
+            keystore: self.keystore_kaspa.clone(),
+            keystore_account: self.keystore_account_kaspa.clone(),
+            password: self.password_kaspa.clone(),
+        }
+    }
+}
+
 impl WalletOpts {
     pub async fn signer(&self) -> Result<WalletSigner> {
         trace!("start finding signer");
@@ -223,6 +321,55 @@ using the --from flag."
 
         Ok(signer)
     }
+
+    /// Applies CLI/env Kaspa wallet overrides into IGRA config with highest precedence.
+    pub fn apply_igra_kaspa_wallet_overrides(&self, config: &mut Config) {
+        if self.kaspa.is_set() {
+            config.igra.kaspa_wallet = self.kaspa.as_config();
+            return;
+        }
+
+        if !config.igra.kaspa_wallet.is_empty() {
+            return;
+        }
+
+        if let Some(fallback) = self.evm_fallback_kaspa_config() {
+            warn!(
+                "IGRA Kaspa wallet fallback is reusing EVM signer key material; prefer explicit --private-key-kaspa or --mnemonic-kaspa for key separation"
+            );
+            config.igra.kaspa_wallet = fallback;
+        }
+    }
+
+    fn evm_fallback_kaspa_config(&self) -> Option<IgraKaspaWalletConfig> {
+        if let Some(private_key) = self.raw.private_key.clone() {
+            return Some(IgraKaspaWalletConfig {
+                private_key: Some(private_key),
+                ..Default::default()
+            });
+        }
+
+        if let Some(mnemonic) = self.raw.mnemonic.clone() {
+            return Some(IgraKaspaWalletConfig {
+                mnemonic: Some(mnemonic),
+                mnemonic_passphrase: self.raw.mnemonic_passphrase.clone(),
+                mnemonic_derivation_path: self.raw.hd_path.clone(),
+                mnemonic_index: Some(self.raw.mnemonic_index),
+                ..Default::default()
+            });
+        }
+
+        if self.keystore_path.is_some() || self.keystore_account_name.is_some() {
+            return Some(IgraKaspaWalletConfig {
+                keystore: self.keystore_path.clone(),
+                keystore_account: self.keystore_account_name.clone(),
+                password: self.keystore_password.clone(),
+                ..Default::default()
+            });
+        }
+
+        None
+    }
 }
 
 impl From<RawWalletOpts> for WalletOpts {
@@ -285,6 +432,7 @@ mod tests {
             browser_port: 9545,
             browser_development: false,
             browser_disable_open: false,
+            kaspa: KaspaWalletOpts::default(),
         };
         match wallet.signer().await {
             Ok(_) => {
@@ -297,5 +445,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parses_kaspa_wallet_opts_from_cli() {
+        let wallet: WalletOpts = WalletOpts::parse_from([
+            "foundry-cli",
+            "--private-key-kaspa",
+            "0x1234",
+            "--mnemonic-index-kaspa",
+            "7",
+        ]);
+
+        assert_eq!(wallet.kaspa.private_key_kaspa.as_deref(), Some("0x1234"));
+        assert_eq!(wallet.kaspa.mnemonic_index_kaspa, Some(7));
+        assert!(wallet.kaspa.is_set());
+    }
+
+    #[test]
+    fn applies_kaspa_wallet_overrides_to_igra_config() {
+        let wallet: WalletOpts = WalletOpts::parse_from([
+            "foundry-cli",
+            "--private-key-kaspa",
+            "0xabcd",
+            "--mnemonic-kaspa",
+            "test test test test test test test test test test test junk",
+            "--mnemonic-derivation-path-kaspa",
+            "m/44'/111111'/0'/0/0",
+        ]);
+
+        let mut config = Config::default();
+        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
+
+        assert_eq!(config.igra.kaspa_wallet.private_key.as_deref(), Some("0xabcd"));
+        assert_eq!(
+            config.igra.kaspa_wallet.mnemonic.as_deref(),
+            Some("test test test test test test test test test test test junk")
+        );
+        assert_eq!(
+            config.igra.kaspa_wallet.mnemonic_derivation_path.as_deref(),
+            Some("m/44'/111111'/0'/0/0")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_evm_private_key_when_kaspa_key_missing() {
+        let wallet: WalletOpts =
+            WalletOpts::parse_from(["foundry-cli", "--private-key", "0x1111111111111111111111111111111111111111111111111111111111111111"]);
+
+        let mut config = Config::default();
+        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
+
+        assert_eq!(
+            config.igra.kaspa_wallet.private_key.as_deref(),
+            Some("0x1111111111111111111111111111111111111111111111111111111111111111")
+        );
+        assert!(config.igra.kaspa_wallet.mnemonic.is_none());
+    }
+
+    #[test]
+    fn explicit_kaspa_key_overrides_evm_fallback() {
+        let wallet: WalletOpts = WalletOpts::parse_from([
+            "foundry-cli",
+            "--private-key",
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "--private-key-kaspa",
+            "0x2222222222222222222222222222222222222222222222222222222222222222",
+        ]);
+
+        let mut config = Config::default();
+        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
+
+        assert_eq!(
+            config.igra.kaspa_wallet.private_key.as_deref(),
+            Some("0x2222222222222222222222222222222222222222222222222222222222222222")
+        );
     }
 }

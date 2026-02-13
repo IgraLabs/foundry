@@ -21,6 +21,16 @@ fn lockfile_get(root: &Path, dep_path: &Path) -> Option<DepIdentifier> {
     l.get(dep_path).cloned()
 }
 
+fn skip_unless_ext_enabled(test_name: &str) -> bool {
+    if std::env::var("FOUNDRY_RUN_EXT_INTEGRATION_TESTS").is_err() {
+        eprintln!(
+            "skipping external integration test {test_name} (set FOUNDRY_RUN_EXT_INTEGRATION_TESTS=1 to enable)"
+        );
+        return true;
+    }
+    false
+}
+
 // checks missing dependencies are auto installed
 forgetest_init!(can_install_missing_deps_build, |prj, cmd| {
     prj.initialize_default_contracts();
@@ -449,6 +459,9 @@ Compiler run successful!
 
 #[tokio::test]
 async fn uni_v4_core_sync_foundry_lock() {
+    if skip_unless_ext_enabled("uni_v4_core_sync_foundry_lock") {
+        return;
+    }
     let (prj, mut cmd) =
         ExtTester::new("Uniswap", "v4-core", "e50237c43811bd9b526eff40f26772152a42daba")
             .setup_forge_prj(true);
@@ -500,6 +513,9 @@ async fn uni_v4_core_sync_foundry_lock() {
 
 #[tokio::test]
 async fn oz_contracts_sync_foundry_lock() {
+    if skip_unless_ext_enabled("oz_contracts_sync_foundry_lock") {
+        return;
+    }
     let (prj, mut cmd) = ExtTester::new(
         "OpenZeppelin",
         "openzeppelin-contracts",
@@ -557,6 +573,9 @@ async fn oz_contracts_sync_foundry_lock() {
 
 #[tokio::test]
 async fn correctly_sync_dep_with_multiple_version() {
+    if skip_unless_ext_enabled("correctly_sync_dep_with_multiple_version") {
+        return;
+    }
     let (prj, mut cmd) = ExtTester::new(
         "yash-atreya",
         "sync-lockfile-multi-version-dep",
@@ -592,6 +611,9 @@ async fn correctly_sync_dep_with_multiple_version() {
 }
 
 forgetest_init!(sync_on_forge_update, |prj, cmd| {
+    if skip_unless_ext_enabled("sync_on_forge_update") {
+        return;
+    }
     let git = Git::new(prj.root());
 
     let submodules = git.submodules().unwrap();

@@ -8,11 +8,20 @@ use foundry_test_utils::{
     rpc::{next_etherscan_api_key, next_http_archive_rpc_url},
     util::OutputExt,
 };
+use tokio::time::{Duration, sleep};
+
+const ETHERSCAN_RATE_LIMIT_ERR: &str = "Max calls per sec rate limit reached";
+const ETHERSCAN_RETRY_ATTEMPTS: usize = 4;
+const ETHERSCAN_RETRY_DELAY_SECS: u64 = 2;
+
+fn is_etherscan_rate_limited(msg: &str) -> bool {
+    msg.contains(ETHERSCAN_RATE_LIMIT_ERR)
+}
 
 #[expect(clippy::too_many_arguments)]
 async fn test_verify_bytecode(
     prj: TestProject,
-    mut cmd: TestCommand,
+    _cmd: TestCommand,
     addr: &str,
     contract_name: &str,
     constructor_args: Option<Vec<&str>>,
@@ -22,38 +31,72 @@ async fn test_verify_bytecode(
     expected_matches: (&str, &str),
     chain: Chain,
 ) {
-    let etherscan_key = next_etherscan_api_key();
     let rpc_url = next_http_archive_rpc_url();
 
     // fetch and flatten source code using the library directly
-    let source_code = fetch_etherscan_source_flattened(addr, &etherscan_key, chain)
-        .await
-        .expect("failed to fetch source code from etherscan");
+    let source_code = {
+        let mut source = None;
+        for attempt in 0..ETHERSCAN_RETRY_ATTEMPTS {
+            let etherscan_key = next_etherscan_api_key();
+            match fetch_etherscan_source_flattened(addr, &etherscan_key, chain).await {
+                Ok(found) => {
+                    source = Some(found);
+                    break;
+                }
+                Err(err)
+                    if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS &&
+                        is_etherscan_rate_limited(&err.to_string()) =>
+                {
+                    sleep(Duration::from_secs(ETHERSCAN_RETRY_DELAY_SECS)).await;
+                }
+                Err(err) => panic!("failed to fetch source code from etherscan: {err}"),
+            }
+        }
+        source.expect("failed to fetch source code from etherscan after retries")
+    };
 
     prj.add_source(contract_name, &source_code);
     prj.write_config(config);
 
-    let etherscan_key = next_etherscan_api_key();
-    let mut args = vec![
-        "verify-bytecode",
-        addr,
-        contract_name,
-        "--etherscan-api-key",
-        &etherscan_key,
-        "--verifier",
-        verifier,
-        "--verifier-url",
-        verifier_url,
-        "--rpc-url",
-        &rpc_url,
-    ];
+    let output = {
+        let mut maybe_output = None;
+        for attempt in 0..ETHERSCAN_RETRY_ATTEMPTS {
+            let etherscan_key = next_etherscan_api_key();
+            let mut args = vec![
+                "verify-bytecode",
+                addr,
+                contract_name,
+                "--etherscan-api-key",
+                &etherscan_key,
+                "--verifier",
+                verifier,
+                "--verifier-url",
+                verifier_url,
+                "--rpc-url",
+                &rpc_url,
+            ];
 
-    if let Some(constructor_args) = constructor_args {
-        args.push("--constructor-args");
-        args.extend(constructor_args.iter());
-    }
+            if let Some(ref constructor_args) = constructor_args {
+                args.push("--constructor-args");
+                args.extend(constructor_args.iter().copied());
+            }
 
-    let output = cmd.forge_fuse().args(args).assert_success().get_output().stdout_lossy();
+            let mut attempt_cmd = prj.forge_command();
+            let assert = attempt_cmd.forge_fuse().args(args).assert();
+            if assert.get_output().status.success() {
+                maybe_output = Some(assert.get_output().stdout_lossy());
+                break;
+            }
+            if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS &&
+                is_etherscan_rate_limited(&assert.get_output().stderr_lossy())
+            {
+                sleep(Duration::from_secs(ETHERSCAN_RETRY_DELAY_SECS)).await;
+                continue;
+            }
+            assert.success();
+        }
+        maybe_output.expect("verify-bytecode command did not succeed after retries")
+    };
 
     assert!(
         output
@@ -68,7 +111,7 @@ async fn test_verify_bytecode(
 #[expect(clippy::too_many_arguments)]
 async fn test_verify_bytecode_with_ignore(
     prj: TestProject,
-    mut cmd: TestCommand,
+    _cmd: TestCommand,
     addr: &str,
     contract_name: &str,
     config: Config,
@@ -78,37 +121,70 @@ async fn test_verify_bytecode_with_ignore(
     ignore: &str,
     chain: Chain,
 ) {
-    let etherscan_key = next_etherscan_api_key();
     let rpc_url = next_http_archive_rpc_url();
 
     // fetch and flatten source code using the library directly
-    let source_code = fetch_etherscan_source_flattened(addr, &etherscan_key, chain)
-        .await
-        .expect("failed to fetch source code from etherscan");
+    let source_code = {
+        let mut source = None;
+        for attempt in 0..ETHERSCAN_RETRY_ATTEMPTS {
+            let etherscan_key = next_etherscan_api_key();
+            match fetch_etherscan_source_flattened(addr, &etherscan_key, chain).await {
+                Ok(found) => {
+                    source = Some(found);
+                    break;
+                }
+                Err(err)
+                    if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS &&
+                        is_etherscan_rate_limited(&err.to_string()) =>
+                {
+                    sleep(Duration::from_secs(ETHERSCAN_RETRY_DELAY_SECS)).await;
+                }
+                Err(err) => panic!("failed to fetch source code from etherscan: {err}"),
+            }
+        }
+        source.expect("failed to fetch source code from etherscan after retries")
+    };
 
     prj.add_source(contract_name, &source_code);
     prj.write_config(config);
 
-    let output = cmd
-        .forge_fuse()
-        .args([
-            "verify-bytecode",
-            addr,
-            contract_name,
-            "--etherscan-api-key",
-            &etherscan_key,
-            "--verifier",
-            verifier,
-            "--verifier-url",
-            verifier_url,
-            "--rpc-url",
-            &rpc_url,
-            "--ignore",
-            ignore,
-        ])
-        .assert_success()
-        .get_output()
-        .stdout_lossy();
+    let output = {
+        let mut maybe_output = None;
+        for attempt in 0..ETHERSCAN_RETRY_ATTEMPTS {
+            let etherscan_key = next_etherscan_api_key();
+            let mut attempt_cmd = prj.forge_command();
+            let assert = attempt_cmd
+                .forge_fuse()
+                .args([
+                    "verify-bytecode",
+                    addr,
+                    contract_name,
+                    "--etherscan-api-key",
+                    &etherscan_key,
+                    "--verifier",
+                    verifier,
+                    "--verifier-url",
+                    verifier_url,
+                    "--rpc-url",
+                    &rpc_url,
+                    "--ignore",
+                    ignore,
+                ])
+                .assert();
+            if assert.get_output().status.success() {
+                maybe_output = Some(assert.get_output().stdout_lossy());
+                break;
+            }
+            if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS &&
+                is_etherscan_rate_limited(&assert.get_output().stderr_lossy())
+            {
+                sleep(Duration::from_secs(ETHERSCAN_RETRY_DELAY_SECS)).await;
+                continue;
+            }
+            assert.success();
+        }
+        maybe_output.expect("verify-bytecode --ignore command did not succeed after retries")
+    };
 
     if ignore == "creation" {
         assert!(!output.contains(

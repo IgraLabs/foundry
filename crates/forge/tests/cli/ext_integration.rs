@@ -3,9 +3,22 @@ use foundry_test_utils::util::ExtTester;
 // Actively maintained tests
 // Last updated: June 19th 2025
 
+fn skip_unless_ext_enabled(test_name: &str) -> bool {
+    if std::env::var("FOUNDRY_RUN_EXT_INTEGRATION_TESTS").is_err() {
+        eprintln!(
+            "skipping external integration test {test_name} (set FOUNDRY_RUN_EXT_INTEGRATION_TESTS=1 to enable)"
+        );
+        return true;
+    }
+    false
+}
+
 // <https://github.com/foundry-rs/forge-std>
 #[test]
 fn forge_std() {
+    if skip_unless_ext_enabled("forge_std") {
+        return;
+    }
     ExtTester::new("foundry-rs", "forge-std", "b69e66b0ff79924d487d49bf7fb47c9ec326acba")
         // Skip fork tests.
         .args(["--nmc", "Fork"])
@@ -17,6 +30,9 @@ fn forge_std() {
 #[test]
 #[cfg_attr(windows, ignore = "Windows cannot find installed programs")]
 fn prb_math() {
+    if skip_unless_ext_enabled("prb_math") {
+        return;
+    }
     ExtTester::new("PaulRBerg", "prb-math", "aad73cfc6cdc2c9b660199b5b1e9db391ea48640")
         .install_command(&["bun", "install", "--prefer-offline"])
         // Try npm if bun fails / is not installed.
@@ -28,6 +44,9 @@ fn prb_math() {
 #[test]
 #[cfg_attr(windows, ignore = "Windows cannot find installed programs")]
 fn prb_proxy() {
+    if skip_unless_ext_enabled("prb_proxy") {
+        return;
+    }
     ExtTester::new("PaulRBerg", "prb-proxy", "e45f5325d4b6003227a6c4bdaefac9453f89de2e")
         .install_command(&["bun", "install", "--prefer-offline"])
         // Try npm if bun fails / is not installed.
@@ -39,6 +58,9 @@ fn prb_proxy() {
 #[test]
 #[cfg_attr(windows, ignore = "Windows cannot find installed programs")]
 fn sablier_v2_core() {
+    if skip_unless_ext_enabled("sablier_v2_core") {
+        return;
+    }
     let mut tester =
         ExtTester::new("sablier-labs", "v2-core", "d85521f5615f6c19612ff250ee89c57b9afa6aa2")
             // Skip fork tests.
@@ -64,6 +86,9 @@ fn sablier_v2_core() {
 // <https://github.com/Vectorized/solady>
 #[test]
 fn solady() {
+    if skip_unless_ext_enabled("solady") {
+        return;
+    }
     let mut tester =
         ExtTester::new("Vectorized", "solady", "cbcfe0009477aa329574f17e8db0a05703bb8bdd");
 
@@ -82,6 +107,9 @@ fn solady() {
 #[cfg_attr(windows, ignore = "Windows cannot find installed programs")]
 #[cfg(not(feature = "isolate-by-default"))]
 fn snekmate() {
+    if skip_unless_ext_enabled("snekmate") {
+        return;
+    }
     ExtTester::new("pcaversaccio", "snekmate", "601031d244475b160a00f73053532528bf665cc3")
         .install_command(&["pnpm", "install", "--prefer-offline"])
         // Try npm if pnpm fails / is not installed.
@@ -92,6 +120,9 @@ fn snekmate() {
 // <https://github.com/mds1/multicall>
 #[test]
 fn mds1_multicall3() {
+    if skip_unless_ext_enabled("mds1_multicall3") {
+        return;
+    }
     ExtTester::new("mds1", "multicall", "5f90062160aedb7c807fadca469ac783a0557b57").run();
 }
 
@@ -100,6 +131,9 @@ fn mds1_multicall3() {
 // <https://github.com/Arachnid/solidity-stringutils>
 #[test]
 fn solidity_stringutils() {
+    if skip_unless_ext_enabled("solidity_stringutils") {
+        return;
+    }
     ExtTester::new("Arachnid", "solidity-stringutils", "4b2fcc43fa0426e19ce88b1f1ec16f5903a2e461")
         .run();
 }
@@ -107,12 +141,18 @@ fn solidity_stringutils() {
 // <https://github.com/m1guelpf/lil-web3>
 #[test]
 fn lil_web3() {
+    if skip_unless_ext_enabled("lil_web3") {
+        return;
+    }
     ExtTester::new("m1guelpf", "lil-web3", "7346bd28c2586da3b07102d5290175a276949b15").run();
 }
 
 // <https://github.com/makerdao/multicall>
 #[test]
 fn makerdao_multicall() {
+    if skip_unless_ext_enabled("makerdao_multicall") {
+        return;
+    }
     ExtTester::new("makerdao", "multicall", "103a8a28e4e372d582d6539b30031bda4cd48e21").run();
 }
 
@@ -121,6 +161,9 @@ fn makerdao_multicall() {
 // <https://github.com/hexonaut/guni-lev>
 #[test]
 fn gunilev() {
+    if skip_unless_ext_enabled("gunilev") {
+        return;
+    }
     ExtTester::new("hexonaut", "guni-lev", "15ee8b4c2d28e553c5cd5ba9a2a274af97563bc4")
         .fork_block(13633752)
         .run();
@@ -129,6 +172,9 @@ fn gunilev() {
 // <https://github.com/mds1/convex-shutdown-simulation>
 #[test]
 fn convex_shutdown_simulation() {
+    if skip_unless_ext_enabled("convex_shutdown_simulation") {
+        return;
+    }
     ExtTester::new(
         "mds1",
         "convex-shutdown-simulation",

@@ -1,0 +1,553 @@
+### crates/common/src/provider/igra_transport.rs (submit path)
+   130	    async fn submit_payload(&self, request: &IgraSubmitRequest) -> Result<String, String> {
+   131	        let rpc_url = request
+   132	            .kaspa_rpc_url
+   133	            .as_deref()
+   134	            .ok_or_else(|| "IGRA config error: `kaspa_rpc_url` is required".to_string())?;
+   135	        let network = request
+   136	            .kaspa_network
+   137	            .as_deref()
+   138	            .ok_or_else(|| "IGRA config error: `kaspa_network` is required".to_string())?;
+   139	        let (network_type, address_prefix) = kaspa_network_descriptor(network)?;
+   140	        let private_key = resolve_kaspa_private_key(&request.kaspa_wallet)?;
+   141	        let source_address = kaspa_address_from_private_key(&private_key, address_prefix)?;
+   142	        let mut client = GrpcClient::connect(rpc_url.to_string())
+   143	            .await
+   144	            .map_err(|err| format!("IGRA submit error: failed to connect to Kaspa RPC: {err}"))?;
+   145	
+   146	        for attempt in 0..=1 {
+   147	            let force_refresh = attempt > 0;
+   148	            let utxos = self
+   149	                .load_utxos(
+   150	                    &mut client,
+   151	                    rpc_url,
+   152	                    network,
+   153	                    &source_address,
+   154	                    force_refresh,
+   155	                )
+   156	                .await?;
+   157	
+   158	            let private_key_for_build = private_key;
+   159	            let source_address_for_build = source_address.clone();
+   160	            let payload_bytes_for_build = request.payload_bytes.clone();
+   161	            let transaction = tokio::task::spawn_blocking(move || {
+   162	                build_signed_payload_transaction(
+   163	                    &private_key_for_build,
+   164	                    &source_address_for_build,
+   165	                    network_type,
+   166	                    &payload_bytes_for_build,
+   167	                    &utxos,
+   168	                )
+   169	            })
+   170	            .await
+   171	            .map_err(|err| format!("IGRA submit error: failed to join Kaspa tx builder task: {err}"))??;
+   172	            // Invalidate local UTXO cache before broadcast so concurrent reads cannot reuse
+   173	            // potentially spent entries from this submission attempt.
+   174	            self.invalidate_utxo_cache().await;
+   175	            let rpc_transaction = RpcTransaction::from(&transaction);
+   176	            match client.submit_transaction(rpc_transaction, false).await {
+   177	                Ok(tx_id) => {
+   178	                    self.invalidate_utxo_cache().await;
+   179	                    return Ok(tx_id.to_string());
+   180	                }
+   181	                Err(err) => {
+   182	                    if attempt == 1 {
+   183	                        return Err(format!("IGRA submit error: {err}"));
+   184	                    }
+   185	                }
+   186	            }
+   187	        }
+   188	
+   189	        Err("IGRA submit error: failed to submit Kaspa transaction".to_string())
+   190	    }
+   191	}
+   192	
+   193	impl InProcessKaspaPayloadSubmitter {
+   194	    async fn invalidate_utxo_cache(&self) {
+   195	        self.utxo_cache_epoch.fetch_add(1, Ordering::Relaxed);
+   196	        let mut cache_guard = self.utxo_cache.lock().await;
+   197	        *cache_guard = None;
+   198	    }
+   199	
+   200	    async fn load_utxos(
+   201	        &self,
+   202	        client: &mut GrpcClient,
+   203	        rpc_url: &str,
+   204	        network: &str,
+   205	        source_address: &KaspaAddress,
+   206	        force_refresh: bool,
+   207	    ) -> Result<Vec<RpcUtxosByAddressesEntry>, String> {
+   208	        let cache_key = format!("{rpc_url}|{network}|{source_address}");
+   209	        let read_epoch = self.utxo_cache_epoch.load(Ordering::Relaxed);
+   210	        if !force_refresh {
+   211	            let cache_guard = self.utxo_cache.lock().await;
+   212	            if let Some(cache) = cache_guard.as_ref()
+   213	                && cache.cache_key == cache_key
+   214	                && cache.fetched_at.elapsed() <= Duration::from_secs(CACHE_TTL_SECS)
+   215	            {
+   216	                return Ok(cache.entries.clone());
+   217	            }
+   218	        }
+   219	
+   220	        let entries = client
+   221	            .get_utxos_by_addresses(vec![source_address.clone()])
+   222	            .await
+   223	            .map_err(|err| format!("IGRA submit error: failed to load Kaspa UTXOs: {err}"))?;
+   224	
+   225	        let mut cache_guard = self.utxo_cache.lock().await;
+   226	        let current_epoch = self.utxo_cache_epoch.load(Ordering::Relaxed);
+   227	        if force_refresh || current_epoch == read_epoch {
+   228	            *cache_guard = Some(CachedUtxoSet {
+   229	                cache_key,
+   230	                fetched_at: Instant::now(),
+   231	                entries: entries.clone(),
+   232	            });
+   233	        }
+   234	        Ok(entries)
+   235	    }
+   236	}
+   237	
+   238	fn kaspa_network_descriptor(
+   239	    network: &str,
+   240	) -> Result<(KaspaNetworkType, KaspaAddressPrefix), String> {
+
+### crates/common/src/provider/igra_transport.rs (transport lock path)
+   750	                let mut replacement_observation: Option<(String, String)> = None;
+   751	                let tracked = tracked_send;
+   752	
+   753	                let result: Result<ResponsePacket, TransportError> = async {
+   754	                    let tx_id_prefix = tx_id_prefix.ok_or_else(|| {
+   755	                        Self::reject_error("IGRA config error: `tx_id_prefix` is required")
+   756	                    })?;
+   757	
+   758	                    if let Some(tracked) = tracked.as_ref() {
+   759	                        Self::persist_transition_safe(
+   760	                            tracked,
+   761	                            TxLifecycleState::ReceivedRawL2,
+   762	                            None,
+   763	                            None,
+   764	                            None,
+   765	                            None,
+   766	                            false,
+   767	                        );
+   768	
+   769	                        let store = tracked.store.clone();
+   770	                        let sender = tracked.sender.clone();
+   771	                        let lock_owner_id = tracked.lock_owner_id.clone();
+   772	                        let l2_nonce = tracked.l2_nonce;
+   773	                        let l2_tx_hash = tracked.l2_tx_hash.clone();
+   774	                        let lock_result = tokio::task::spawn_blocking(move || {
+   775	                            store.acquire_sender_lock_and_classify_nonce(
+   776	                                &sender,
+   777	                                &lock_owner_id,
+   778	                                l2_nonce,
+   779	                                &l2_tx_hash,
+   780	                            )
+   781	                        })
+   782	                        .await
+   783	                        .map_err(|err| {
+   784	                            Self::reject_error(&format!("IGRA sender lock task join failure: {err}"))
+   785	                        })?;
+   786	
+   787	                        match lock_result {
+   788	                            Ok(NonceOrdering::InOrder { .. }) => {
+   789	                                lock_acquired = true;
+   790	                                in_order_submit = true;
+   791	                            }
+   792	                            Ok(NonceOrdering::Stale { replacement_candidate, .. }) => {
+   793	                                lock_acquired = true;
+   794	                                if replacement_candidate {
+   795	                                    let message = format!(
+   796	                                        "stale nonce replacement candidate for sender {} nonce {} tx {}",
+   797	                                        tracked.sender, tracked.l2_nonce, tracked.l2_tx_hash
+   798	                                    );
+   799	                                    let code =
+   800	                                        IGRA_NONCE_REPLACEMENT_CANDIDATE_ERROR_CODE.to_string();
+   801	                                    replacement_observation = Some((code.clone(), message.clone()));
+   802	                                    Self::persist_transition_safe(
+   803	                                        tracked,
+   804	                                        TxLifecycleState::StaleReplacementCandidate,
+   805	                                        None,
+   806	                                        None,
+   807	                                        Some(code),
+   808	                                        Some(message),
+   809	                                        false,
+   810	                                    );
+   811	                                }
+   812	                            }
+   813	                            Err(err @ IgraStoreError::LockTimeout { .. }) => {
+   814	                                Self::persist_transition_safe(
+   815	                                    tracked,
+   816	                                    TxLifecycleState::BlockedLockTimeout,
+   817	                                    None,
+   818	                                    None,
+   819	                                    err.code().map(str::to_string),
+   820	                                    Some(err.to_string()),
+   821	                                    false,
+   822	                                );
+   823	                                return Err(Self::reject_error(&err.to_string()));
+   824	                            }
+   825	                            Err(err @ IgraStoreError::BlockedNonceGap { .. }) => {
+   826	                                Self::persist_transition_safe(
+   827	                                    tracked,
+   828	                                    TxLifecycleState::BlockedNonceGap,
+   829	                                    None,
+   830	                                    None,
+   831	                                    Some(IGRA_NONCE_GAP_ERROR_CODE.to_string()),
+   832	                                    Some(err.to_string()),
+   833	                                    false,
+   834	                                );
+   835	                                return Err(Self::reject_error(&err.to_string()));
+   836	                            }
+   837	                            Err(err) => {
+   838	                                warn!(
+   839	                                    "non-fatal IGRA sender lock/classification failure for {}: {err}",
+   840	                                    tracked.sender
+   841	                                );
+   842	                            }
+   843	                        }
+   844	                    }
+   845	
+   846	                    let replacement_code =
+   847	                        replacement_observation.as_ref().map(|(code, _)| code.clone());
+   848	                    let replacement_message =
+   849	                        replacement_observation.as_ref().map(|(_, message)| message.clone());
+   850	                    if let Some(tracked) = tracked.as_ref() {
+   851	                        Self::persist_transition_safe(
+   852	                            tracked,
+   853	                            TxLifecycleState::KaspaUnsignedCreated,
+   854	                            None,
+   855	                            None,
+   856	                            replacement_code.clone(),
+   857	                            replacement_message.clone(),
+   858	                            false,
+   859	                        );
+   860	                    }
+   861	
+   862	                    let mine_raw_tx = raw_send.raw_tx.clone();
+   863	                    let mine_prefix = tx_id_prefix.clone();
+   864	                    let mine_timeout = mining_timeout;
+   865	                    let mined = tokio::task::spawn_blocking(move || {
+   866	                        mine_payload_nonce(
+   867	                            &mine_raw_tx,
+   868	                            raw_send.tx_type_nibble,
+   869	                            &mine_prefix,
+   870	                            mine_timeout,
+   871	                        )
+   872	                    })
+   873	                    .await
+   874	                    .map_err(|err| {
+   875	                        Self::reject_error(&format!("IGRA mining task join failure: {err}"))
+   876	                    })?
+   877	                    .map_err(|err| Self::reject_error(&err))?;
+   878	
+   879	                    if let Some(tracked) = tracked.as_ref() {
+   880	                        Self::persist_transition_safe(
+   881	                            tracked,
+   882	                            TxLifecycleState::KaspaPrefixMined,
+   883	                            Some(mined.payload_nonce),
+   884	                            None,
+   885	                            replacement_code.clone(),
+   886	                            replacement_message.clone(),
+   887	                            false,
+   888	                        );
+   889	                    }
+   890	
+   891	                    let submit_request = IgraSubmitRequest {
+   892	                        l2_tx_hash: raw_send.metadata.l2_tx_hash.clone(),
+   893	                        payload_bytes: mined.payload_bytes.clone(),
+   894	                        payload_nonce: mined.payload_nonce,
+   895	                        kaspa_rpc_url,
+   896	                        kaspa_network,
+   897	                        kaspa_wallet,
+   898	                    };
+   899	                    let kaspa_tx_id = submitter
+   900	                        .submit_payload(&submit_request)
+   901	                        .await
+   902	                        .map_err(|err| Self::reject_error(&err))?;
+   903	
+   904	                    if let Some(tracked) = tracked.as_ref() {
+   905	                        Self::persist_transition_safe(
+   906	                            tracked,
+   907	                            TxLifecycleState::KaspaSigned,
+   908	                            Some(mined.payload_nonce),
+   909	                            None,
+   910	                            replacement_code.clone(),
+   911	                            replacement_message.clone(),
+   912	                            false,
+   913	                        );
+   914	                        Self::persist_transition_safe(
+   915	                            tracked,
+   916	                            TxLifecycleState::KaspaBroadcasted,
+   917	                            Some(mined.payload_nonce),
+   918	                            Some(kaspa_tx_id.clone()),
+   919	                            replacement_code,
+   920	                            replacement_message,
+   921	                            false,
+   922	                        );
+   923	                        if in_order_submit {
+   924	                            let store = tracked.store.clone();
+   925	                            let sender = tracked.sender.clone();
+   926	                            let nonce = tracked.l2_nonce;
+   927	                            match tokio::task::spawn_blocking(move || {
+   928	                                store.mark_submitted_in_order_nonce(&sender, nonce)
+   929	                            })
+   930	                            .await
+   931	                            {
+   932	                                Ok(Ok(())) => {}
+   933	                                Ok(Err(err)) => {
+   934	                                    warn!("failed to advance IGRA next-expected nonce: {err}")
+   935	                                }
+   936	                                Err(err) => warn!(
+   937	                                    "failed to join IGRA next-expected nonce task: {err}"
+   938	                                ),
+   939	                            }
+   940	                        }
+   941	                    }
+   942	
+   943	                    Self::success_l2_tx_hash_response(raw_send.id.clone(), &raw_send.metadata.l2_tx_hash)
+   944	                }
+   945	                .await;
+   946	
+   947	                if let Some(tracked) = tracked.as_ref() {
+   948	                    if let Err(err) = &result {
+   949	                        let err_text = err.to_string();
+   950	                        let err_code = if err_text.contains(IGRA_MINING_TIMEOUT_ERROR_CODE) {
+   951	                            Some(IGRA_MINING_TIMEOUT_ERROR_CODE.to_string())
+   952	                        } else {
+   953	                            None
+   954	                        };
+   955	                        Self::persist_transition_safe(
+   956	                            tracked,
+   957	                            TxLifecycleState::FailedRecoverable,
+   958	                            None,
+   959	                            None,
+   960	                            err_code,
+
+### crates/common/src/provider/igra_transport.rs (utxo selection/fee)
+   360	    }
+   361	
+   362	    let mut sorted = utxos.to_vec();
+   363	    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
+   364	    let mut selected = Vec::new();
+   365	    let mut total_input = 0u64;
+   366	    for entry in sorted {
+   367	        total_input = total_input.saturating_add(entry.utxo_entry.amount);
+   368	        selected.push(entry);
+   369	        let required_fee = estimated_fee_sompi(payload.len(), selected.len());
+   370	        if total_input >= required_fee.saturating_add(MIN_CHANGE_SOMPI) {
+   371	            break;
+   372	        }
+   373	    }
+   374	
+   375	    let fee = estimated_fee_sompi(payload.len(), selected.len());
+   376	    if total_input < fee.saturating_add(MIN_CHANGE_SOMPI) {
+   377	        return Err("IGRA submit error: insufficient Kaspa UTXOs for fee payment".to_string());
+   378	    }
+   379	
+   380	    let output_value = total_input.saturating_sub(fee);
+   381	    if output_value < MIN_CHANGE_SOMPI {
+   382	        return Err("IGRA submit error: insufficient Kaspa UTXOs for fee payment".to_string());
+   383	    }
+   384	
+   385	    let script_public_key = pay_to_address_script(source_address);
+   386	    let inputs = selected
+   387	        .iter()
+   388	        .map(|entry| {
+   389	            KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1)
+   390	        })
+   391	        .collect::<Vec<_>>();
+   392	    let outputs = vec![KaspaTransactionOutput::new(output_value, script_public_key)];
+   393	    let tx = KaspaTransaction::new(
+   394	        0,
+   395	        inputs,
+   396	        outputs,
+   397	        0,
+   398	        SubnetworkId::default(),
+   399	        0,
+   400	        payload.to_vec(),
+   401	    );
+   402	
+   403	    let entries = selected
+   404	        .iter()
+   405	        .map(|entry| KaspaUtxoEntry {
+   406	            amount: entry.utxo_entry.amount,
+   407	            script_public_key: entry.utxo_entry.script_public_key.clone(),
+   408	            block_daa_score: entry.utxo_entry.block_daa_score,
+   409	            is_coinbase: entry.utxo_entry.is_coinbase,
+   410	        })
+   411	        .collect::<Vec<_>>();
+   412	
+   413	    let signable = KaspaSignableTransaction::with_entries(tx, entries);
+   414	    let signed = kaspa_sign_with_multiple_v2(signable, std::slice::from_ref(private_key))
+   415	        .fully_signed()
+   416	        .map_err(|err| format!("IGRA submit error: failed to sign Kaspa tx: {err}"))?;
+   417	    kaspa_verify(&signed.as_verifiable())
+   418	        .map_err(|err| format!("IGRA submit error: invalid Kaspa signature set: {err}"))?;
+   419	
+   420	    let mass_calculator = KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
+   421	    let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
+   422	    let contextual = mass_calculator
+   423	        .calc_contextual_masses(&signed.as_verifiable())
+   424	        .ok_or_else(|| "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string())?;
+   425	    let mass = contextual.max(non_contextual);
+   426	    if mass > MAX_STANDARD_KASPA_TX_MASS {
+   427	        return Err(format!(
+   428	            "IGRA submit error: Kaspa transaction mass {mass} exceeds standard limit {MAX_STANDARD_KASPA_TX_MASS}"
+   429	        ));
+   430	    }
+   431	
+   432	    let tx = signed.tx;
+   433	    tx.set_mass(mass);
+   434	    Ok(tx)
+   435	}
+   436	
+   437	fn estimated_fee_sompi(payload_len: usize, inputs: usize) -> u64 {
+   438	    let payload_len = u64::try_from(payload_len).unwrap_or(u64::MAX);
+   439	    let kib = payload_len.div_ceil(1024);
+   440	    let input_tail = u64::try_from(inputs.saturating_sub(1)).unwrap_or(u64::MAX);
+   441	    BASE_SUBMIT_FEE_SOMPI
+   442	        .saturating_add(kib.saturating_mul(FEE_PER_KIB_SOMPI))
+   443	        .saturating_add(input_tail.saturating_mul(EXTRA_INPUT_FEE_SOMPI))
+   444	}
+   445	
+
+### crates/common/src/igra_store.rs (lock loops)
+   248	    }
+   249	
+   250	    pub const fn sender_lock_timeout_secs(&self) -> u64 {
+   251	        self.sender_lock_timeout_secs
+   252	    }
+   253	
+   254	    pub fn acquire_sender_lock(&self, sender: &str, owner_id: &str) -> Result<(), IgraStoreError> {
+   255	        let mut conn = self.open_connection()?;
+   256	        let timeout_ms = self.sender_lock_timeout_secs.saturating_mul(1000);
+   257	        let deadline_ms = now_ms().saturating_add(timeout_ms);
+   258	        let lease_ms = timeout_ms;
+   259	
+   260	        loop {
+   261	            let now = now_ms();
+   262	            if now >= deadline_ms {
+   263	                return Err(IgraStoreError::LockTimeout { sender: sender.to_string() });
+   264	            }
+   265	
+   266	            match self.try_acquire_sender_lock_once(&mut conn, sender, owner_id, now, lease_ms) {
+   267	                Ok(true) => return Ok(()),
+   268	                Ok(false) => {}
+   269	                Err(err) if is_retryable_busy_error(&err) => {}
+   270	                Err(err) => return Err(err),
+   271	            }
+   272	
+   273	            thread::sleep(Duration::from_millis(LOCK_POLL_INTERVAL_MS));
+   274	        }
+   275	    }
+   276	
+   277	    pub fn release_sender_lock(&self, sender: &str, owner_id: &str) -> Result<(), IgraStoreError> {
+   278	        let conn = self.open_connection()?;
+   279	        conn.execute(
+   280	            "DELETE FROM sender_locks WHERE sender = ?1 AND owner_id = ?2",
+   281	            params![sender, owner_id],
+   282	        )?;
+   283	        Ok(())
+   284	    }
+   285	
+   286	    pub fn acquire_sender_lock_and_classify_nonce(
+   287	        &self,
+   288	        sender: &str,
+   289	        owner_id: &str,
+   290	        nonce: u64,
+   291	        l2_tx_hash: &str,
+   292	    ) -> Result<NonceOrdering, IgraStoreError> {
+   293	        let mut conn = self.open_connection()?;
+   294	        let timeout_ms = self.sender_lock_timeout_secs.saturating_mul(1000);
+   295	        let deadline_ms = now_ms().saturating_add(timeout_ms);
+   296	        let lease_ms = timeout_ms;
+   297	
+   298	        loop {
+   299	            let now = now_ms();
+   300	            if now >= deadline_ms {
+   301	                return Err(IgraStoreError::LockTimeout { sender: sender.to_string() });
+   302	            }
+   303	
+   304	            match self.try_acquire_sender_lock_and_classify_once(
+   305	                &mut conn, sender, owner_id, nonce, l2_tx_hash, now, lease_ms,
+   306	            ) {
+   307	                Ok(Some(ordering)) => return Ok(ordering),
+   308	                Ok(None) => {}
+   309	                Err(err) if is_retryable_busy_error(&err) => {}
+   310	                Err(err) => return Err(err),
+   311	            }
+   312	
+   313	            thread::sleep(Duration::from_millis(LOCK_POLL_INTERVAL_MS));
+   314	        }
+   315	    }
+   316	
+   317	    pub fn classify_nonce(
+   318	        &self,
+   319	        sender: &str,
+   320	        nonce: u64,
+   321	    ) -> Result<NonceOrdering, IgraStoreError> {
+   322	        let mut conn = self.open_connection()?;
+   323	        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+   324	        let ordering = self.classify_nonce_in_tx(&tx, sender, nonce, None)?;
+   325	        tx.commit()?;
+   326	        Ok(ordering)
+   327	    }
+   328	
+   329	    pub fn mark_submitted_in_order_nonce(
+   330	        &self,
+   331	        sender: &str,
+   332	        nonce: u64,
+   333	    ) -> Result<(), IgraStoreError> {
+   334	        let next_nonce = nonce
+   335	            .checked_add(1)
+
+### crates/wallets/src/opts.rs (fallback warning)
+   324	
+   325	    /// Applies CLI/env Kaspa wallet overrides into IGRA config with highest precedence.
+   326	    pub fn apply_igra_kaspa_wallet_overrides(&self, config: &mut Config) {
+   327	        if self.kaspa.is_set() {
+   328	            config.igra.kaspa_wallet = self.kaspa.as_config();
+   329	            return;
+   330	        }
+   331	
+   332	        if !config.igra.kaspa_wallet.is_empty() {
+   333	            return;
+   334	        }
+   335	
+   336	        if let Some(fallback) = self.evm_fallback_kaspa_config() {
+   337	            warn!(
+   338	                "IGRA Kaspa wallet fallback is reusing EVM signer key material; prefer explicit --private-key-kaspa or --mnemonic-kaspa for key separation"
+   339	            );
+   340	            config.igra.kaspa_wallet = fallback;
+   341	        }
+   342	    }
+   343	
+   344	    fn evm_fallback_kaspa_config(&self) -> Option<IgraKaspaWalletConfig> {
+   345	        if let Some(private_key) = self.raw.private_key.clone() {
+   346	            return Some(IgraKaspaWalletConfig {
+
+### crates/wallets/src/wallet_multi/mod.rs (fallback warning)
+   270	impl MultiWalletOpts {
+   271	    /// Applies CLI/env Kaspa wallet overrides into IGRA config with highest precedence.
+   272	    pub fn apply_igra_kaspa_wallet_overrides(&self, config: &mut Config) {
+   273	        if self.kaspa.is_set() {
+   274	            config.igra.kaspa_wallet = self.kaspa.as_config();
+   275	            return;
+   276	        }
+   277	
+   278	        if !config.igra.kaspa_wallet.is_empty() {
+   279	            return;
+   280	        }
+   281	
+   282	        if let Some(fallback) = self.evm_fallback_kaspa_config() {
+   283	            warn!(
+   284	                "IGRA Kaspa wallet fallback is reusing EVM signer key material; prefer explicit --private-key-kaspa or --mnemonic-kaspa for key separation"
+   285	            );
+   286	            config.igra.kaspa_wallet = fallback;
+   287	        }
+   288	    }
+   289	
+   290	    fn evm_fallback_kaspa_config(&self) -> Option<foundry_config::IgraKaspaWalletConfig> {
+   291	        if let Some(private_key) = self.private_key.clone().or_else(|| {
+   292	            self.private_keys

@@ -31,7 +31,7 @@ async fn verify_storage_proof(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_account_proof() {
-    let (api, _handle) = spawn(NodeConfig::empty_state()).await;
+    let (api, _handle) = spawn(NodeConfig::empty_state().with_port(0)).await;
 
     api.anvil_set_balance(
         address!("0x2031f89b3ea8014eb51a78c316e42af3e0d7695f"),
@@ -88,7 +88,7 @@ async fn test_account_proof() {
 async fn test_storage_proof() {
     let target = address!("0x1ed9b1dd266b607ee278726d324b855a093394a6");
 
-    let (api, _handle) = spawn(NodeConfig::empty_state()).await;
+    let (api, _handle) = spawn(NodeConfig::empty_state().with_port(0)).await;
     let storage: BTreeMap<U256, B256> =
         serde_json::from_str(include_str!("../../test-data/storage_sample.json")).unwrap();
 
@@ -122,7 +122,7 @@ async fn test_storage_proof() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn can_get_random_account_proofs() {
-    let (api, _handle) = spawn(NodeConfig::test()).await;
+    let (api, _handle) = spawn(NodeConfig::test().with_port(0)).await;
 
     for acc in std::iter::repeat_with(Address::random).take(10) {
         let _ = api

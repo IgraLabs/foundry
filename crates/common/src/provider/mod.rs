@@ -217,6 +217,8 @@ impl<N: Network> ProviderBuilder<N> {
                 .or(config.igra.el_receipt_timeout_secs),
             kaspa_rpc_url: config.igra.kaspa_rpc_url.clone(),
             kaspa_network: config.igra.kaspa_network.clone(),
+            payload_compression: config.igra.payload_compression.clone(),
+            kaspa_wallet: config.igra.kaspa_wallet.clone(),
         });
 
         Ok(builder)

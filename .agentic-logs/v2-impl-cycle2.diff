@@ -1,0 +1,1106 @@
+diff --git a/crates/common/src/igra_store.rs b/crates/common/src/igra_store.rs
+index 3709d5ed3..744ff0235 100644
+--- a/crates/common/src/igra_store.rs
++++ b/crates/common/src/igra_store.rs
+@@ -3,7 +3,7 @@
+ use alloy_primitives::{hex, utils::keccak256};
+ use eyre::{Context, Result};
+ use foundry_config::Config;
+-use rusqlite::{Connection, OptionalExtension, params};
++use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
+ use std::{
+     fs,
+     path::PathBuf,
+@@ -263,8 +263,11 @@ pub fn acquire_sender_lock(&self, sender: &str, owner_id: &str) -> Result<(), Ig
+                 return Err(IgraStoreError::LockTimeout { sender: sender.to_string() });
+             }
+ 
+-            if self.try_acquire_sender_lock_once(&mut conn, sender, owner_id, now, lease_ms)? {
+-                return Ok(());
++            match self.try_acquire_sender_lock_once(&mut conn, sender, owner_id, now, lease_ms) {
++                Ok(true) => return Ok(()),
++                Ok(false) => {}
++                Err(err) if is_retryable_busy_error(&err) => {}
++                Err(err) => return Err(err),
+             }
+ 
+             thread::sleep(Duration::from_millis(LOCK_POLL_INTERVAL_MS));
+@@ -298,10 +301,13 @@ pub fn acquire_sender_lock_and_classify_nonce(
+                 return Err(IgraStoreError::LockTimeout { sender: sender.to_string() });
+             }
+ 
+-            if let Some(ordering) = self.try_acquire_sender_lock_and_classify_once(
++            match self.try_acquire_sender_lock_and_classify_once(
+                 &mut conn, sender, owner_id, nonce, l2_tx_hash, now, lease_ms,
+-            )? {
+-                return Ok(ordering);
++            ) {
++                Ok(Some(ordering)) => return Ok(ordering),
++                Ok(None) => {}
++                Err(err) if is_retryable_busy_error(&err) => {}
++                Err(err) => return Err(err),
+             }
+ 
+             thread::sleep(Duration::from_millis(LOCK_POLL_INTERVAL_MS));
+@@ -314,7 +320,7 @@ pub fn classify_nonce(
+         nonce: u64,
+     ) -> Result<NonceOrdering, IgraStoreError> {
+         let mut conn = self.open_connection()?;
+-        let tx = conn.transaction()?;
++        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+         let ordering = self.classify_nonce_in_tx(&tx, sender, nonce, None)?;
+         tx.commit()?;
+         Ok(ordering)
+@@ -329,7 +335,7 @@ pub fn mark_submitted_in_order_nonce(
+             .checked_add(1)
+             .ok_or_else(|| IgraStoreError::NonceOverflow { sender: sender.to_string(), nonce })?;
+         let mut conn = self.open_connection()?;
+-        let tx = conn.transaction()?;
++        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+         let now = now_ms();
+ 
+         let expected: Option<i64> = tx
+@@ -863,6 +869,15 @@ fn now_ms() -> u64 {
+         .unwrap_or_default()
+ }
+ 
++fn is_retryable_busy_error(err: &IgraStoreError) -> bool {
++    match err {
++        IgraStoreError::Sqlite(rusqlite::Error::SqliteFailure(sqlite_err, _)) => {
++            matches!(sqlite_err.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
++        }
++        _ => false,
++    }
++}
++
+ fn fingerprint(url: Option<&str>, chain_id: u64, network: Option<&str>) -> Option<String> {
+     let url = url?.trim();
+     if url.is_empty() {
+diff --git a/crates/common/src/provider/igra_transport.rs b/crates/common/src/provider/igra_transport.rs
+index 9dffae2e0..6651a6ccd 100644
+--- a/crates/common/src/provider/igra_transport.rs
++++ b/crates/common/src/provider/igra_transport.rs
+@@ -4,22 +4,44 @@
+     IGRA_NONCE_GAP_ERROR_CODE, IGRA_NONCE_REPLACEMENT_CANDIDATE_ERROR_CODE, IgraStore,
+     IgraStoreConfig, IgraStoreError, NonceOrdering, TxLifecycleState, TxLifecycleUpdate,
+ };
+-use alloy_consensus::{Transaction, TxEnvelope, transaction::SignerRecoverable};
++use alloy_consensus::{Transaction as AlloyTransaction, TxEnvelope, transaction::SignerRecoverable};
+ use alloy_json_rpc::{
+     Id, RequestPacket, Response, ResponsePacket, ResponsePayload, SerializedRequest,
+ };
+-use alloy_primitives::{hex, utils::keccak256};
++use alloy_primitives::{B256, hex, utils::keccak256};
+ use alloy_provider::network::eip2718::Decodable2718;
++use alloy_signer_local::{MnemonicBuilder, PrivateKeySigner, coins_bip39::English};
+ use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
++use async_trait::async_trait;
++use foundry_config::{Config, IgraKaspaWalletConfig};
++use kaspa_addresses::{Address as KaspaAddress, Prefix as KaspaAddressPrefix, Version as KaspaAddressVersion};
++use kaspa_bip32::secp256k1::SecretKey as KaspaSecretKey;
++use kaspa_consensus_core::{
++    config::params::Params as KaspaParams,
++    mass::MassCalculator as KaspaMassCalculator,
++    network::NetworkType as KaspaNetworkType,
++    sign::{sign_with_multiple_v2 as kaspa_sign_with_multiple_v2, verify as kaspa_verify},
++    subnets::SubnetworkId,
++    tx::{
++        SignableTransaction as KaspaSignableTransaction, Transaction as KaspaTransaction,
++        TransactionInput as KaspaTransactionInput, TransactionOutput as KaspaTransactionOutput,
++        UtxoEntry as KaspaUtxoEntry,
++    },
++};
++use kaspa_grpc_client::GrpcClient;
++use kaspa_rpc_core::{RpcTransaction, RpcUtxosByAddressesEntry, api::rpc::RpcApi};
++use kaspa_txscript::pay_to_address_script;
+ use serde_json::Value;
+ use std::{
+-    process::Command,
++    fs,
++    path::{Path, PathBuf},
+     sync::{
+         Arc,
+         atomic::{AtomicU64, Ordering},
+     },
+     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+ };
++use tokio::sync::Mutex as TokioMutex;
+ use tower::Service;
+ use tracing::{info, warn};
+ 
+@@ -33,9 +55,17 @@
+ pub const IGRA_EIP7702_UNSUPPORTED_ERROR: &str = "IGRA unsupported transaction type: EIP-7702";
+ /// Error code returned when payload prefix mining times out.
+ pub const IGRA_MINING_TIMEOUT_ERROR_CODE: &str = "IGRA_MINING_001";
++/// Error returned when no usable Kaspa key material is available for IGRA submission.
++pub const IGRA_KEY_RESOLUTION_ERROR: &str = "IGRA key resolution error: cannot derive Kaspa key from current EVM signer; provide --private-key-kaspa or --mnemonic-kaspa";
+ 
+ const DEFAULT_MINING_TIMEOUT_SECS: u64 = 120;
+ const IGRA_PAYLOAD_VERSION: u8 = 1;
++const MAX_STANDARD_KASPA_TX_MASS: u64 = 100_000;
++const CACHE_TTL_SECS: u64 = 20;
++const BASE_SUBMIT_FEE_SOMPI: u64 = 200_000;
++const FEE_PER_KIB_SOMPI: u64 = 20_000;
++const EXTRA_INPUT_FEE_SOMPI: u64 = 10_000;
++const MIN_CHANGE_SOMPI: u64 = 1_000;
+ 
+ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+ 
+@@ -46,6 +76,7 @@ pub struct IgraTransportConfig {
+     pub mining_timeout_secs: Option<u64>,
+     pub kaspa_rpc_url: Option<String>,
+     pub kaspa_network: Option<String>,
++    pub kaspa_wallet: IgraKaspaWalletConfig,
+ }
+ 
+ /// Payload submission request forwarded to a Kaspa submitter implementation.
+@@ -56,61 +87,351 @@ pub struct IgraSubmitRequest {
+     pub payload_nonce: u32,
+     pub kaspa_rpc_url: Option<String>,
+     pub kaspa_network: Option<String>,
++    pub kaspa_wallet: IgraKaspaWalletConfig,
+ }
+ 
+ /// Abstraction over Kaspa submission to keep IGRA transport testable.
++#[async_trait]
+ pub trait IgraPayloadSubmitter: Send + Sync + std::fmt::Debug {
+-    fn submit_payload(&self, request: &IgraSubmitRequest) -> Result<String, String>;
++    async fn submit_payload(&self, request: &IgraSubmitRequest) -> Result<String, String>;
+ }
+ 
+-/// Default submitter implementation backed by a `kaswallet` command execution path.
+-#[derive(Clone, Debug)]
+-pub struct KaswalletPayloadSubmitter {
+-    binary: String,
++#[derive(Clone)]
++struct CachedUtxoSet {
++    cache_key: String,
++    fetched_at: Instant,
++    entries: Vec<RpcUtxosByAddressesEntry>,
+ }
+ 
+-impl Default for KaswalletPayloadSubmitter {
++/// Default submitter implementation backed by in-process Kaspa RPC, signing, and broadcast.
++#[derive(Clone)]
++pub struct InProcessKaspaPayloadSubmitter {
++    utxo_cache: Arc<TokioMutex<Option<CachedUtxoSet>>>,
++}
++
++impl std::fmt::Debug for InProcessKaspaPayloadSubmitter {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("InProcessKaspaPayloadSubmitter").finish()
++    }
++}
++
++impl Default for InProcessKaspaPayloadSubmitter {
+     fn default() -> Self {
+-        let binary = std::env::var("KASWALLET_BIN").unwrap_or_else(|_| "kaswallet".to_string());
+-        Self { binary }
++        Self { utxo_cache: Arc::new(TokioMutex::new(None)) }
+     }
+ }
+ 
+-impl IgraPayloadSubmitter for KaswalletPayloadSubmitter {
+-    fn submit_payload(&self, request: &IgraSubmitRequest) -> Result<String, String> {
+-        let payload_hex = format!("0x{}", hex::encode(&request.payload_bytes));
+-        let mut command = Command::new(&self.binary);
+-        command
+-            .arg("submit-payload")
+-            .arg("--payload")
+-            .arg(payload_hex)
+-            .arg("--l2-tx-hash")
+-            .arg(&request.l2_tx_hash);
+-
+-        if let Some(network) = request.kaspa_network.as_deref() {
+-            command.arg("--network").arg(network);
++#[async_trait]
++impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
++    async fn submit_payload(&self, request: &IgraSubmitRequest) -> Result<String, String> {
++        let rpc_url = request
++            .kaspa_rpc_url
++            .as_deref()
++            .ok_or_else(|| "IGRA config error: `kaspa_rpc_url` is required".to_string())?;
++        let network = request
++            .kaspa_network
++            .as_deref()
++            .ok_or_else(|| "IGRA config error: `kaspa_network` is required".to_string())?;
++        let (network_type, address_prefix) = kaspa_network_descriptor(network)?;
++        let private_key = resolve_kaspa_private_key(&request.kaspa_wallet)?;
++        let source_address = kaspa_address_from_private_key(&private_key, address_prefix)?;
++        let mut client = GrpcClient::connect(rpc_url.to_string())
++            .await
++            .map_err(|err| format!("IGRA submit error: failed to connect to Kaspa RPC: {err}"))?;
++
++        for attempt in 0..=1 {
++            let force_refresh = attempt > 0;
++            let utxos = self
++                .load_utxos(
++                    &mut client,
++                    rpc_url,
++                    network,
++                    &source_address,
++                    force_refresh,
++                )
++                .await?;
++
++            let private_key_for_build = private_key;
++            let source_address_for_build = source_address.clone();
++            let payload_bytes_for_build = request.payload_bytes.clone();
++            let transaction = tokio::task::spawn_blocking(move || {
++                build_signed_payload_transaction(
++                    &private_key_for_build,
++                    &source_address_for_build,
++                    network_type,
++                    &payload_bytes_for_build,
++                    &utxos,
++                )
++            })
++            .await
++            .map_err(|err| format!("IGRA submit error: failed to join Kaspa tx builder task: {err}"))??;
++            // Invalidate local UTXO cache before broadcast so concurrent reads cannot reuse
++            // potentially spent entries from this submission attempt.
++            self.invalidate_utxo_cache().await;
++            let rpc_transaction = RpcTransaction::from(&transaction);
++            match client.submit_transaction(rpc_transaction, false).await {
++                Ok(tx_id) => {
++                    self.invalidate_utxo_cache().await;
++                    return Ok(tx_id.to_string());
++                }
++                Err(err) => {
++                    if attempt == 1 {
++                        return Err(format!("IGRA submit error: {err}"));
++                    }
++                }
++            }
+         }
+-        if let Some(rpc_url) = request.kaspa_rpc_url.as_deref() {
+-            command.arg("--rpc-url").arg(rpc_url);
++
++        Err("IGRA submit error: failed to submit Kaspa transaction".to_string())
++    }
++}
++
++impl InProcessKaspaPayloadSubmitter {
++    async fn invalidate_utxo_cache(&self) {
++        let mut cache_guard = self.utxo_cache.lock().await;
++        *cache_guard = None;
++    }
++
++    async fn load_utxos(
++        &self,
++        client: &mut GrpcClient,
++        rpc_url: &str,
++        network: &str,
++        source_address: &KaspaAddress,
++        force_refresh: bool,
++    ) -> Result<Vec<RpcUtxosByAddressesEntry>, String> {
++        let cache_key = format!("{rpc_url}|{network}|{source_address}");
++        if !force_refresh {
++            let cache_guard = self.utxo_cache.lock().await;
++            if let Some(cache) = cache_guard.as_ref()
++                && cache.cache_key == cache_key
++                && cache.fetched_at.elapsed() <= Duration::from_secs(CACHE_TTL_SECS)
++            {
++                return Ok(cache.entries.clone());
++            }
+         }
+ 
+-        let output =
+-            command.output().map_err(|err| format!("kaswallet execution failed: {err}"))?;
+-        if !output.status.success() {
+-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+-            let details = if !stderr.is_empty() { stderr } else { stdout };
+-            return Err(format!(
+-                "kaswallet submit-payload failed with status {}: {}",
+-                output.status, details
+-            ));
++        let entries = client
++            .get_utxos_by_addresses(vec![source_address.clone()])
++            .await
++            .map_err(|err| format!("IGRA submit error: failed to load Kaspa UTXOs: {err}"))?;
++
++        let mut cache_guard = self.utxo_cache.lock().await;
++        *cache_guard = Some(CachedUtxoSet {
++            cache_key,
++            fetched_at: Instant::now(),
++            entries: entries.clone(),
++        });
++        Ok(entries)
++    }
++}
++
++fn kaspa_network_descriptor(
++    network: &str,
++) -> Result<(KaspaNetworkType, KaspaAddressPrefix), String> {
++    match network {
++        "mainnet" => Ok((KaspaNetworkType::Mainnet, KaspaAddressPrefix::Mainnet)),
++        "testnet-10" => Ok((KaspaNetworkType::Testnet, KaspaAddressPrefix::Testnet)),
++        "devnet" => Ok((KaspaNetworkType::Devnet, KaspaAddressPrefix::Devnet)),
++        "simnet" => Ok((KaspaNetworkType::Simnet, KaspaAddressPrefix::Simnet)),
++        "custom" => Err("IGRA config error: `kaspa_network=custom` requires explicit in-process network mapping".to_string()),
++        other => Err(format!("IGRA config error: unsupported kaspa_network `{other}`")),
++    }
++}
++
++fn kaspa_address_from_private_key(
++    private_key: &[u8; 32],
++    prefix: KaspaAddressPrefix,
++) -> Result<KaspaAddress, String> {
++    let secret = KaspaSecretKey::from_slice(private_key)
++        .map_err(|err| format!("IGRA key resolution error: invalid private key bytes: {err}"))?;
++    let public_key = kaspa_bip32::secp256k1::PublicKey::from_secret_key_global(&secret);
++    let payload = public_key.x_only_public_key().0.serialize();
++    Ok(KaspaAddress::new(prefix, KaspaAddressVersion::PubKey, &payload))
++}
++
++fn resolve_kaspa_private_key(config: &IgraKaspaWalletConfig) -> Result<[u8; 32], String> {
++    if let Some(private_key) = config.private_key.as_deref() {
++        return parse_private_key_hex(private_key);
++    }
++
++    if let Some(mnemonic) = config.mnemonic.as_deref() {
++        return resolve_mnemonic_private_key(
++            mnemonic,
++            config.mnemonic_passphrase.as_deref(),
++            config.mnemonic_derivation_path.as_deref(),
++            config.mnemonic_index.unwrap_or(0),
++        );
++    }
++
++    if config.keystore.is_some() || config.keystore_account.is_some() {
++        return resolve_keystore_private_key(config);
++    }
++
++    Err(IGRA_KEY_RESOLUTION_ERROR.to_string())
++}
++
++fn parse_private_key_hex(private_key: &str) -> Result<[u8; 32], String> {
++    let private_key = private_key.trim();
++    let key = private_key.parse::<B256>().map_err(|_| {
++        format!("{IGRA_KEY_RESOLUTION_ERROR}: provided --private-key-kaspa value is invalid hex")
++    })?;
++    Ok(key.0)
++}
++
++fn resolve_mnemonic_private_key(
++    mnemonic: &str,
++    passphrase: Option<&str>,
++    derivation_path: Option<&str>,
++    index: u32,
++) -> Result<[u8; 32], String> {
++    let phrase = if Path::new(mnemonic).is_file() {
++        fs::read_to_string(mnemonic)
++            .map_err(|err| format!("IGRA key resolution error: failed to read mnemonic file: {err}"))?
++    } else {
++        mnemonic.to_string()
++    };
++    let phrase = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
++
++    let mut builder = MnemonicBuilder::<English>::default().phrase(phrase);
++    if let Some(passphrase) = passphrase {
++        builder = builder.password(passphrase);
++    }
++    builder = if let Some(path) = derivation_path {
++        builder
++            .derivation_path(path)
++            .map_err(|err| format!("IGRA key resolution error: invalid derivation path: {err}"))?
++    } else {
++        builder
++            .index(index)
++            .map_err(|err| format!("IGRA key resolution error: invalid mnemonic index: {err}"))?
++    };
++
++    let signer = builder.build().map_err(|err| {
++        format!("IGRA key resolution error: failed to derive key from mnemonic: {err}")
++    })?;
++    Ok(signer.credential().to_bytes().into())
++}
++
++fn resolve_keystore_private_key(config: &IgraKaspaWalletConfig) -> Result<[u8; 32], String> {
++    let path = resolve_keystore_path(config)?;
++    let password = config.password.as_deref().ok_or_else(|| {
++        "IGRA key resolution error: kaspa keystore password is required; set --password-kaspa or KASPA_PASSWORD".to_string()
++    })?;
++    let signer = PrivateKeySigner::decrypt_keystore(&path, password).map_err(|err| {
++        format!("IGRA key resolution error: failed to decrypt kaspa keystore: {err}")
++    })?;
++    Ok(signer.credential().to_bytes().into())
++}
++
++fn resolve_keystore_path(config: &IgraKaspaWalletConfig) -> Result<PathBuf, String> {
++    if let Some(path) = config.keystore.as_ref() {
++        return Ok(PathBuf::from(path));
++    }
++
++    if let Some(account) = config.keystore_account.as_ref() {
++        let keystore_dir = Config::foundry_keystores_dir().ok_or_else(|| {
++            "IGRA key resolution error: could not resolve default foundry keystore directory".to_string()
++        })?;
++        return Ok(keystore_dir.join(account));
++    }
++
++    Err("IGRA key resolution error: kaspa keystore path or account is required".to_string())
++}
++
++fn build_signed_payload_transaction(
++    private_key: &[u8; 32],
++    source_address: &KaspaAddress,
++    network_type: KaspaNetworkType,
++    payload: &[u8],
++    utxos: &[RpcUtxosByAddressesEntry],
++) -> Result<KaspaTransaction, String> {
++    if utxos.is_empty() {
++        return Err("IGRA submit error: insufficient Kaspa UTXOs for fee payment".to_string());
++    }
++
++    let mut sorted = utxos.to_vec();
++    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
++    let mut selected = Vec::new();
++    let mut total_input = 0u64;
++    for entry in sorted {
++        total_input = total_input.saturating_add(entry.utxo_entry.amount);
++        selected.push(entry);
++        let required_fee = estimated_fee_sompi(payload.len(), selected.len());
++        if total_input > required_fee.saturating_add(MIN_CHANGE_SOMPI) {
++            break;
+         }
++    }
++
++    let fee = estimated_fee_sompi(payload.len(), selected.len());
++    if total_input <= fee.saturating_add(MIN_CHANGE_SOMPI) {
++        return Err("IGRA submit error: insufficient Kaspa UTXOs for fee payment".to_string());
++    }
+ 
+-        let stdout = String::from_utf8_lossy(&output.stdout);
+-        parse_kaspa_tx_id(&stdout).ok_or_else(|| {
+-            "kaswallet submit-payload succeeded but did not return kaspa_tx_id".to_string()
++    let output_value = total_input.saturating_sub(fee);
++    if output_value < MIN_CHANGE_SOMPI {
++        return Err("IGRA submit error: insufficient Kaspa UTXOs for fee payment".to_string());
++    }
++
++    let script_public_key = pay_to_address_script(source_address);
++    let inputs = selected
++        .iter()
++        .map(|entry| {
++            KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1)
++        })
++        .collect::<Vec<_>>();
++    let outputs = vec![KaspaTransactionOutput::new(output_value, script_public_key)];
++    let tx = KaspaTransaction::new(
++        0,
++        inputs,
++        outputs,
++        0,
++        SubnetworkId::default(),
++        0,
++        payload.to_vec(),
++    );
++
++    let entries = selected
++        .iter()
++        .map(|entry| KaspaUtxoEntry {
++            amount: entry.utxo_entry.amount,
++            script_public_key: entry.utxo_entry.script_public_key.clone(),
++            block_daa_score: entry.utxo_entry.block_daa_score,
++            is_coinbase: entry.utxo_entry.is_coinbase,
+         })
++        .collect::<Vec<_>>();
++
++    let signable = KaspaSignableTransaction::with_entries(tx, entries);
++    let signed = kaspa_sign_with_multiple_v2(signable, std::slice::from_ref(private_key))
++        .fully_signed()
++        .map_err(|err| format!("IGRA submit error: failed to sign Kaspa tx: {err}"))?;
++    kaspa_verify(&signed.as_verifiable())
++        .map_err(|err| format!("IGRA submit error: invalid Kaspa signature set: {err}"))?;
++
++    let mass_calculator = KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
++    let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
++    let contextual = mass_calculator
++        .calc_contextual_masses(&signed.as_verifiable())
++        .ok_or_else(|| "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string())?;
++    let mass = contextual.max(non_contextual);
++    if mass > MAX_STANDARD_KASPA_TX_MASS {
++        return Err(format!(
++            "IGRA submit error: Kaspa transaction mass {mass} exceeds standard limit {MAX_STANDARD_KASPA_TX_MASS}"
++        ));
+     }
++
++    let tx = signed.tx;
++    tx.set_mass(mass);
++    Ok(tx)
++}
++
++fn estimated_fee_sompi(payload_len: usize, inputs: usize) -> u64 {
++    let payload_len = u64::try_from(payload_len).unwrap_or(u64::MAX);
++    let kib = payload_len.div_ceil(1024);
++    let input_tail = u64::try_from(inputs.saturating_sub(1)).unwrap_or(u64::MAX);
++    BASE_SUBMIT_FEE_SOMPI
++        .saturating_add(kib.saturating_mul(FEE_PER_KIB_SOMPI))
++        .saturating_add(input_tail.saturating_mul(EXTRA_INPUT_FEE_SOMPI))
+ }
+ 
+ /// Transport wrapper that applies IGRA-specific request interception.
+@@ -123,6 +444,7 @@ pub struct IgraTransport<T> {
+     mining_timeout: Duration,
+     kaspa_rpc_url: Option<String>,
+     kaspa_network: Option<String>,
++    kaspa_wallet: IgraKaspaWalletConfig,
+     submitter: Arc<dyn IgraPayloadSubmitter>,
+ }
+ 
+@@ -137,7 +459,8 @@ pub fn new(inner: T, enabled: bool) -> Self {
+             mining_timeout: Duration::from_secs(DEFAULT_MINING_TIMEOUT_SECS),
+             kaspa_rpc_url: None,
+             kaspa_network: None,
+-            submitter: Arc::new(KaswalletPayloadSubmitter::default()),
++            kaspa_wallet: IgraKaspaWalletConfig::default(),
++            submitter: Arc::new(InProcessKaspaPayloadSubmitter::default()),
+         }
+     }
+ 
+@@ -148,6 +471,7 @@ pub fn with_transport_config(mut self, config: IgraTransportConfig) -> Self {
+             Duration::from_secs(config.mining_timeout_secs.unwrap_or(DEFAULT_MINING_TIMEOUT_SECS));
+         self.kaspa_rpc_url = config.kaspa_rpc_url;
+         self.kaspa_network = config.kaspa_network;
++        self.kaspa_wallet = config.kaspa_wallet;
+         self
+     }
+ 
+@@ -323,7 +647,7 @@ fn raw_tx_metadata_from_raw_tx(raw_tx: &[u8]) -> RawTxMetadata {
+             .as_ref()
+             .and_then(|envelope| envelope.recover_signer().ok())
+             .map(|address| format!("{address:#x}"));
+-        let nonce = decoded.as_ref().map(Transaction::nonce);
++        let nonce = decoded.as_ref().map(AlloyTransaction::nonce);
+ 
+         RawTxMetadata { l2_tx_hash, sender, nonce }
+     }
+@@ -408,6 +732,7 @@ pub fn request(&self, request: RequestPacket) -> TransportFut<'static>
+             let mining_timeout = self.mining_timeout;
+             let kaspa_rpc_url = self.kaspa_rpc_url.clone();
+             let kaspa_network = self.kaspa_network.clone();
++            let kaspa_wallet = self.kaspa_wallet.clone();
+             let submitter = self.submitter.clone();
+ 
+             return Box::pin(async move {
+@@ -547,16 +872,12 @@ pub fn request(&self, request: RequestPacket) -> TransportFut<'static>
+                         payload_nonce: mined.payload_nonce,
+                         kaspa_rpc_url,
+                         kaspa_network,
++                        kaspa_wallet,
+                     };
+-                    let submitter = submitter.clone();
+-                    let kaspa_tx_id = tokio::task::spawn_blocking(move || {
+-                        submitter.submit_payload(&submit_request)
+-                    })
+-                    .await
+-                    .map_err(|err| {
+-                        Self::reject_error(&format!("IGRA submit task join failure: {err}"))
+-                    })?
+-                    .map_err(|err| Self::reject_error(&err))?;
++                    let kaspa_tx_id = submitter
++                        .submit_payload(&submit_request)
++                        .await
++                        .map_err(|err| Self::reject_error(&err))?;
+ 
+                     if let Some(tracked) = tracked.as_ref() {
+                         Self::persist_transition_safe(
+@@ -735,40 +1056,6 @@ fn mine_payload_nonce(
+     }
+ }
+ 
+-fn parse_kaspa_tx_id(stdout: &str) -> Option<String> {
+-    let trimmed = stdout.trim();
+-    if trimmed.is_empty() {
+-        return None;
+-    }
+-
+-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+-        for key in ["kaspa_tx_id", "tx_id", "transaction_id", "id"] {
+-            if let Some(id) = value.get(key).and_then(Value::as_str).map(str::trim)
+-                && !id.is_empty()
+-            {
+-                return Some(id.to_string());
+-            }
+-        }
+-    }
+-
+-    if let Some(candidate) = trimmed
+-        .split_whitespace()
+-        .find(|part| looks_like_kaspa_tx_id(part.trim_matches(|c| c == '"' || c == '\'')))
+-    {
+-        return Some(candidate.trim_matches(|c| c == '"' || c == '\'').to_string());
+-    }
+-
+-    trimmed.lines().rev().find_map(|line| {
+-        let line = line.trim();
+-        if line.is_empty() { None } else { Some(line.to_string()) }
+-    })
+-}
+-
+-fn looks_like_kaspa_tx_id(candidate: &str) -> bool {
+-    let value = candidate.strip_prefix("0x").unwrap_or(candidate);
+-    value.len() == 64 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+-}
+-
+ fn now_ms() -> u64 {
+     SystemTime::now()
+         .duration_since(UNIX_EPOCH)
+@@ -860,6 +1147,7 @@ mod tests {
+     use alloy_json_rpc::{Id, Request, RequestPacket, Response, ResponsePacket, ResponsePayload};
+     use alloy_primitives::{hex, utils::keccak256};
+     use alloy_transport::{TransportError, TransportFut};
++    use foundry_config::IgraKaspaWalletConfig;
+     use serde_json::value::RawValue;
+     use std::sync::{
+         Arc,
+@@ -934,13 +1222,17 @@ fn max_in_flight(&self) -> usize {
+         }
+     }
+ 
++    #[async_trait::async_trait]
+     impl IgraPayloadSubmitter for RecordingSubmitter {
+-        fn submit_payload(&self, _request: &super::IgraSubmitRequest) -> Result<String, String> {
++        async fn submit_payload(
++            &self,
++            _request: &super::IgraSubmitRequest,
++        ) -> Result<String, String> {
+             self.calls.fetch_add(1, Ordering::SeqCst);
+             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+             self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+             if !self.delay.is_zero() {
+-                std::thread::sleep(self.delay);
++                tokio::time::sleep(self.delay).await;
+             }
+             self.in_flight.fetch_sub(1, Ordering::SeqCst);
+             self.result.clone()
+@@ -1013,6 +1305,7 @@ fn test_transport_config() -> IgraTransportConfig {
+             mining_timeout_secs: Some(2),
+             kaspa_rpc_url: Some("grpc://127.0.0.1:16110".to_string()),
+             kaspa_network: Some("testnet-10".to_string()),
++            kaspa_wallet: IgraKaspaWalletConfig::default(),
+         }
+     }
+ 
+diff --git a/crates/wallets/src/opts.rs b/crates/wallets/src/opts.rs
+index 9265a7c79..412854859 100644
+--- a/crates/wallets/src/opts.rs
++++ b/crates/wallets/src/opts.rs
+@@ -2,7 +2,9 @@
+ use alloy_primitives::Address;
+ use clap::Parser;
+ use eyre::Result;
++use foundry_config::{Config, IgraKaspaWalletConfig};
+ use serde::Serialize;
++use tracing::warn;
+ 
+ /// The wallet options can either be:
+ /// 1. Raw (via private key / mnemonic file, see `RawWallet`)
+@@ -29,6 +31,9 @@ pub struct WalletOpts {
+     #[command(flatten)]
+     pub raw: RawWalletOpts,
+ 
++    #[command(flatten)]
++    pub kaspa: KaspaWalletOpts,
++
+     /// Use the keystore in the given folder or file.
+     #[arg(
+         long = "keystore",
+@@ -134,6 +139,99 @@ pub struct WalletOpts {
+     pub browser_development: bool,
+ }
+ 
++/// Kaspa key source options used by IGRA mode.
++#[derive(Clone, Debug, Default, Serialize, Parser)]
++#[command(next_help_heading = "Wallet options - kaspa", about = None, long_about = None)]
++pub struct KaspaWalletOpts {
++    /// Use the provided Kaspa private key.
++    #[arg(
++        long = "private-key-kaspa",
++        env = "KASPA_PRIVATE_KEY",
++        value_name = "RAW_PRIVATE_KEY",
++        hide_env_values = true
++    )]
++    pub private_key_kaspa: Option<String>,
++
++    /// Use the Kaspa mnemonic phrase.
++    #[arg(
++        long = "mnemonic-kaspa",
++        env = "KASPA_MNEMONIC",
++        value_name = "MNEMONIC",
++        hide_env_values = true
++    )]
++    pub mnemonic_kaspa: Option<String>,
++
++    /// Use a BIP39 passphrase for the Kaspa mnemonic.
++    #[arg(
++        long = "mnemonic-passphrase-kaspa",
++        env = "KASPA_MNEMONIC_PASSPHRASE",
++        value_name = "PASSPHRASE",
++        hide_env_values = true
++    )]
++    pub mnemonic_passphrase_kaspa: Option<String>,
++
++    /// Kaspa mnemonic derivation path override.
++    #[arg(
++        long = "mnemonic-derivation-path-kaspa",
++        env = "KASPA_MNEMONIC_DERIVATION_PATH",
++        value_name = "PATH"
++    )]
++    pub mnemonic_derivation_path_kaspa: Option<String>,
++
++    /// Kaspa mnemonic index override.
++    #[arg(long = "mnemonic-index-kaspa", env = "KASPA_MNEMONIC_INDEX", value_name = "INDEX")]
++    pub mnemonic_index_kaspa: Option<u32>,
++
++    /// Use a Kaspa keystore file.
++    #[arg(long = "keystore-kaspa", env = "KASPA_KEYSTORE", value_name = "PATH")]
++    pub keystore_kaspa: Option<String>,
++
++    /// Use a Kaspa keystore account alias.
++    #[arg(
++        long = "keystore-account-kaspa",
++        env = "KASPA_KEYSTORE_ACCOUNT",
++        value_name = "ACCOUNT_NAME"
++    )]
++    pub keystore_account_kaspa: Option<String>,
++
++    /// Kaspa keystore password.
++    #[arg(
++        long = "password-kaspa",
++        env = "KASPA_PASSWORD",
++        value_name = "PASSWORD",
++        hide_env_values = true
++    )]
++    pub password_kaspa: Option<String>,
++}
++
++impl KaspaWalletOpts {
++    /// Returns true when explicit Kaspa signer source was provided.
++    pub fn is_set(&self) -> bool {
++        self.private_key_kaspa.is_some() ||
++            self.mnemonic_kaspa.is_some() ||
++            self.mnemonic_passphrase_kaspa.is_some() ||
++            self.mnemonic_derivation_path_kaspa.is_some() ||
++            self.mnemonic_index_kaspa.is_some() ||
++            self.keystore_kaspa.is_some() ||
++            self.keystore_account_kaspa.is_some() ||
++            self.password_kaspa.is_some()
++    }
++
++    /// Converts CLI/env Kaspa options to config shape.
++    pub fn as_config(&self) -> IgraKaspaWalletConfig {
++        IgraKaspaWalletConfig {
++            private_key: self.private_key_kaspa.clone(),
++            mnemonic: self.mnemonic_kaspa.clone(),
++            mnemonic_passphrase: self.mnemonic_passphrase_kaspa.clone(),
++            mnemonic_derivation_path: self.mnemonic_derivation_path_kaspa.clone(),
++            mnemonic_index: self.mnemonic_index_kaspa,
++            keystore: self.keystore_kaspa.clone(),
++            keystore_account: self.keystore_account_kaspa.clone(),
++            password: self.password_kaspa.clone(),
++        }
++    }
++}
++
+ impl WalletOpts {
+     pub async fn signer(&self) -> Result<WalletSigner> {
+         trace!("start finding signer");
+@@ -223,6 +321,55 @@ pub async fn signer(&self) -> Result<WalletSigner> {
+ 
+         Ok(signer)
+     }
++
++    /// Applies CLI/env Kaspa wallet overrides into IGRA config with highest precedence.
++    pub fn apply_igra_kaspa_wallet_overrides(&self, config: &mut Config) {
++        if self.kaspa.is_set() {
++            config.igra.kaspa_wallet = self.kaspa.as_config();
++            return;
++        }
++
++        if !config.igra.kaspa_wallet.is_empty() {
++            return;
++        }
++
++        if let Some(fallback) = self.evm_fallback_kaspa_config() {
++            warn!(
++                "IGRA Kaspa wallet fallback is reusing EVM signer key material; prefer explicit --private-key-kaspa or --mnemonic-kaspa for key separation"
++            );
++            config.igra.kaspa_wallet = fallback;
++        }
++    }
++
++    fn evm_fallback_kaspa_config(&self) -> Option<IgraKaspaWalletConfig> {
++        if let Some(private_key) = self.raw.private_key.clone() {
++            return Some(IgraKaspaWalletConfig {
++                private_key: Some(private_key),
++                ..Default::default()
++            });
++        }
++
++        if let Some(mnemonic) = self.raw.mnemonic.clone() {
++            return Some(IgraKaspaWalletConfig {
++                mnemonic: Some(mnemonic),
++                mnemonic_passphrase: self.raw.mnemonic_passphrase.clone(),
++                mnemonic_derivation_path: self.raw.hd_path.clone(),
++                mnemonic_index: Some(self.raw.mnemonic_index),
++                ..Default::default()
++            });
++        }
++
++        if self.keystore_path.is_some() || self.keystore_account_name.is_some() {
++            return Some(IgraKaspaWalletConfig {
++                keystore: self.keystore_path.clone(),
++                keystore_account: self.keystore_account_name.clone(),
++                password: self.keystore_password.clone(),
++                ..Default::default()
++            });
++        }
++
++        None
++    }
+ }
+ 
+ impl From<RawWalletOpts> for WalletOpts {
+@@ -285,6 +432,7 @@ async fn illformed_private_key_generates_user_friendly_error() {
+             browser_port: 9545,
+             browser_development: false,
+             browser_disable_open: false,
++            kaspa: KaspaWalletOpts::default(),
+         };
+         match wallet.signer().await {
+             Ok(_) => {
+@@ -298,4 +446,79 @@ async fn illformed_private_key_generates_user_friendly_error() {
+             }
+         }
+     }
++
++    #[test]
++    fn parses_kaspa_wallet_opts_from_cli() {
++        let wallet: WalletOpts = WalletOpts::parse_from([
++            "foundry-cli",
++            "--private-key-kaspa",
++            "0x1234",
++            "--mnemonic-index-kaspa",
++            "7",
++        ]);
++
++        assert_eq!(wallet.kaspa.private_key_kaspa.as_deref(), Some("0x1234"));
++        assert_eq!(wallet.kaspa.mnemonic_index_kaspa, Some(7));
++        assert!(wallet.kaspa.is_set());
++    }
++
++    #[test]
++    fn applies_kaspa_wallet_overrides_to_igra_config() {
++        let wallet: WalletOpts = WalletOpts::parse_from([
++            "foundry-cli",
++            "--private-key-kaspa",
++            "0xabcd",
++            "--mnemonic-kaspa",
++            "test test test test test test test test test test test junk",
++            "--mnemonic-derivation-path-kaspa",
++            "m/44'/111111'/0'/0/0",
++        ]);
++
++        let mut config = Config::default();
++        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
++
++        assert_eq!(config.igra.kaspa_wallet.private_key.as_deref(), Some("0xabcd"));
++        assert_eq!(
++            config.igra.kaspa_wallet.mnemonic.as_deref(),
++            Some("test test test test test test test test test test test junk")
++        );
++        assert_eq!(
++            config.igra.kaspa_wallet.mnemonic_derivation_path.as_deref(),
++            Some("m/44'/111111'/0'/0/0")
++        );
++    }
++
++    #[test]
++    fn falls_back_to_evm_private_key_when_kaspa_key_missing() {
++        let wallet: WalletOpts =
++            WalletOpts::parse_from(["foundry-cli", "--private-key", "0x1111111111111111111111111111111111111111111111111111111111111111"]);
++
++        let mut config = Config::default();
++        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
++
++        assert_eq!(
++            config.igra.kaspa_wallet.private_key.as_deref(),
++            Some("0x1111111111111111111111111111111111111111111111111111111111111111")
++        );
++        assert!(config.igra.kaspa_wallet.mnemonic.is_none());
++    }
++
++    #[test]
++    fn explicit_kaspa_key_overrides_evm_fallback() {
++        let wallet: WalletOpts = WalletOpts::parse_from([
++            "foundry-cli",
++            "--private-key",
++            "0x1111111111111111111111111111111111111111111111111111111111111111",
++            "--private-key-kaspa",
++            "0x2222222222222222222222222222222222222222222222222222222222222222",
++        ]);
++
++        let mut config = Config::default();
++        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
++
++        assert_eq!(
++            config.igra.kaspa_wallet.private_key.as_deref(),
++            Some("0x2222222222222222222222222222222222222222222222222222222222222222")
++        );
++    }
+ }
+diff --git a/crates/wallets/src/wallet_multi/mod.rs b/crates/wallets/src/wallet_multi/mod.rs
+index 3a03646e7..5e3a2fa29 100644
+--- a/crates/wallets/src/wallet_multi/mod.rs
++++ b/crates/wallets/src/wallet_multi/mod.rs
+@@ -1,4 +1,5 @@
+ use crate::{
++    opts::KaspaWalletOpts,
+     signer::{PendingSigner, WalletSigner},
+     utils,
+ };
+@@ -10,6 +11,7 @@
+ use foundry_config::Config;
+ use serde::Serialize;
+ use std::path::PathBuf;
++use tracing::warn;
+ 
+ /// Container for multiple wallets.
+ #[derive(Debug, Default)]
+@@ -259,9 +261,92 @@ pub struct MultiWalletOpts {
+     /// **WARNING**: This should only be used in a development environment.
+     #[arg(long, help_heading = "Wallet options - browser", hide = true)]
+     pub browser_development: bool,
++
++    #[command(flatten)]
++    #[builder(default = "KaspaWalletOpts::default()")]
++    pub kaspa: KaspaWalletOpts,
+ }
+ 
+ impl MultiWalletOpts {
++    /// Applies CLI/env Kaspa wallet overrides into IGRA config with highest precedence.
++    pub fn apply_igra_kaspa_wallet_overrides(&self, config: &mut Config) {
++        if self.kaspa.is_set() {
++            config.igra.kaspa_wallet = self.kaspa.as_config();
++            return;
++        }
++
++        if !config.igra.kaspa_wallet.is_empty() {
++            return;
++        }
++
++        if let Some(fallback) = self.evm_fallback_kaspa_config() {
++            warn!(
++                "IGRA Kaspa wallet fallback is reusing EVM signer key material; prefer explicit --private-key-kaspa or --mnemonic-kaspa for key separation"
++            );
++            config.igra.kaspa_wallet = fallback;
++        }
++    }
++
++    fn evm_fallback_kaspa_config(&self) -> Option<foundry_config::IgraKaspaWalletConfig> {
++        if let Some(private_key) = self.private_key.clone().or_else(|| {
++            self.private_keys
++                .as_ref()
++                .and_then(|private_keys| private_keys.first().cloned())
++        }) {
++            return Some(foundry_config::IgraKaspaWalletConfig {
++                private_key: Some(private_key),
++                ..Default::default()
++            });
++        }
++
++        if let Some(mnemonic) =
++            self.mnemonics.as_ref().and_then(|mnemonics| mnemonics.first().cloned())
++        {
++            let mnemonic_passphrase = self
++                .mnemonic_passphrases
++                .as_ref()
++                .and_then(|phrases| phrases.first().cloned());
++            let mnemonic_derivation_path =
++                self.hd_paths.as_ref().and_then(|paths| paths.first().cloned());
++            let mnemonic_index = self
++                .mnemonic_indexes
++                .as_ref()
++                .and_then(|indexes| indexes.first().copied())
++                .or(Some(0));
++
++            return Some(foundry_config::IgraKaspaWalletConfig {
++                mnemonic: Some(mnemonic),
++                mnemonic_passphrase,
++                mnemonic_derivation_path,
++                mnemonic_index,
++                ..Default::default()
++            });
++        }
++
++        let keystore = self
++            .keystore_paths
++            .as_ref()
++            .and_then(|paths| paths.first().cloned());
++        let keystore_account = self
++            .keystore_account_names
++            .as_ref()
++            .and_then(|names| names.first().cloned());
++        if keystore.is_some() || keystore_account.is_some() {
++            let password = self
++                .keystore_passwords
++                .as_ref()
++                .and_then(|passwords| passwords.first().cloned());
++            return Some(foundry_config::IgraKaspaWalletConfig {
++                keystore,
++                keystore_account,
++                password,
++                ..Default::default()
++            });
++        }
++
++        None
++    }
++
+     /// Returns [MultiWallet] container configured with provided options.
+     pub async fn get_multi_wallet(&self) -> Result<MultiWallet> {
+         let mut pending = Vec::new();
+@@ -653,4 +738,40 @@ fn should_not_require_the_mnemonics_flag_with_mnemonic_indexes() {
+             )
+         }
+     }
++
++    #[test]
++    fn falls_back_to_evm_private_key_when_kaspa_key_missing() {
++        let wallet: MultiWalletOpts = MultiWalletOpts::parse_from([
++            "foundry-cli",
++            "--private-key",
++            "0x1111111111111111111111111111111111111111111111111111111111111111",
++        ]);
++
++        let mut config = Config::default();
++        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
++
++        assert_eq!(
++            config.igra.kaspa_wallet.private_key.as_deref(),
++            Some("0x1111111111111111111111111111111111111111111111111111111111111111")
++        );
++    }
++
++    #[test]
++    fn explicit_kaspa_key_overrides_multi_wallet_fallback() {
++        let wallet: MultiWalletOpts = MultiWalletOpts::parse_from([
++            "foundry-cli",
++            "--private-key",
++            "0x1111111111111111111111111111111111111111111111111111111111111111",
++            "--private-key-kaspa",
++            "0x2222222222222222222222222222222222222222222222222222222222222222",
++        ]);
++
++        let mut config = Config::default();
++        wallet.apply_igra_kaspa_wallet_overrides(&mut config);
++
++        assert_eq!(
++            config.igra.kaspa_wallet.private_key.as_deref(),
++            Some("0x2222222222222222222222222222222222222222222222222222222222222222")
++        );
++    }
+ }

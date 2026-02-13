@@ -4,6 +4,41 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Kaspa signer source configuration for IGRA write-path submission.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IgraKaspaWalletConfig {
+    /// Kaspa private key in hex format.
+    pub private_key: Option<String>,
+    /// Kaspa mnemonic phrase.
+    pub mnemonic: Option<String>,
+    /// Optional BIP39 passphrase for the mnemonic.
+    pub mnemonic_passphrase: Option<String>,
+    /// Optional derivation path override.
+    pub mnemonic_derivation_path: Option<String>,
+    /// Mnemonic index override.
+    pub mnemonic_index: Option<u32>,
+    /// Optional keystore path.
+    pub keystore: Option<String>,
+    /// Optional keystore account alias.
+    pub keystore_account: Option<String>,
+    /// Optional keystore password value.
+    pub password: Option<String>,
+}
+
+impl IgraKaspaWalletConfig {
+    /// Returns true when no explicit Kaspa signer source was configured.
+    pub fn is_empty(&self) -> bool {
+        self.private_key.is_none() &&
+            self.mnemonic.is_none() &&
+            self.mnemonic_passphrase.is_none() &&
+            self.mnemonic_derivation_path.is_none() &&
+            self.mnemonic_index.is_none() &&
+            self.keystore.is_none() &&
+            self.keystore_account.is_none() &&
+            self.password.is_none()
+    }
+}
+
 /// IGRA-specific configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IgraConfig {
@@ -23,6 +58,13 @@ pub struct IgraConfig {
     pub el_receipt_timeout_secs: Option<u64>,
     /// Timeout in seconds while mining payload nonces for tx-id prefix.
     pub mining_timeout_secs: Option<u64>,
+    /// Optional payload compression mode for L2Data inside the Kaspa payload.
+    ///
+    /// Note: ZippedPayload is not deployed/accepted on galleon testnet at the moment. Keep v1
+    /// deterministic by using "none".
+    ///
+    /// Supported: "none".
+    pub payload_compression: Option<String>,
     /// Sender lock timeout in seconds.
     pub sender_lock_timeout_secs: Option<u64>,
     /// Retention period for completed IGRA tx-map entries.
@@ -31,6 +73,9 @@ pub struct IgraConfig {
     pub failed_retention_hours: Option<u64>,
     /// Max size of IGRA tx-map database in MB.
     pub max_db_size_mb: Option<u64>,
+    /// Optional Kaspa signer source configuration for in-process submission.
+    #[serde(default)]
+    pub kaspa_wallet: IgraKaspaWalletConfig,
 }
 
 impl IgraConfig {
@@ -99,6 +144,22 @@ impl IgraConfig {
         validate_positive_opt("failed_retention_hours", self.failed_retention_hours)?;
         validate_positive_opt("max_db_size_mb", self.max_db_size_mb)?;
 
+        if let Some(mode) = self.payload_compression.as_deref() {
+            let mode = mode.trim().to_ascii_lowercase();
+            if matches!(mode.as_str(), "zlib") {
+                return Err(IgraConfigError::Invalid {
+                    field: "payload_compression",
+                    reason: "zlib is not implemented; use `none`".to_string(),
+                });
+            }
+            if !matches!(mode.as_str(), "" | "none") {
+                return Err(IgraConfigError::Invalid {
+                    field: "payload_compression",
+                    reason: "supported values: none".to_string(),
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -164,7 +225,7 @@ pub enum IgraConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::IgraConfig;
+    use super::{IgraConfig, IgraKaspaWalletConfig};
 
     fn valid_config() -> IgraConfig {
         IgraConfig {
@@ -176,10 +237,12 @@ mod tests {
             tx_id_prefix: Some("97b1".to_string()),
             el_receipt_timeout_secs: Some(300),
             mining_timeout_secs: Some(120),
+            payload_compression: None,
             sender_lock_timeout_secs: Some(60),
             completed_retention_hours: Some(168),
             failed_retention_hours: Some(720),
             max_db_size_mb: Some(512),
+            kaspa_wallet: IgraKaspaWalletConfig::default(),
         }
     }
 
@@ -288,5 +351,15 @@ mod tests {
             let err = config.validate().unwrap_err().to_string();
             assert!(err.contains(field), "expected field `{field}` in error: {err}");
         }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_payload_compression() {
+        let mut config = valid_config();
+        config.payload_compression = Some("brotli".to_string());
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("payload_compression"));
+        assert!(err.contains("supported values"));
     }
 }

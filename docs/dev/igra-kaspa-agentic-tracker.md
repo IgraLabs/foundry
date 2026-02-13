@@ -286,3 +286,96 @@ Source spec: `docs/dev/igra-kaspa-integration-plan.md`
   - `cargo test -p cast guardrails_ -- --nocapture` passed
   - `cargo test -p forge guardrails_ -- --nocapture` passed
 - Result: Item 10 complete for deterministic harness + CI + write-path guardrail test coverage scope.
+
+## V2 Delta Implementation (Design Spec v2)
+
+Source specs:
+- `docs/dev/igra-kaspa-design-spec-v2.md`
+- `docs/dev/igra-kaspa-design-spec-v2-review.md`
+- `docs/dev/igra-kaspa-design-spec-v2-review-r2.md`
+
+### Scope
+
+1. In-process Kaspa submission runtime (no external `kaswallet` subprocess execution in IGRA write path).
+2. Kaspa key UX parity with EVM-style CLI/ENV options.
+3. Default fallback behavior: if explicit Kaspa key material is absent, reuse resolved EVM signer material.
+
+### Cycle 1 (Implement + Review)
+
+- Implementer run:
+  - Added Kaspa key source config shape (`IgraKaspaWalletConfig`) and config exports.
+  - Added Kaspa wallet CLI/ENV options in `foundry-wallets`:
+    - `--private-key-kaspa`, `--mnemonic-kaspa`, `--mnemonic-passphrase-kaspa`,
+      `--mnemonic-derivation-path-kaspa`, `--mnemonic-index-kaspa`,
+      `--keystore-kaspa`, `--keystore-account-kaspa`, `--password-kaspa`.
+  - Added override + fallback wiring in:
+    - `crates/wallets/src/opts.rs`
+    - `crates/wallets/src/wallet_multi/mod.rs`
+  - Wired command entrypoints to apply overrides before IGRA guardrails:
+    - `crates/cast/src/cmd/send.rs`
+    - `crates/forge/src/cmd/create.rs`
+    - `crates/script/src/lib.rs`
+  - Replaced subprocess submit path with in-process submitter in:
+    - `crates/common/src/provider/igra_transport.rs`
+    - `crates/common/src/provider/mod.rs`
+- Reviewer run (Claude): flagged runtime blocking risk in submit path and UTXO cache staleness risk.
+- Fix run:
+  - Moved CPU-heavy Kaspa tx build/sign/mass calculation to `tokio::task::spawn_blocking`.
+  - Added UTXO cache invalidation on successful submit.
+  - Added explicit warning logs when EVM signer fallback is used for Kaspa key material.
+- Tests:
+  - `cargo test -p foundry-common igra_transport -- --nocapture` passed
+  - `cargo test -p foundry-wallets falls_back_to_evm -- --nocapture` passed
+  - `cargo test -p foundry-wallets explicit_kaspa_key_overrides -- --nocapture` passed
+
+### Cycle 2 (Hardening + Re-review)
+
+- Implementer run:
+  - Fixed sender-lock acquisition race in SQLite by using `TransactionBehavior::Immediate` and retry handling for busy/locked states:
+    - `crates/common/src/igra_store.rs`
+  - Hardened fee/input selection consistency:
+    - selection loop now uses selected-input fee estimate
+    - aligned threshold comparisons (`>=` for selection, `<` for insufficient funds)
+    - safer integer conversion in fee helper (`usize -> u64` via checked conversion with saturation fallback)
+  - Hardened cache correctness with epoch-based cache write guard:
+    - `utxo_cache_epoch` added to in-process submitter
+    - invalidation bumps epoch and clears cache
+    - stale post-fetch cache writes are dropped when epoch changed
+  - Moved potentially blocking store operations off async executor via `spawn_blocking`:
+    - sender lock acquire/classify
+    - mark submitted nonce
+    - sender lock release
+- Reviewer run (Claude, focused snippets):
+  - returned mixed findings; accepted findings above were implemented.
+  - several findings were rejected as false positives after code verification (for example lock release path is present, and fallback-to-EVM behavior is required by v2 spec).
+- Tests:
+  - `cargo test -p foundry-common igra_transport -- --nocapture` passed
+  - `cargo test -p foundry-common igra_store -- --nocapture` passed
+  - `cargo test -p foundry-wallets falls_back_to_evm -- --nocapture` passed
+  - `cargo test -p foundry-wallets explicit_kaspa_key_overrides -- --nocapture` passed
+
+### Final V2 Status
+
+- In-process submit runtime: implemented.
+- Kaspa CLI/ENV key UX: implemented.
+- EVM->Kaspa default fallback semantics: implemented.
+- Override precedence (explicit Kaspa > config > fallback): implemented and tested.
+- Regression suites for transport/store/wallet fallback: passing.
+
+### Post-Review Fix: BIP39 Passphrase Derivation Mismatch
+
+Issue:
+- User reported that the funded Kaspa deposit address derived from the Hardhat mnemonic did not match Foundry's derived address.
+
+Root cause:
+- The user's wallet was created/imported with a **non-empty BIP39 mnemonic passphrase** (aka recovery/mnemonic/payment passphrase).
+- BIP39 passphrase participates in seed derivation: same words + different passphrase => different seed => different keys/address.
+
+Fixes:
+- Documented the gotcha and required CLI/ENV usage:
+  - `--mnemonic-passphrase-kaspa` / `KASPA_MNEMONIC_PASSPHRASE`
+  - `docs/dev/igra-kaspa-design-spec-v2.md` Section 4.5.1
+- Added unit tests proving:
+  - mnemonic + passphrase=mnemonic => funded `kaspatest:qzf364...`
+  - mnemonic + empty passphrase => `kaspatest:qzy7...`
+- Improved runtime error hint when mnemonic is provided without passphrase and no UTXOs are found.

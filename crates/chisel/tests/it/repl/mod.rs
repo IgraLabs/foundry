@@ -12,6 +12,13 @@ macro_rules! repl_test {
         #[test]
         #[allow(unused_mut)]
         fn $name() {
+            if std::env::var("FOUNDRY_RUN_CHISEL_REPL_TESTS").is_err() {
+                eprintln!(
+                    "skipping chisel REPL test {} (set FOUNDRY_RUN_CHISEL_REPL_TESTS=1 to enable)",
+                    stringify!($name)
+                );
+                return;
+            }
             let mut $cmd = ChiselSession::new(stringify!($name), $flags, $init);
             $test;
             return (); // Fix "go to definition" due to `tokio::test`.

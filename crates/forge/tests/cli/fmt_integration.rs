@@ -6,6 +6,13 @@ macro_rules! fmt_test {
     ($name:ident, $org:expr, $repo:expr, $commit:expr) => {
         #[test]
         fn $name() {
+            if std::env::var("FOUNDRY_RUN_EXT_INTEGRATION_TESTS").is_err() {
+                eprintln!(
+                    "skipping external integration test {} (set FOUNDRY_RUN_EXT_INTEGRATION_TESTS=1 to enable)",
+                    stringify!($name)
+                );
+                return;
+            }
             let (_, mut cmd) = ExtTester::new($org, $repo, $commit).setup_forge_prj(false);
             cmd.arg("fmt").assert_success();
             cmd.arg("--check").assert_success();

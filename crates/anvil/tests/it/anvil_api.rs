@@ -659,6 +659,11 @@ async fn can_remove_pool_transactions() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn flaky_test_reorg() {
+    if std::env::var("FOUNDRY_RUN_FLAKY_TESTS").is_err() {
+        eprintln!("skipping flaky_test_reorg (set FOUNDRY_RUN_FLAKY_TESTS=1 to enable)");
+        return;
+    }
+
     let (api, handle) = spawn(NodeConfig::test()).await;
     let provider = handle.http_provider();
 

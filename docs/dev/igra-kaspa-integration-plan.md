@@ -62,7 +62,7 @@ expected_el_chain_id = 1337
 kaspa_network = "testnet-10"
 
 # Mining + submission
-tx_id_prefix = "97b1"
+tx_id_prefix = "97b4" # testnet-10 (galleon-testnet). Use "97b1" for mainnet.
 kaspa_submit_timeout_secs = 30
 mining_timeout_secs = 120
 kaspa_acceptance_confirmations = 0 # v1 default: mempool acceptance only
@@ -72,7 +72,7 @@ el_confirmations = 1
 # Payload/size policy
 max_l2_tx_bytes = 131072
 max_kaspa_compute_mass = 80000
-payload_compression = "off" # off | zstd (future)
+payload_compression = "none" # v1 only: UnzippedPayload (0x94). ZippedPayload is not implemented.
 
 # Reliability
 max_retries = 3 # mining and other transient pre-broadcast failures

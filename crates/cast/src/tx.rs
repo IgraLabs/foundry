@@ -350,6 +350,8 @@ pub struct CastTxBuilder<P, S> {
     tx: WithOtherFields<TransactionRequest>,
     /// Whether the transaction should be sent as a legacy transaction.
     legacy: bool,
+    /// Whether IGRA mode is enabled (affects fee defaults for EIP-1559 txs).
+    igra_enabled: bool,
     blob: bool,
     /// Whether the blob transaction should use EIP-4844 (legacy) format instead of EIP-7594.
     eip4844: bool,
@@ -412,6 +414,7 @@ impl<P: Provider<AnyNetwork>> CastTxBuilder<P, InitState> {
             provider,
             tx,
             legacy,
+            igra_enabled: config.igra.enabled,
             blob: tx_opts.blob,
             eip4844: tx_opts.eip4844,
             chain,
@@ -429,6 +432,7 @@ impl<P: Provider<AnyNetwork>> CastTxBuilder<P, InitState> {
             provider: self.provider,
             tx: self.tx,
             legacy: self.legacy,
+            igra_enabled: self.igra_enabled,
             blob: self.blob,
             eip4844: self.eip4844,
             chain: self.chain,
@@ -486,6 +490,7 @@ impl<P: Provider<AnyNetwork>> CastTxBuilder<P, ToState> {
             provider: self.provider,
             tx: self.tx,
             legacy: self.legacy,
+            igra_enabled: self.igra_enabled,
             blob: self.blob,
             eip4844: self.eip4844,
             chain: self.chain,
@@ -614,12 +619,55 @@ impl<P: Provider<AnyNetwork>> CastTxBuilder<P, InputState> {
         {
             let estimate = self.provider.estimate_eip1559_fees().await?;
 
+            // IGRA adapter enforces a minimum fee policy for EIP-1559 txs via
+            // `maxPriorityFeePerGas`. On IGRA networks, `eth_gasPrice` reflects this minimum
+            // better than `eth_feeHistory` percentiles, so when IGRA mode is enabled we use it as
+            // a floor for default fee filling.
+            let floor = if self.igra_enabled { Some(self.provider.get_gas_price().await?) } else { None };
+
+            if let Some(existing) = self.tx.max_fee_per_gas {
+                if let Some(floor) = floor {
+                    if existing < floor {
+                        eyre::bail!(
+                            "IGRA requires maxFeePerGas >= eth_gasPrice ({} < {}); set --gas-price accordingly",
+                            existing,
+                            floor
+                        );
+                    }
+                }
+            }
+            if let Some(existing) = self.tx.max_priority_fee_per_gas {
+                if let Some(floor) = floor {
+                    if existing < floor {
+                        eyre::bail!(
+                            "IGRA requires maxPriorityFeePerGas >= eth_gasPrice ({} < {}); set --priority-gas-price accordingly",
+                            existing,
+                            floor
+                        );
+                    }
+                }
+            }
+
             if self.tx.max_fee_per_gas.is_none() {
-                self.tx.max_fee_per_gas = Some(estimate.max_fee_per_gas);
+                let mut value = estimate.max_fee_per_gas;
+                if let Some(floor) = floor {
+                    value = value.max(floor);
+                }
+                self.tx.max_fee_per_gas = Some(value);
             }
 
             if self.tx.max_priority_fee_per_gas.is_none() {
-                self.tx.max_priority_fee_per_gas = Some(estimate.max_priority_fee_per_gas);
+                let mut value = estimate.max_priority_fee_per_gas;
+                if let Some(floor) = floor {
+                    value = value.max(floor);
+                }
+                // EIP-1559 requires max_fee_per_gas >= max_priority_fee_per_gas.
+                if let Some(max_fee) = self.tx.max_fee_per_gas {
+                    if value > max_fee {
+                        self.tx.max_fee_per_gas = Some(value);
+                    }
+                }
+                self.tx.max_priority_fee_per_gas = Some(value);
             }
         }
 

@@ -121,7 +121,8 @@ impl SendTxArgs {
             None
         };
 
-        let config = send_tx.eth.load_config()?;
+        let mut config = send_tx.eth.load_config()?;
+        send_tx.eth.wallet.apply_igra_kaspa_wallet_overrides(&mut config);
         ensure_supported_igra_signer_flow(
             &config,
             "cast send",
@@ -142,7 +143,15 @@ impl SendTxArgs {
             .await?
             .with_blob_data(blob_data)?;
 
-        let timeout = send_tx.timeout.unwrap_or(config.transaction_timeout);
+        // In IGRA mode, the EL receipt can appear significantly later than a direct EL submission,
+        // so default receipt polling timeout to the IGRA-configured value.
+        let timeout = send_tx.timeout.unwrap_or_else(|| {
+            if config.igra.enabled {
+                config.igra.el_receipt_timeout_secs.unwrap_or(config.transaction_timeout)
+            } else {
+                config.transaction_timeout
+            }
+        });
 
         // Check if this is a Tempo transaction - requires special handling for local signing
         let is_tempo = builder.is_tempo();

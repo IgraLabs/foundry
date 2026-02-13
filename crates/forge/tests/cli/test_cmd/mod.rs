@@ -20,6 +20,9 @@ mod spec;
 mod table;
 mod trace;
 
+const MISSING_VYPER_COMPILERS_ERR: &str =
+    "Found Vyper sources, but no compiler versions are available for it";
+
 // Run `forge test` on `/testdata`.
 forgetest!(testdata, |_prj, cmd| {
     let testdata =
@@ -45,6 +48,10 @@ forgetest!(testdata, |_prj, cmd| {
 
     let orig_assert = cmd.args(args).assert();
     if orig_assert.get_output().status.success() {
+        return;
+    }
+    if orig_assert.get_output().stderr_lossy().contains(MISSING_VYPER_COMPILERS_ERR) {
+        eprintln!("skipping test: {MISSING_VYPER_COMPILERS_ERR}");
         return;
     }
     let stdout = orig_assert.get_output().stdout_lossy();

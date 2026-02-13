@@ -25,6 +25,9 @@ use std::{
 use crate::util::{SOLC_VERSION, copy_dir_filtered, pretty_err};
 
 static CURRENT_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static ENSURE_WORKSPACE_BINS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static ENSURED_WORKSPACE_BINS: LazyLock<Mutex<std::collections::BTreeSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::BTreeSet::new()));
 
 /// Global test identifier.
 static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -460,13 +463,21 @@ impl TestProject {
     }
 
     pub(crate) fn forge_path(&self) -> PathBuf {
-        canonicalize(self.exe_root.join(format!("../forge{}", env::consts::EXE_SUFFIX)))
+        // Many integration tests (including `cast` CLI tests) shell out to `forge`. When running
+        // `cargo test -p cast`, Cargo does not build the `forge` binary by default, which would
+        // cause `spawn` to fail with ENOENT. Ensure the workspace binary exists once per test run.
+        let path = self.exe_root.join(format!("../forge{}", env::consts::EXE_SUFFIX));
+        ensure_workspace_bin_built("forge", &path, &self.exe_root);
+        canonicalize(path)
     }
 
     /// Returns the path to the cast executable.
     pub fn cast_bin(&self) -> Command {
-        let cast = canonicalize(self.exe_root.join(format!("../cast{}", env::consts::EXE_SUFFIX)));
+        let cast = self.exe_root.join(format!("../cast{}", env::consts::EXE_SUFFIX));
+        ensure_workspace_bin_built("cast", &cast, &self.exe_root);
+        let cast = canonicalize(cast);
         let mut cmd = Command::new(cast);
+        cmd.current_dir(self.inner.root());
         // disable color output for comparisons
         cmd.env("NO_COLOR", "1");
         cmd
@@ -881,4 +892,45 @@ pub fn lossy_string(bytes: &[u8]) -> String {
 fn canonicalize(path: impl AsRef<Path>) -> PathBuf {
     foundry_common::fs::canonicalize_path(path.as_ref())
         .unwrap_or_else(|_| path.as_ref().to_path_buf())
+}
+
+fn ensure_workspace_bin_built(bin: &str, expected_path: &Path, exe_root: &Path) {
+    if expected_path.exists() {
+        return;
+    }
+
+    // Avoid building multiple times concurrently when tests run in parallel.
+    let _lock = ENSURE_WORKSPACE_BINS_LOCK.lock();
+    {
+        let ensured = ENSURED_WORKSPACE_BINS.lock();
+        if ensured.contains(bin) {
+            // Another test already attempted the build; check again.
+            return;
+        }
+    }
+
+    // Derive the workspace target dir from `<target>/<profile>/deps`.
+    // `exe_root` is typically `<target>/debug/deps` during tests.
+    let target_dir = exe_root.join("../..");
+    // Run `cargo build` from the workspace root, not from the test project's CWD.
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")));
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "-p", bin, "--target-dir"])
+        .arg(&target_dir)
+        .current_dir(workspace_root)
+        .env("CARGO_TERM_COLOR", "never");
+    test_debug!("{cmd:?}");
+    let status = cmd.status().unwrap();
+    if !status.success() {
+        panic!("failed to build workspace binary `{bin}` (status={status})");
+    }
+
+    ENSURED_WORKSPACE_BINS.lock().insert(bin.to_string());
+
+    if !expected_path.exists() {
+        panic!("workspace binary `{bin}` still missing at {:?}", expected_path);
+    }
 }
