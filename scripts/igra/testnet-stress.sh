@@ -63,9 +63,29 @@ IGRA_STRESS_EVM_KEYS="${IGRA_STRESS_EVM_KEYS:-}"
 # Kaspa signer material (single-worker defaults).
 IGRA_PRIVATE_KEY_KASPA="${IGRA_PRIVATE_KEY_KASPA:-}"
 IGRA_MNEMONIC_KASPA="${IGRA_MNEMONIC_KASPA:-}"
-IGRA_MNEMONIC_PASSPHRASE_KASPA="${IGRA_MNEMONIC_PASSPHRASE_KASPA:-}"
+# Passphrase semantics:
+# - default is empty passphrase (standard BIP39)
+# - to use `passphrase == mnemonic`, set IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC=1
+# - to explicitly force empty passphrase, set IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY=1
+IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC="${IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC:-0}"
+IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY="${IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY:-0}"
+IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET=0
+if [[ -n "${IGRA_MNEMONIC_PASSPHRASE_KASPA+x}" ]]; then
+  IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET=1
+fi
+IGRA_MNEMONIC_PASSPHRASE_KASPA="${IGRA_MNEMONIC_PASSPHRASE_KASPA-}"
 IGRA_MNEMONIC_DERIVATION_PATH_KASPA="${IGRA_MNEMONIC_DERIVATION_PATH_KASPA:-}"
 IGRA_MNEMONIC_INDEX_KASPA="${IGRA_MNEMONIC_INDEX_KASPA:-}"
+
+MNEMONIC_PASSPHRASE_EFFECTIVE=""
+if [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY}" == "1" ]]; then
+  IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET=1
+  MNEMONIC_PASSPHRASE_EFFECTIVE=""
+elif [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET}" == "1" ]]; then
+  MNEMONIC_PASSPHRASE_EFFECTIVE="${IGRA_MNEMONIC_PASSPHRASE_KASPA}"
+elif [[ -n "${IGRA_MNEMONIC_KASPA}" && "${IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC}" == "1" ]]; then
+  MNEMONIC_PASSPHRASE_EFFECTIVE="${IGRA_MNEMONIC_KASPA}"
+fi
 
 # Multi-worker Kaspa keys (recommended): comma-separated list matching IGRA_STRESS_WORKERS.
 IGRA_STRESS_KASPA_PRIVATE_KEYS="${IGRA_STRESS_KASPA_PRIVATE_KEYS:-}"
@@ -188,11 +208,6 @@ EOF
     } >> "${work_dir}/foundry.toml"
   else
     if [[ -n "${IGRA_PRIVATE_KEY_KASPA}" || -n "${IGRA_MNEMONIC_KASPA}" || -n "${IGRA_MNEMONIC_PASSPHRASE_KASPA}" || -n "${IGRA_MNEMONIC_DERIVATION_PATH_KASPA}" || -n "${IGRA_MNEMONIC_INDEX_KASPA}" ]]; then
-      # Testnet convenience (same as smoke): mnemonic passphrase defaults to mnemonic if omitted.
-      local mn_pass="${IGRA_MNEMONIC_PASSPHRASE_KASPA}"
-      if [[ -n "${IGRA_MNEMONIC_KASPA}" && -z "${mn_pass}" ]]; then
-        mn_pass="${IGRA_MNEMONIC_KASPA}"
-      fi
       {
         echo ""
         echo "[igra.kaspa_wallet]"
@@ -202,8 +217,8 @@ EOF
         if [[ -n "${IGRA_MNEMONIC_KASPA}" ]]; then
           echo "mnemonic = \"${IGRA_MNEMONIC_KASPA}\""
         fi
-        if [[ -n "${mn_pass}" ]]; then
-          echo "mnemonic_passphrase = \"${mn_pass}\""
+        if [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET}" == "1" || "${IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC}" == "1" || "${IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY}" == "1" ]]; then
+          echo "mnemonic_passphrase = \"${MNEMONIC_PASSPHRASE_EFFECTIVE}\""
         fi
         if [[ -n "${IGRA_MNEMONIC_DERIVATION_PATH_KASPA}" ]]; then
           echo "mnemonic_derivation_path = \"${IGRA_MNEMONIC_DERIVATION_PATH_KASPA}\""
@@ -317,4 +332,3 @@ if ls "${TMP_DIR}"/w*/summary.json >/dev/null 2>&1; then
 fi
 
 exit "${exit_code}"
-

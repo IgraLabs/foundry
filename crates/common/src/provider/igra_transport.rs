@@ -729,6 +729,7 @@ fn resolve_kaspa_private_key(config: &IgraKaspaWalletConfig) -> Result<[u8; 32],
         return resolve_mnemonic_private_key(
             mnemonic,
             config.mnemonic_passphrase.as_deref(),
+            config.mnemonic_passphrase_as_mnemonic,
             config.mnemonic_derivation_path.as_deref(),
             config.mnemonic_index.unwrap_or(0),
         );
@@ -752,6 +753,7 @@ fn parse_private_key_hex(private_key: &str) -> Result<[u8; 32], String> {
 fn resolve_mnemonic_private_key(
     mnemonic: &str,
     passphrase: Option<&str>,
+    passphrase_as_mnemonic: bool,
     derivation_path: Option<&str>,
     index: u32,
 ) -> Result<[u8; 32], String> {
@@ -768,10 +770,17 @@ fn resolve_mnemonic_private_key(
     // - BIP39 seed from mnemonic (+ optional passphrase)
     // - BIP32 master key
     // - BIP44-ish path: m/44'/111111'/0'/0/<index> by default (single-sig receive chain)
-    let kaspa_mnemonic = KaspaMnemonic::new(phrase, KaspaLanguage::English).map_err(|err| {
+    let kaspa_mnemonic = KaspaMnemonic::new(phrase.clone(), KaspaLanguage::English).map_err(|err| {
         format!("IGRA key resolution error: invalid Kaspa mnemonic: {err}")
     })?;
-    let seed = kaspa_mnemonic.to_seed(passphrase.unwrap_or_default());
+    let effective_passphrase_owned;
+    let effective_passphrase = if passphrase_as_mnemonic && passphrase.is_none() {
+        effective_passphrase_owned = phrase;
+        effective_passphrase_owned.as_str()
+    } else {
+        passphrase.unwrap_or_default()
+    };
+    let seed = kaspa_mnemonic.to_seed(effective_passphrase);
 
     let xprv = KaspaExtendedPrivateKey::<KaspaSecretKey>::new(seed).map_err(|err| {
         format!("IGRA key resolution error: failed to derive Kaspa master key from mnemonic seed: {err}")
@@ -1972,7 +1981,7 @@ mod tests {
 
         for (name, path) in schemes {
             let private_key =
-                resolve_mnemonic_private_key(mnemonic, None, path, 0).expect("derive kaspa key");
+                resolve_mnemonic_private_key(mnemonic, None, false, path, 0).expect("derive kaspa key");
             let address = kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
                 .expect("derive kaspa address")
                 .to_string();
@@ -1983,7 +1992,8 @@ mod tests {
         // The sample CLI output shows `[1a1f47ce]`.
         let maybe_account_index = 0x1a1f_47ceu32;
         let maybe_path = format!("m/44'/111111'/{maybe_account_index}'/0/0");
-        let maybe_key = resolve_mnemonic_private_key(mnemonic, None, Some(&maybe_path), 0).expect("derive kaspa key");
+        let maybe_key =
+            resolve_mnemonic_private_key(mnemonic, None, false, Some(&maybe_path), 0).expect("derive kaspa key");
         let maybe_addr = kaspa_address_from_private_key(&maybe_key, KaspaAddressPrefix::Testnet)
             .expect("derive kaspa address")
             .to_string();
@@ -1993,7 +2003,7 @@ mod tests {
         // Brute force a reasonable range for the canonical BIP44 receive address (index 0).
         for account_index in 0u32..=2000u32 {
             let path = format!("m/44'/111111'/{account_index}'/0/0");
-            let private_key = resolve_mnemonic_private_key(mnemonic, None, Some(&path), 0)
+            let private_key = resolve_mnemonic_private_key(mnemonic, None, false, Some(&path), 0)
                 .expect("derive kaspa key");
             let address =
                 kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
@@ -2033,7 +2043,8 @@ mod tests {
                                         seg(0, change_h),
                                         seg(0, idx_h),
                                     );
-                                    let private_key = resolve_mnemonic_private_key(mnemonic, None, Some(&path), 0)
+                                    let private_key =
+                                        resolve_mnemonic_private_key(mnemonic, None, false, Some(&path), 0)
                                         .expect("derive kaspa key");
                                     let address = kaspa_address_from_private_key(
                                         &private_key,
@@ -2072,7 +2083,8 @@ mod tests {
         // If the passphrase is empty, the derived seed and thus the deposit address will differ.
         let mnemonic = "test test test test test test test test test test test junk";
         let private_key =
-            resolve_mnemonic_private_key(mnemonic, Some(mnemonic), None, 0).expect("derive kaspa key");
+            resolve_mnemonic_private_key(mnemonic, Some(mnemonic), false, None, 0)
+                .expect("derive kaspa key");
         let address =
             kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet).expect("derive kaspa address");
 
@@ -2085,7 +2097,7 @@ mod tests {
     fn kaspa_mnemonic_default_deposit_address_differs_with_empty_passphrase() {
         // Same mnemonic but empty passphrase.
         let mnemonic = "test test test test test test test test test test test junk";
-        let private_key = resolve_mnemonic_private_key(mnemonic, None, None, 0).expect("derive kaspa key");
+        let private_key = resolve_mnemonic_private_key(mnemonic, None, false, None, 0).expect("derive kaspa key");
         let address =
             kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet).expect("derive kaspa address");
 

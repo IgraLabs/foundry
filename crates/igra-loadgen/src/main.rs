@@ -89,9 +89,29 @@ struct Args {
 
     /// BIP39 passphrase for the Kaspa mnemonic ("recovery passphrase" in kaspa-cli).
     ///
-    /// If omitted and --kaspa-mnemonic is set, defaults to empty string.
-    #[arg(long, env = "IGRA_KASPA_MNEMONIC_PASSPHRASE", hide_env_values = true, default_value = "")]
-    kaspa_mnemonic_passphrase: String,
+    /// If omitted and no other passphrase flags are set, defaults to empty string (standard BIP39).
+    #[arg(long, env = "IGRA_KASPA_MNEMONIC_PASSPHRASE", hide_env_values = true)]
+    kaspa_mnemonic_passphrase: Option<String>,
+
+    /// Use the mnemonic phrase itself as the BIP39 passphrase (non-standard; opt-in).
+    #[arg(
+        long,
+        env = "IGRA_KASPA_MNEMONIC_PASSPHRASE_AS_MNEMONIC",
+        default_value_t = false,
+        conflicts_with = "kaspa_mnemonic_passphrase",
+        conflicts_with = "kaspa_mnemonic_passphrase_empty"
+    )]
+    kaspa_mnemonic_passphrase_as_mnemonic: bool,
+
+    /// Explicitly set the Kaspa mnemonic passphrase to the empty string.
+    #[arg(
+        long,
+        env = "IGRA_KASPA_MNEMONIC_PASSPHRASE_EMPTY",
+        default_value_t = false,
+        conflicts_with = "kaspa_mnemonic_passphrase",
+        conflicts_with = "kaspa_mnemonic_passphrase_as_mnemonic"
+    )]
+    kaspa_mnemonic_passphrase_empty: bool,
 
     /// Start index when deriving Kaspa keys from mnemonic.
     #[arg(long, default_value_t = 0)]
@@ -147,7 +167,9 @@ async fn main() -> Result<()> {
             }
             kaspa_keys = derive_kaspa_private_keys(
                 mnemonic,
-                &args.kaspa_mnemonic_passphrase,
+                args.kaspa_mnemonic_passphrase.as_deref(),
+                args.kaspa_mnemonic_passphrase_as_mnemonic,
+                args.kaspa_mnemonic_passphrase_empty,
                 None,
                 args.kaspa_mnemonic_index_start,
                 count,
@@ -525,7 +547,9 @@ fn kaspa_address_from_private_key_hex(private_key: &str, network: &str) -> Resul
 
 fn derive_kaspa_private_keys(
     mnemonic: &str,
-    passphrase: &str,
+    passphrase: Option<&str>,
+    passphrase_as_mnemonic: bool,
+    passphrase_empty: bool,
     derivation_path: Option<&str>,
     start_index: u32,
     count: u32,
@@ -537,9 +561,19 @@ fn derive_kaspa_private_keys(
     };
     let phrase = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
 
+    let effective_passphrase_owned;
+    let effective_passphrase = if passphrase_as_mnemonic && passphrase.is_none() && !passphrase_empty {
+        effective_passphrase_owned = phrase.clone();
+        effective_passphrase_owned.as_str()
+    } else if passphrase_empty {
+        ""
+    } else {
+        passphrase.unwrap_or_default()
+    };
+
     let kaspa_mnemonic = KaspaMnemonic::new(phrase, KaspaLanguage::English)
         .map_err(|err| eyre!("invalid Kaspa mnemonic: {err}"))?;
-    let seed = kaspa_mnemonic.to_seed(passphrase);
+    let seed = kaspa_mnemonic.to_seed(effective_passphrase);
     let xprv = KaspaExtendedPrivateKey::<KaspaSecretKey>::new(seed)
         .map_err(|err| eyre!("failed to derive Kaspa master key: {err}"))?;
 

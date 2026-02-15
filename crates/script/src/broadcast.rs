@@ -18,7 +18,11 @@ use foundry_cheatcodes::Wallets;
 use foundry_cli::utils::{has_batch_support, has_different_gas_calc};
 use foundry_common::{
     TransactionMaybeSigned,
-    provider::{RetryProvider, get_http_provider, try_get_http_provider},
+    igra_store::IgraStoreConfig,
+    provider::{
+        ProviderBuilder as FoundryProviderBuilder, RetryProvider,
+        igra_transport::IgraTransportConfig, try_get_http_provider,
+    },
     shell,
 };
 use foundry_config::Config;
@@ -30,6 +34,55 @@ use crate::{
     ScriptArgs, ScriptConfig, build::LinkedBuildData, progress::ScriptProgress,
     sequence::ScriptSequenceKind, verify::BroadcastedState,
 };
+
+fn try_get_sequence_provider(rpc_url: &str, config: &Config) -> Result<RetryProvider> {
+    if !config.igra.enabled {
+        return try_get_http_provider(rpc_url);
+    }
+
+    // Ensure broadcasted script transactions use the same provider stack as `cast`/`forge`
+    // command paths (IGRA transport interception + tx-map persistence).
+    config.igra.validate().wrap_err("invalid IGRA configuration")?;
+
+    let mut builder = FoundryProviderBuilder::new(rpc_url)
+        .accept_invalid_certs(config.eth_rpc_accept_invalid_certs)
+        .no_proxy(config.eth_rpc_no_proxy)
+        .igra_enabled(true)
+        .igra_store_config(IgraStoreConfig {
+            kaspa_network: config.igra.kaspa_network.clone(),
+            expected_el_chain_id: config.igra.expected_el_chain_id,
+            el_rpc_url: config.igra.el_rpc_url.clone(),
+            kaspa_rpc_url: config.igra.kaspa_rpc_url.clone(),
+            sender_lock_timeout_secs: config.igra.sender_lock_timeout_secs,
+            completed_retention_hours: config.igra.completed_retention_hours,
+            failed_retention_hours: config.igra.failed_retention_hours,
+            max_db_size_mb: config.igra.max_db_size_mb,
+            ..Default::default()
+        })
+        .igra_transport_config(IgraTransportConfig {
+            tx_id_prefix: config.igra.tx_id_prefix.clone(),
+            mining_timeout_secs: config.igra.mining_timeout_secs.or(config.igra.el_receipt_timeout_secs),
+            kaspa_rpc_url: config.igra.kaspa_rpc_url.clone(),
+            kaspa_network: config.igra.kaspa_network.clone(),
+            payload_compression: config.igra.payload_compression.clone(),
+            kaspa_utxo_mode: None,
+            kaspa_fee_mode: None,
+            kaspa_fee_bucket: None,
+            kaspa_wallet: config.igra.kaspa_wallet.clone(),
+        });
+
+    if let Some(timeout) = config.eth_rpc_timeout {
+        builder = builder.timeout(Duration::from_secs(timeout));
+    }
+    if let Some(headers) = config.eth_rpc_headers.clone() {
+        builder = builder.headers(headers);
+    }
+    if let Some(jwt) = config.eth_rpc_jwt.clone() {
+        builder = builder.jwt(jwt);
+    }
+
+    builder.build()
+}
 
 pub async fn estimate_gas<P: Provider<AnyNetwork>>(
     tx: &mut WithOtherFields<TransactionRequest>,
@@ -271,22 +324,27 @@ impl BundledState {
     pub async fn wait_for_pending(mut self) -> Result<Self> {
         let progress = ScriptProgress::default();
         let progress_ref = &progress;
+        let config = self.script_config.config.clone();
+        let tx_timeout = self.script_config.config.transaction_timeout;
         let futs = self
             .sequence
             .sequences_mut()
             .iter_mut()
             .enumerate()
-            .map(|(sequence_idx, sequence)| async move {
+            .map(|(sequence_idx, sequence)| {
+                let config = config.clone();
+                async move {
                 let rpc_url = sequence.rpc_url();
-                let provider = Arc::new(get_http_provider(rpc_url));
+                let provider = Arc::new(try_get_sequence_provider(rpc_url, &config)?);
                 progress_ref
                     .wait_for_pending(
                         sequence_idx,
                         sequence,
                         &provider,
-                        self.script_config.config.transaction_timeout,
+                        tx_timeout,
                     )
                     .await
+                }
             })
             .collect::<Vec<_>>();
 
@@ -351,7 +409,8 @@ impl BundledState {
         for i in 0..self.sequence.sequences().len() {
             let mut sequence = self.sequence.sequences_mut().get_mut(i).unwrap();
 
-            let provider = Arc::new(try_get_http_provider(sequence.rpc_url())?);
+            let provider =
+                Arc::new(try_get_sequence_provider(sequence.rpc_url(), &self.script_config.config)?);
             let already_broadcasted = sequence.receipts.len();
 
             let seq_progress = progress.get_sequence_progress(i, sequence);

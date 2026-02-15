@@ -16,6 +16,18 @@ Notes:
 - If you are using the same accounts as `scripts/igra/testnet-smoke.sh`, your funded Kaspa wallet likely uses the convention `passphrase == mnemonic`. Keep that consistent.
 - For reliable RPC connectivity in sandboxed environments, `igra-loadgen` supports `--no-proxy` (disables automatic proxy detection for HTTP(S) RPC).
 
+## Repo Default Testnet Wallets
+
+For galleon testnet smoke/load testing in this repo we commonly use:
+
+- EVM mnemonic (IKAS): `test test test test test test test test test test test junk`
+- Prefunded EVM sender (index 0): `0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266`
+- Kaspa mnemonic (KAS): same phrase as above
+- Kaspa passphrase: `passphrase == mnemonic` (non-standard; opt-in)
+- Prefunded Kaspa address (index 0): `kaspatest:qzf364tlnl7ja0w65ydu0m5l70pur2hcm3l3ahkmhs660zcyf7cvuf6uznufr`
+
+If you use that convention, prefer the explicit flag `--kaspa-mnemonic-passphrase-as-mnemonic` (used below).
+
 ## Build Binaries
 
 From repo root:
@@ -88,9 +100,11 @@ Set the Kaspa mnemonic that holds your initial KAS funds:
 ```bash
 export KASPA_MNEMONIC="(your kaspa mnemonic here)"
 
-# If your funded wallet used a non-empty BIP39 passphrase, set it.
-# For the smoke-test accounts used in this repo, the convention was: passphrase == mnemonic.
-export KASPA_MNEMONIC_PASSPHRASE="$KASPA_MNEMONIC"
+# If your funded wallet used a BIP39 passphrase, set it explicitly.
+# If your funded wallet uses the non-standard setup `passphrase == mnemonic`, you can either:
+# - set `KASPA_MNEMONIC_PASSPHRASE="$KASPA_MNEMONIC"`, or
+# - use `--kaspa-mnemonic-passphrase-as-mnemonic` (recommended for clarity).
+export KASPA_MNEMONIC_PASSPHRASE="${KASPA_MNEMONIC_PASSPHRASE:-}"
 ```
 
 Print the derived (worker -> evm_sender + kaspa_address) mapping and store addresses:
@@ -103,12 +117,19 @@ Print the derived (worker -> evm_sender + kaspa_address) mapping and store addre
   --tx-id-prefix "$IGRA_TX_ID_PREFIX" \
   --evm-keys "$WORKDIR/evm_keys.txt" \
   --kaspa-mnemonic "$KASPA_MNEMONIC" \
-  --kaspa-mnemonic-passphrase "$KASPA_MNEMONIC_PASSPHRASE" \
+  --kaspa-mnemonic-passphrase-as-mnemonic \
   --kaspa-mnemonic-index-start 0 \
   --kaspa-mnemonic-count 10 \
   --print-addresses > "$WORKDIR/addrs.json"
 
 jq -r '.[].kaspa_address' "$WORKDIR/addrs.json" > "$WORKDIR/kaspa_addrs.txt"
+```
+
+If your wallet uses a normal (non-empty) BIP39 passphrase instead, replace the `--kaspa-mnemonic-passphrase-as-mnemonic`
+flag with:
+
+```bash
+  --kaspa-mnemonic-passphrase "$KASPA_MNEMONIC_PASSPHRASE"
 ```
 
 ## Fund 10 Kaspa Accounts (KAS)
@@ -141,7 +162,7 @@ done < "$WORKDIR/kaspa_addrs.txt"
   --kaspa-rpc-url "$KASPA_GRPC_URL" \
   --kaspa-network "$KASPA_NETWORK" \
   --mnemonic "$KASPA_MNEMONIC" \
-  --mnemonic-passphrase "$KASPA_MNEMONIC_PASSPHRASE" \
+  --mnemonic-passphrase-as-mnemonic \
   --mnemonic-index 0 \
   "${TO_ARGS[@]}"
 ```
@@ -220,7 +241,7 @@ RUST_LOG=warn "$CARGO_TARGET_DIR/release/igra-loadgen" \
   --mining-timeout-secs 120 \
   --evm-keys "$WORKDIR/evm_keys.txt" \
   --kaspa-mnemonic "$KASPA_MNEMONIC" \
-  --kaspa-mnemonic-passphrase "$KASPA_MNEMONIC_PASSPHRASE" \
+  --kaspa-mnemonic-passphrase-as-mnemonic \
   --kaspa-mnemonic-index-start 0 \
   --kaspa-mnemonic-count 10 \
   --tps 5 \
@@ -243,7 +264,7 @@ RUST_LOG=warn "$CARGO_TARGET_DIR/release/igra-loadgen" \
   --mining-timeout-secs 120 \
   --evm-keys "$WORKDIR/evm_keys.txt" \
   --kaspa-mnemonic "$KASPA_MNEMONIC" \
-  --kaspa-mnemonic-passphrase "$KASPA_MNEMONIC_PASSPHRASE" \
+  --kaspa-mnemonic-passphrase-as-mnemonic \
   --kaspa-mnemonic-index-start 0 \
   --kaspa-mnemonic-count 10 \
   --tps 0 \
@@ -261,4 +282,3 @@ RUST_LOG=warn "$CARGO_TARGET_DIR/release/igra-loadgen" \
   - a shorter prefix (1 byte) or a mode that relaxes/turns off prefix mining for stress windows, and
   - sufficient EL gas funding (current observed `eth_gasPrice` makes 500 TPS for hours extremely expensive).
 - `kaspa_utxo_mode=chain` is used by `igra-loadgen` (default in this guide) to avoid UTXO contention and reduce RPC load at higher send rates.
-

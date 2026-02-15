@@ -90,20 +90,25 @@ Network-specific prefix:
 Kaspa signer material can be provided via:
 - `cast send --private-key-kaspa ...`
 - `cast send --mnemonic-kaspa ... --mnemonic-passphrase-kaspa ... --mnemonic-index-kaspa ...`
+- `cast send --mnemonic-kaspa ... --mnemonic-passphrase-kaspa-as-mnemonic` (non-standard; opt-in)
+- `cast send --mnemonic-kaspa ... --mnemonic-passphrase-kaspa-empty` (explicit empty passphrase)
 - `cast send --keystore-kaspa ... --password-kaspa ...`
 
 Environment variables used by the CLI:
 - `KASPA_PRIVATE_KEY`
 - `KASPA_MNEMONIC`
 - `KASPA_MNEMONIC_PASSPHRASE`
+- `KASPA_MNEMONIC_PASSPHRASE_AS_MNEMONIC`
+- `KASPA_MNEMONIC_PASSPHRASE_EMPTY`
 - `KASPA_MNEMONIC_DERIVATION_PATH`
 - `KASPA_MNEMONIC_INDEX`
 - `KASPA_KEYSTORE`
 - `KASPA_KEYSTORE_ACCOUNT`
 - `KASPA_PASSWORD`
 
-Testnet convention used by our scripts:
-- If `IGRA_MNEMONIC_KASPA` is set but passphrase is empty, scripts default `mnemonic_passphrase = mnemonic` (because thatâ€™s how the funded testnet wallet was set up for our smoke runs).
+Testnet script behavior:
+- Scripts default to **empty** BIP39 passphrase (standard behavior).
+- If you need the non-standard setup `passphrase == mnemonic`, set `IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC=1`.
 
 ## How to Test
 
@@ -140,6 +145,26 @@ Inputs are configured via env vars (see the script header), notably:
 - `IGRA_KASPA_NETWORK`
 - `IGRA_TX_ID_PREFIX`
 - `IGRA_MNEMONIC_KASPA` / `IGRA_PRIVATE_KEY_KASPA` etc.
+
+Repo default testnet wallets (used for our smoke/loadgen repro on galleon testnet):
+- EVM mnemonic (IKAS): `test test test test test test test test test test test junk`
+- Prefunded EVM sender (index 0): `0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266`
+- Kaspa mnemonic (KAS): same phrase as above
+- Kaspa passphrase: `passphrase == mnemonic` (non-standard; opt-in)
+- Prefunded Kaspa address (index 0): `kaspatest:qzf364tlnl7ja0w65ydu0m5l70pur2hcm3l3ahkmhs660zcyf7cvuf6uznufr`
+
+To use that setup with the smoke script:
+```bash
+MN="test test test test test test test test test test test junk"
+IGRA_MNEMONIC_KASPA="$MN" \
+IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC=1 \
+IGRA_MNEMONIC_INDEX_KASPA=0 \
+./scripts/igra/testnet-smoke.sh
+```
+
+Note:
+- `scripts/igra/testnet-smoke.sh` sandboxes `HOME` per run, so the IGRA tx-map SQLite store does
+  not leak across runs and cause nonce-gap blocking.
 
 ### 3. Testnet Load (10 accounts)
 
@@ -226,4 +251,3 @@ Always check `eth_gasPrice` / EIP-1559 rules on the target EL before assuming â€
 - Kaspa helpers:
   - `crates/common/src/bin/kaspa_utxos.rs`
   - `crates/common/src/bin/kaspa_fund.rs`
-

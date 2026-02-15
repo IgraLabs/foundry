@@ -31,7 +31,17 @@ IGRA_KASPA_RPC_URL="${IGRA_KASPA_RPC_URL:-grpc://stage-roman.igralabs.com:16210}
 IGRA_PRIVATE_KEY="${IGRA_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 IGRA_PRIVATE_KEY_KASPA="${IGRA_PRIVATE_KEY_KASPA:-}"
 IGRA_MNEMONIC_KASPA="${IGRA_MNEMONIC_KASPA:-}"
-IGRA_MNEMONIC_PASSPHRASE_KASPA="${IGRA_MNEMONIC_PASSPHRASE_KASPA:-}"
+# Passphrase semantics:
+# - default is empty passphrase (standard BIP39)
+# - to use `passphrase == mnemonic`, set IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC=1
+# - to explicitly force empty passphrase, set IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY=1
+IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC="${IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC:-0}"
+IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY="${IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY:-0}"
+IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET=0
+if [[ -n "${IGRA_MNEMONIC_PASSPHRASE_KASPA+x}" ]]; then
+  IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET=1
+fi
+IGRA_MNEMONIC_PASSPHRASE_KASPA="${IGRA_MNEMONIC_PASSPHRASE_KASPA-}"
 IGRA_MNEMONIC_DERIVATION_PATH_KASPA="${IGRA_MNEMONIC_DERIVATION_PATH_KASPA:-}"
 IGRA_MNEMONIC_INDEX_KASPA="${IGRA_MNEMONIC_INDEX_KASPA:-}"
 
@@ -57,11 +67,14 @@ KEEP_TMP="${KEEP_TMP:-0}"
 SEND_ASYNC="${SEND_ASYNC:-1}"
 CAST_LEGACY="${CAST_LEGACY:-0}"
 
-# Testnet harness convenience:
-# If a Kaspa mnemonic is provided but no passphrase is set, default passphrase to mnemonic.
-# This matches the user's funded testnet wallet setup (passphrase == mnemonic string).
-if [[ -n "${IGRA_MNEMONIC_KASPA}" && -z "${IGRA_MNEMONIC_PASSPHRASE_KASPA}" ]]; then
-  IGRA_MNEMONIC_PASSPHRASE_KASPA="${IGRA_MNEMONIC_KASPA}"
+MNEMONIC_PASSPHRASE_EFFECTIVE=""
+if [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY}" == "1" ]]; then
+  IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET=1
+  MNEMONIC_PASSPHRASE_EFFECTIVE=""
+elif [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET}" == "1" ]]; then
+  MNEMONIC_PASSPHRASE_EFFECTIVE="${IGRA_MNEMONIC_PASSPHRASE_KASPA}"
+elif [[ -n "${IGRA_MNEMONIC_KASPA}" && "${IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC}" == "1" ]]; then
+  MNEMONIC_PASSPHRASE_EFFECTIVE="${IGRA_MNEMONIC_KASPA}"
 fi
 
 TMP_DIR=""
@@ -102,6 +115,13 @@ WORK_DIR="${TMP_DIR}/flow"
 mkdir -p "${WORK_DIR}"
 cd "${WORK_DIR}"
 
+# Isolate Foundry cache per run so IGRA tx-map state (sender nonce tracking) doesn't
+# leak across smoke runs and cause BLOCKED_NONCE_GAP errors.
+# Note: foundry cache paths are derived from HOME, so we sandbox HOME to a temp dir.
+HOME_DIR="${WORK_DIR}/home"
+mkdir -p "${HOME_DIR}"
+export HOME="${HOME_DIR}"
+
 if [[ "${RUN_FORGE_SCRIPT}" == "1" ]]; then
   echo "[igra-smoke] initializing temporary forge project"
   "${FORGE_BIN}" init --force --no-git . >/dev/null
@@ -135,8 +155,8 @@ if [[ -n "${IGRA_PRIVATE_KEY_KASPA}" || -n "${IGRA_MNEMONIC_KASPA}" || -n "${IGR
     if [[ -n "${IGRA_MNEMONIC_KASPA}" ]]; then
       echo "mnemonic = \"${IGRA_MNEMONIC_KASPA}\""
     fi
-    if [[ -n "${IGRA_MNEMONIC_PASSPHRASE_KASPA}" ]]; then
-      echo "mnemonic_passphrase = \"${IGRA_MNEMONIC_PASSPHRASE_KASPA}\""
+    if [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET}" == "1" || "${IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC}" == "1" || "${IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY}" == "1" ]]; then
+      echo "mnemonic_passphrase = \"${MNEMONIC_PASSPHRASE_EFFECTIVE}\""
     fi
     if [[ -n "${IGRA_MNEMONIC_DERIVATION_PATH_KASPA}" ]]; then
       echo "mnemonic_derivation_path = \"${IGRA_MNEMONIC_DERIVATION_PATH_KASPA}\""
@@ -201,8 +221,8 @@ fi
 if [[ -n "${IGRA_MNEMONIC_KASPA}" ]]; then
   SEND_ARGS+=(--mnemonic-kaspa "${IGRA_MNEMONIC_KASPA}")
 fi
-if [[ -n "${IGRA_MNEMONIC_PASSPHRASE_KASPA}" ]]; then
-  SEND_ARGS+=(--mnemonic-passphrase-kaspa "${IGRA_MNEMONIC_PASSPHRASE_KASPA}")
+if [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET}" == "1" || "${IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC}" == "1" || "${IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY}" == "1" ]]; then
+  SEND_ARGS+=(--mnemonic-passphrase-kaspa "${MNEMONIC_PASSPHRASE_EFFECTIVE}")
 fi
 if [[ -n "${IGRA_MNEMONIC_DERIVATION_PATH_KASPA}" ]]; then
   SEND_ARGS+=(--mnemonic-derivation-path-kaspa "${IGRA_MNEMONIC_DERIVATION_PATH_KASPA}")
@@ -321,7 +341,11 @@ if [[ "${RUN_FORGE_SCRIPT}" == "1" ]]; then
   if [[ -n "${IGRA_MNEMONIC_KASPA}" ]]; then
     FORGE_ARGS+=(--mnemonic-kaspa "${IGRA_MNEMONIC_KASPA}")
   fi
-  if [[ -n "${IGRA_MNEMONIC_PASSPHRASE_KASPA}" ]]; then
+  if [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_AS_MNEMONIC}" == "1" ]]; then
+    FORGE_ARGS+=(--mnemonic-passphrase-kaspa-as-mnemonic)
+  elif [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_EMPTY}" == "1" ]]; then
+    FORGE_ARGS+=(--mnemonic-passphrase-kaspa-empty)
+  elif [[ "${IGRA_MNEMONIC_PASSPHRASE_KASPA_IS_SET}" == "1" ]]; then
     FORGE_ARGS+=(--mnemonic-passphrase-kaspa "${IGRA_MNEMONIC_PASSPHRASE_KASPA}")
   fi
   if [[ -n "${IGRA_MNEMONIC_DERIVATION_PATH_KASPA}" ]]; then

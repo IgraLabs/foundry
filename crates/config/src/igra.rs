@@ -13,6 +13,10 @@ pub struct IgraKaspaWalletConfig {
     pub mnemonic: Option<String>,
     /// Optional BIP39 passphrase for the mnemonic.
     pub mnemonic_passphrase: Option<String>,
+    /// If true and `mnemonic_passphrase` is unset, use the mnemonic phrase itself as the
+    /// passphrase. This is non-standard BIP39 behavior and must be explicitly enabled.
+    #[serde(default)]
+    pub mnemonic_passphrase_as_mnemonic: bool,
     /// Optional derivation path override.
     pub mnemonic_derivation_path: Option<String>,
     /// Mnemonic index override.
@@ -31,6 +35,7 @@ impl IgraKaspaWalletConfig {
         self.private_key.is_none() &&
             self.mnemonic.is_none() &&
             self.mnemonic_passphrase.is_none() &&
+            !self.mnemonic_passphrase_as_mnemonic &&
             self.mnemonic_derivation_path.is_none() &&
             self.mnemonic_index.is_none() &&
             self.keystore.is_none() &&
@@ -83,6 +88,14 @@ impl IgraConfig {
     pub fn validate(&self) -> Result<(), IgraConfigError> {
         if !self.enabled {
             return Ok(());
+        }
+
+        if self.kaspa_wallet.mnemonic_passphrase_as_mnemonic && self.kaspa_wallet.mnemonic_passphrase.is_some()
+        {
+            return Err(IgraConfigError::Invalid {
+                field: "kaspa_wallet.mnemonic_passphrase_as_mnemonic",
+                reason: "conflicts with kaspa_wallet.mnemonic_passphrase".to_string(),
+            });
         }
 
         let el_rpc_url = required_str("el_rpc_url", self.el_rpc_url.as_deref())?;
