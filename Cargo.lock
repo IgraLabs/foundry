@@ -6390,6 +6390,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "igra-loadgen"
+version = "1.6.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-json-rpc",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "alloy-transport",
+ "clap",
+ "eyre",
+ "foundry-common",
+ "foundry-config",
+ "kaspa-addresses 1.1.0-rc.3",
+ "kaspa-bip32 1.1.0-rc.3",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "impl-codec"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

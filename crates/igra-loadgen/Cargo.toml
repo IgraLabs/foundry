@@ -1,0 +1,33 @@
+[package]
+name = "igra-loadgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+foundry-common.workspace = true
+foundry-config.workspace = true
+
+alloy-consensus.workspace = true
+alloy-json-rpc.workspace = true
+alloy-network.workspace = true
+alloy-primitives.workspace = true
+alloy-signer-local = { workspace = true, features = ["keystore", "mnemonic"] }
+alloy-transport.workspace = true
+
+kaspa-addresses.workspace = true
+kaspa-bip32.workspace = true
+
+clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
+eyre.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower.workspace = true

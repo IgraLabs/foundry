@@ -69,9 +69,10 @@ const MAX_STANDARD_KASPA_TX_MASS: u64 = 100_000;
 // Per IGRA Transaction Protocol: L2Data (raw EVM tx bytes) must not exceed this.
 const IGRA_MAX_L2DATA_BYTES: usize = 24_800;
 const CACHE_TTL_SECS: u64 = 20;
-const BASE_SUBMIT_FEE_SOMPI: u64 = 200_000;
-const FEE_PER_KIB_SOMPI: u64 = 20_000;
-const EXTRA_INPUT_FEE_SOMPI: u64 = 10_000;
+// Legacy fixed-fee fallback (used only if fee estimation RPC fails).
+const BASE_SUBMIT_FEE_SOMPI: u64 = 5_000;
+const FEE_PER_KIB_SOMPI: u64 = 500;
+const EXTRA_INPUT_FEE_SOMPI: u64 = 1_000;
 const MIN_CHANGE_SOMPI: u64 = 1_000;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -85,6 +86,23 @@ pub struct IgraTransportConfig {
     pub kaspa_network: Option<String>,
     /// Payload compression mode for L2Data inside the Kaspa payload.
     pub payload_compression: Option<String>,
+    /// Kaspa UTXO strategy for write-path submissions.
+    ///
+    /// Supported:
+    /// - "rpc" (default): query UTXOs each submission.
+    /// - "chain": maintain a local single-UTXO chain per Kaspa address by spending the previous
+    ///   submission's change output, falling back to RPC refresh on error.
+    pub kaspa_utxo_mode: Option<String>,
+    /// Fee estimation mode for Kaspa submissions.
+    ///
+    /// Supported:
+    /// - "estimate" (default): use `get_fee_estimate` and compute fee from tx mass.
+    /// - "fixed": use a conservative fixed-fee heuristic (legacy fallback).
+    pub kaspa_fee_mode: Option<String>,
+    /// Fee estimate bucket selection when `kaspa_fee_mode=estimate`.
+    ///
+    /// Supported: "priority", "normal" (default), "low".
+    pub kaspa_fee_bucket: Option<String>,
     pub kaspa_wallet: IgraKaspaWalletConfig,
 }
 
@@ -98,6 +116,9 @@ pub struct IgraSubmitRequest {
     pub kaspa_rpc_url: Option<String>,
     pub kaspa_network: Option<String>,
     pub payload_compression: Option<String>,
+    pub kaspa_utxo_mode: Option<String>,
+    pub kaspa_fee_mode: Option<String>,
+    pub kaspa_fee_bucket: Option<String>,
     pub kaspa_wallet: IgraKaspaWalletConfig,
 }
 
@@ -121,11 +142,30 @@ struct CachedUtxoSet {
     entries: Vec<RpcUtxosByAddressesEntry>,
 }
 
+#[derive(Clone, Debug)]
+struct CachedFeeRate {
+    fetched_at: Instant,
+    /// Fee rate in sompi/gram.
+    feerate: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ChainedUtxoState {
+    /// Tip UTXO used as the next input for this address.
+    tip: RpcUtxosByAddressesEntry,
+}
+
 /// Default submitter implementation backed by in-process Kaspa RPC, signing, and broadcast.
 #[derive(Clone)]
 pub struct InProcessKaspaPayloadSubmitter {
     utxo_cache: Arc<TokioMutex<Option<CachedUtxoSet>>>,
     utxo_cache_epoch: Arc<AtomicU64>,
+    grpc_client: Arc<TokioMutex<Option<(String, GrpcClient)>>>,
+    feerate_cache: Arc<TokioMutex<Option<CachedFeeRate>>>,
+    // Mass depends on the payload length (raw L2 tx bytes length). Cache by payload length.
+    mass_cache: Arc<TokioMutex<std::collections::HashMap<usize, u64>>>,
+    // Per-address chained UTXO state to enable "chain" mode.
+    chained_utxos: Arc<TokioMutex<std::collections::HashMap<String, Arc<TokioMutex<ChainedUtxoState>>>>>,
 }
 
 impl std::fmt::Debug for InProcessKaspaPayloadSubmitter {
@@ -139,6 +179,10 @@ impl Default for InProcessKaspaPayloadSubmitter {
         Self {
             utxo_cache: Arc::new(TokioMutex::new(None)),
             utxo_cache_epoch: Arc::new(AtomicU64::new(1)),
+            grpc_client: Arc::new(TokioMutex::new(None)),
+            feerate_cache: Arc::new(TokioMutex::new(None)),
+            mass_cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())),
+            chained_utxos: Arc::new(TokioMutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -176,7 +220,8 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
             rpc_url,
             request.l2_tx_hash
         );
-        let mut client = GrpcClient::connect(rpc_url.to_string())
+        let client = self
+            .get_or_connect_client(rpc_url)
             .await
             .map_err(|err| format!("IGRA submit error: failed to connect to Kaspa RPC: {err}"))?;
 
@@ -188,92 +233,65 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
             .map_err(|err| format!("IGRA config error: `tx_id_prefix` is invalid hex: {err}"))?;
         let mining_timeout = Duration::from_secs(request.mining_timeout_secs);
 
-        for attempt in 0..=1 {
-            let force_refresh = attempt > 0;
-            let utxos = self
-                .load_utxos(
-                    &mut client,
+        let utxo_mode = request
+            .kaspa_utxo_mode
+            .as_deref()
+            .unwrap_or("rpc")
+            .trim()
+            .to_ascii_lowercase();
+        match utxo_mode.as_str() {
+            "chain" => {
+                self.submit_with_chained_utxo(
+                    &client,
                     rpc_url,
                     network,
-                    &source_address,
-                    force_refresh,
-                )
-                .await?;
-
-            // Allow one forced refresh pass in case the cache is stale or the node just finished syncing.
-            if utxos.is_empty() {
-                if !force_refresh {
-                    continue;
-                }
-
-                let mut message = format!(
-                    "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
-                );
-                if request.kaspa_wallet.mnemonic.is_some()
-                    && request.kaspa_wallet.mnemonic_passphrase.is_none()
-                {
-                    message.push_str(
-                        "; hint: if this mnemonic was created/imported with a non-empty BIP39 passphrase, set --mnemonic-passphrase-kaspa (or KASPA_MNEMONIC_PASSPHRASE) to match the funded address",
-                    );
-                }
-                return Err(message);
-            }
-
-            let private_key_for_build = private_key;
-            let source_address_for_build = source_address.clone();
-            let l2data_for_build = l2data.clone();
-            let prefix_for_build = prefix_bytes.clone();
-            let mining_timeout_for_build = mining_timeout;
-            let (payload_nonce, transaction) = tokio::task::spawn_blocking(move || {
-                mine_and_build_signed_payload_transaction(
-                    &private_key_for_build,
-                    &source_address_for_build,
                     network_type,
+                    &private_key,
+                    &source_address,
                     payload_header,
-                    &l2data_for_build,
-                    &prefix_for_build,
-                    mining_timeout_for_build,
-                    &utxos,
+                    &l2data,
+                    &prefix_bytes,
+                    mining_timeout,
+                    request,
                 )
-            })
-            .await
-            .map_err(|err| format!("IGRA submit error: failed to join Kaspa tx builder task: {err}"))??;
-            // Invalidate local UTXO cache before broadcast so concurrent reads cannot reuse
-            // potentially spent entries from this submission attempt.
-            self.invalidate_utxo_cache().await;
-            let rpc_transaction = RpcTransaction::from(&transaction);
-            match client.submit_transaction(rpc_transaction, false).await {
-                Ok(tx_id) => {
-                    self.invalidate_utxo_cache().await;
-                    let kaspa_tx_id = tx_id.to_string();
-                    info!(
-                        "IGRA submit: kaspa_tx_id={} payload_nonce={} payload_header=0x{:02x} l2data_len={} payload_compression={} l2_tx_hash={}",
-                        kaspa_tx_id,
-                        payload_nonce,
-                        payload_header,
-                        l2data.len(),
-                        request
-                            .payload_compression
-                            .as_deref()
-                            .unwrap_or("none")
-                            .trim(),
-                        request.l2_tx_hash
-                    );
-                    return Ok(IgraSubmitResult { kaspa_tx_id, payload_nonce });
-                }
-                Err(err) => {
-                    if attempt == 1 {
-                        return Err(format!("IGRA submit error: {err}"));
-                    }
-                }
+                .await
             }
+            "" | "rpc" => {
+                self.submit_with_rpc_utxos(
+                    &client,
+                    rpc_url,
+                    network,
+                    network_type,
+                    &private_key,
+                    &source_address,
+                    payload_header,
+                    &l2data,
+                    &prefix_bytes,
+                    mining_timeout,
+                    request,
+                )
+                .await
+            }
+            other => Err(format!(
+                "IGRA config error: unsupported kaspa_utxo_mode `{other}` (supported: rpc, chain)"
+            )),
         }
-
-        Err("IGRA submit error: failed to submit Kaspa transaction".to_string())
     }
 }
 
 impl InProcessKaspaPayloadSubmitter {
+    async fn get_or_connect_client(&self, rpc_url: &str) -> Result<GrpcClient, String> {
+        let mut guard = self.grpc_client.lock().await;
+        if let Some((cached_url, client)) = guard.as_ref() && cached_url == rpc_url {
+            return Ok(client.clone());
+        }
+        let client = GrpcClient::connect(rpc_url.to_string())
+            .await
+            .map_err(|err| err.to_string())?;
+        *guard = Some((rpc_url.to_string(), client.clone()));
+        Ok(client)
+    }
+
     async fn invalidate_utxo_cache(&self) {
         self.utxo_cache_epoch.fetch_add(1, Ordering::Relaxed);
         let mut cache_guard = self.utxo_cache.lock().await;
@@ -282,7 +300,7 @@ impl InProcessKaspaPayloadSubmitter {
 
     async fn load_utxos(
         &self,
-        client: &mut GrpcClient,
+        client: &GrpcClient,
         rpc_url: &str,
         network: &str,
         source_address: &KaspaAddress,
@@ -315,6 +333,366 @@ impl InProcessKaspaPayloadSubmitter {
             });
         }
         Ok(entries)
+    }
+
+    async fn get_feerate_sompi_per_gram(
+        &self,
+        client: &GrpcClient,
+        request: &IgraSubmitRequest,
+    ) -> Result<f64, String> {
+        let mode = request
+            .kaspa_fee_mode
+            .as_deref()
+            .unwrap_or("estimate")
+            .trim()
+            .to_ascii_lowercase();
+        if mode == "fixed" {
+            return Ok(0.0);
+        }
+        if mode != "" && mode != "estimate" {
+            return Err(format!(
+                "IGRA config error: unsupported kaspa_fee_mode `{mode}` (supported: estimate, fixed)"
+            ));
+        }
+
+        // Keep this cheap: cache for 1s (similar to kaspad-side caching).
+        let ttl = Duration::from_secs(1);
+        {
+            let guard = self.feerate_cache.lock().await;
+            if let Some(cached) = guard.as_ref() && cached.fetched_at.elapsed() <= ttl {
+                return Ok(cached.feerate);
+            }
+        }
+
+        let estimate = client
+            .get_fee_estimate()
+            .await
+            .map_err(|err| format!("failed to fetch kaspa fee estimate: {err}"))?;
+
+        let bucket = request
+            .kaspa_fee_bucket
+            .as_deref()
+            .unwrap_or("normal")
+            .trim()
+            .to_ascii_lowercase();
+        let feerate = match bucket.as_str() {
+            "" | "normal" => estimate
+                .normal_buckets
+                .first()
+                .map(|b| b.feerate)
+                .unwrap_or(estimate.priority_bucket.feerate),
+            "priority" => estimate.priority_bucket.feerate,
+            "low" => estimate
+                .low_buckets
+                .first()
+                .map(|b| b.feerate)
+                .unwrap_or(estimate.priority_bucket.feerate),
+            other => {
+                return Err(format!(
+                    "IGRA config error: unsupported kaspa_fee_bucket `{other}` (supported: priority, normal, low)"
+                ));
+            }
+        };
+
+        // Protocol minimum: enforce at least 1.0 sompi/gram.
+        let feerate = feerate.max(1.0);
+
+        let mut guard = self.feerate_cache.lock().await;
+        *guard = Some(CachedFeeRate { fetched_at: Instant::now(), feerate });
+        Ok(feerate)
+    }
+
+    async fn get_or_compute_mass(
+        &self,
+        payload_len: usize,
+        compute: impl FnOnce() -> Result<u64, String>,
+    ) -> Result<u64, String> {
+        {
+            let guard = self.mass_cache.lock().await;
+            if let Some(mass) = guard.get(&payload_len) {
+                return Ok(*mass);
+            }
+        }
+        let mass = compute()?;
+        let mut guard = self.mass_cache.lock().await;
+        guard.insert(payload_len, mass);
+        Ok(mass)
+    }
+
+    async fn submit_with_rpc_utxos(
+        &self,
+        client: &GrpcClient,
+        rpc_url: &str,
+        network: &str,
+        network_type: KaspaNetworkType,
+        private_key: &[u8; 32],
+        source_address: &KaspaAddress,
+        payload_header: u8,
+        l2data: &[u8],
+        tx_id_prefix: &[u8],
+        mining_timeout: Duration,
+        request: &IgraSubmitRequest,
+    ) -> Result<IgraSubmitResult, String> {
+        let feerate = match self.get_feerate_sompi_per_gram(client, request).await {
+            Ok(value) => value,
+            Err(err) if err.contains("IGRA config error") => return Err(err),
+            Err(_) => 0.0,
+        };
+
+        for attempt in 0..=1 {
+            let force_refresh = attempt > 0;
+            let utxos = self
+                .load_utxos(client, rpc_url, network, source_address, force_refresh)
+                .await?;
+
+            // Allow one forced refresh pass in case the cache is stale or the node just finished syncing.
+            if utxos.is_empty() {
+                if !force_refresh {
+                    continue;
+                }
+
+                let mut message = format!(
+                    "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
+                );
+                if request.kaspa_wallet.mnemonic.is_some()
+                    && request.kaspa_wallet.mnemonic_passphrase.is_none()
+                {
+                    message.push_str(
+                        "; hint: if this mnemonic was created/imported with a non-empty BIP39 passphrase, set --mnemonic-passphrase-kaspa (or KASPA_MNEMONIC_PASSPHRASE) to match the funded address",
+                    );
+                }
+                return Err(message);
+            }
+
+            // Compute tx mass for this payload length once, then compute fee from feerate.
+            let payload_len = 1usize.saturating_add(l2data.len()).saturating_add(4);
+            let mass = self
+                .get_or_compute_mass(payload_len, || {
+                    compute_kaspa_tx_mass_template(
+                        private_key,
+                        source_address,
+                        network_type,
+                        payload_header,
+                        l2data,
+                        &utxos,
+                    )
+                })
+                .await?;
+            let fee = if feerate > 0.0 {
+                fee_from_feerate(mass, feerate)
+            } else {
+                estimated_fee_sompi(payload_len, 1)
+            };
+
+            let private_key_for_build = *private_key;
+            let source_address_for_build = source_address.clone();
+            let l2data_for_build = l2data.to_vec();
+            let prefix_for_build = tx_id_prefix.to_vec();
+            let mining_timeout_for_build = mining_timeout;
+            let (payload_nonce, transaction) = tokio::task::spawn_blocking(move || {
+                mine_and_build_signed_payload_transaction_with_fee(
+                    &private_key_for_build,
+                    &source_address_for_build,
+                    network_type,
+                    payload_header,
+                    &l2data_for_build,
+                    &prefix_for_build,
+                    mining_timeout_for_build,
+                    &utxos,
+                    fee,
+                )
+            })
+            .await
+            .map_err(|err| format!("IGRA submit error: failed to join Kaspa tx builder task: {err}"))??;
+
+            self.invalidate_utxo_cache().await;
+            let rpc_transaction = RpcTransaction::from(&transaction);
+            match client.submit_transaction(rpc_transaction, false).await {
+                Ok(tx_id) => {
+                    self.invalidate_utxo_cache().await;
+                    let kaspa_tx_id = tx_id.to_string();
+                    info!(
+                        "IGRA submit: kaspa_tx_id={} payload_nonce={} payload_header=0x{:02x} l2data_len={} payload_compression={} l2_tx_hash={}",
+                        kaspa_tx_id,
+                        payload_nonce,
+                        payload_header,
+                        l2data.len(),
+                        request
+                            .payload_compression
+                            .as_deref()
+                            .unwrap_or("none")
+                            .trim(),
+                        request.l2_tx_hash
+                    );
+                    return Ok(IgraSubmitResult { kaspa_tx_id, payload_nonce });
+                }
+                Err(err) => {
+                    if attempt == 1 {
+                        return Err(format!("IGRA submit error: {err}"));
+                    }
+                }
+            }
+        }
+
+        Err("IGRA submit error: failed to submit Kaspa transaction".to_string())
+    }
+
+    async fn submit_with_chained_utxo(
+        &self,
+        client: &GrpcClient,
+        rpc_url: &str,
+        network: &str,
+        network_type: KaspaNetworkType,
+        private_key: &[u8; 32],
+        source_address: &KaspaAddress,
+        payload_header: u8,
+        l2data: &[u8],
+        tx_id_prefix: &[u8],
+        mining_timeout: Duration,
+        request: &IgraSubmitRequest,
+    ) -> Result<IgraSubmitResult, String> {
+        let cache_key = format!("{rpc_url}|{network}|{source_address}");
+
+        let state_lock = {
+            let mut guard = self.chained_utxos.lock().await;
+            if let Some(lock) = guard.get(&cache_key) {
+                lock.clone()
+            } else {
+                // Seed from RPC UTXOs (confirmed) once.
+                let utxos = self.load_utxos(client, rpc_url, network, source_address, true).await?;
+                if utxos.is_empty() {
+                    return Err(format!(
+                        "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
+                    ));
+                }
+                let mut sorted = utxos;
+                sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
+                let tip = sorted
+                    .into_iter()
+                    .next()
+                    .expect("non-empty utxo list has first entry");
+                let lock = Arc::new(TokioMutex::new(ChainedUtxoState { tip }));
+                guard.insert(cache_key.clone(), lock.clone());
+                lock
+            }
+        };
+
+        let feerate = match self.get_feerate_sompi_per_gram(client, request).await {
+            Ok(value) => value,
+            Err(err) if err.contains("IGRA config error") => return Err(err),
+            Err(_) => 0.0,
+        };
+        let payload_len = 1usize.saturating_add(l2data.len()).saturating_add(4);
+
+        // Serialize submissions per address to avoid double-spends.
+        let mut state = state_lock.lock().await;
+
+        for attempt in 0..=1 {
+            let tip = state.tip.clone();
+
+            let mass = self
+                .get_or_compute_mass(payload_len, || {
+                    compute_kaspa_tx_mass_template(
+                        private_key,
+                        source_address,
+                        network_type,
+                        payload_header,
+                        l2data,
+                        std::slice::from_ref(&tip),
+                    )
+                })
+                .await?;
+            let fee = if feerate > 0.0 {
+                fee_from_feerate(mass, feerate)
+            } else {
+                estimated_fee_sompi(payload_len, 1)
+            };
+
+            // If the tip doesn't have enough value, refresh from RPC and retry once.
+            if tip.utxo_entry.amount < fee.saturating_add(MIN_CHANGE_SOMPI) {
+                if attempt == 1 {
+                    return Err(format!(
+                        "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
+                    ));
+                }
+                let refreshed =
+                    self.load_utxos(client, rpc_url, network, source_address, true).await?;
+                if refreshed.is_empty() {
+                    continue;
+                }
+                let mut sorted = refreshed;
+                sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
+                state.tip = sorted
+                    .into_iter()
+                    .next()
+                    .expect("non-empty refreshed utxo list has first entry");
+                continue;
+            }
+
+            let private_key_for_build = *private_key;
+            let source_address_for_build = source_address.clone();
+            let l2data_for_build = l2data.to_vec();
+            let prefix_for_build = tx_id_prefix.to_vec();
+            let mining_timeout_for_build = mining_timeout;
+            let (payload_nonce, transaction, next_tip) = tokio::task::spawn_blocking(move || {
+                mine_and_build_signed_payload_transaction_single_input_with_fee(
+                    &private_key_for_build,
+                    &source_address_for_build,
+                    network_type,
+                    payload_header,
+                    &l2data_for_build,
+                    &prefix_for_build,
+                    mining_timeout_for_build,
+                    &tip,
+                    fee,
+                )
+            })
+            .await
+            .map_err(|err| format!("IGRA submit error: failed to join Kaspa tx builder task: {err}"))??;
+
+            let rpc_transaction = RpcTransaction::from(&transaction);
+            match client.submit_transaction(rpc_transaction, false).await {
+                Ok(tx_id) => {
+                    let kaspa_tx_id = tx_id.to_string();
+                    info!(
+                        "IGRA submit: kaspa_tx_id={} payload_nonce={} payload_header=0x{:02x} l2data_len={} payload_compression={} l2_tx_hash={}",
+                        kaspa_tx_id,
+                        payload_nonce,
+                        payload_header,
+                        l2data.len(),
+                        request
+                            .payload_compression
+                            .as_deref()
+                            .unwrap_or("none")
+                            .trim(),
+                        request.l2_tx_hash
+                    );
+                    // Advance the chain tip only after successful broadcast.
+                    state.tip = next_tip;
+                    return Ok(IgraSubmitResult { kaspa_tx_id, payload_nonce });
+                }
+                Err(err) => {
+                    if attempt == 1 {
+                        return Err(format!("IGRA submit error: {err}"));
+                    }
+
+                    // Refresh tip and retry once.
+                    let refreshed =
+                        self.load_utxos(client, rpc_url, network, source_address, true).await?;
+                    if refreshed.is_empty() {
+                        continue;
+                    }
+                    let mut sorted = refreshed;
+                    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
+                    state.tip = sorted
+                        .into_iter()
+                        .next()
+                        .expect("non-empty refreshed utxo list has first entry");
+                }
+            }
+        }
+
+        Err("IGRA submit error: failed to submit Kaspa transaction".to_string())
     }
 }
 
@@ -461,6 +839,14 @@ fn estimated_fee_sompi(payload_len: usize, inputs: usize) -> u64 {
         .saturating_add(input_tail.saturating_mul(EXTRA_INPUT_FEE_SOMPI))
 }
 
+fn fee_from_feerate(mass: u64, feerate_sompi_per_gram: f64) -> u64 {
+    if !(feerate_sompi_per_gram.is_finite()) {
+        return 1;
+    }
+    let fee = (feerate_sompi_per_gram * (mass as f64)).ceil();
+    if fee <= 1.0 { 1 } else if fee >= (u64::MAX as f64) { u64::MAX } else { fee as u64 }
+}
+
 /// Transport wrapper that applies IGRA-specific request interception.
 #[derive(Clone, Debug)]
 pub struct IgraTransport<T> {
@@ -472,6 +858,9 @@ pub struct IgraTransport<T> {
     kaspa_rpc_url: Option<String>,
     kaspa_network: Option<String>,
     payload_compression: Option<String>,
+    kaspa_utxo_mode: Option<String>,
+    kaspa_fee_mode: Option<String>,
+    kaspa_fee_bucket: Option<String>,
     kaspa_wallet: IgraKaspaWalletConfig,
     submitter: Arc<dyn IgraPayloadSubmitter>,
 }
@@ -488,6 +877,9 @@ impl<T> IgraTransport<T> {
             kaspa_rpc_url: None,
             kaspa_network: None,
             payload_compression: None,
+            kaspa_utxo_mode: None,
+            kaspa_fee_mode: None,
+            kaspa_fee_bucket: None,
             kaspa_wallet: IgraKaspaWalletConfig::default(),
             submitter: Arc::new(InProcessKaspaPayloadSubmitter::default()),
         }
@@ -501,6 +893,9 @@ impl<T> IgraTransport<T> {
         self.kaspa_rpc_url = config.kaspa_rpc_url;
         self.kaspa_network = config.kaspa_network;
         self.payload_compression = config.payload_compression;
+        self.kaspa_utxo_mode = config.kaspa_utxo_mode;
+        self.kaspa_fee_mode = config.kaspa_fee_mode;
+        self.kaspa_fee_bucket = config.kaspa_fee_bucket;
         self.kaspa_wallet = config.kaspa_wallet;
         self
     }
@@ -794,6 +1189,9 @@ impl<T> IgraTransport<T> {
             let kaspa_rpc_url = self.kaspa_rpc_url.clone();
             let kaspa_network = self.kaspa_network.clone();
             let payload_compression = self.payload_compression.clone();
+            let kaspa_utxo_mode = self.kaspa_utxo_mode.clone();
+            let kaspa_fee_mode = self.kaspa_fee_mode.clone();
+            let kaspa_fee_bucket = self.kaspa_fee_bucket.clone();
             let kaspa_wallet = self.kaspa_wallet.clone();
             let submitter = self.submitter.clone();
 
@@ -920,6 +1318,9 @@ impl<T> IgraTransport<T> {
                         kaspa_rpc_url,
                         kaspa_network,
                         payload_compression: payload_compression.clone(),
+                        kaspa_utxo_mode: kaspa_utxo_mode.clone(),
+                        kaspa_fee_mode: kaspa_fee_mode.clone(),
+                        kaspa_fee_bucket: kaspa_fee_bucket.clone(),
                         kaspa_wallet,
                     };
                     let submit_result = submitter
@@ -1119,6 +1520,7 @@ fn build_igra_l2data(raw_tx: &[u8], payload_compression: Option<&str>) -> Result
     }
 }
 
+#[allow(dead_code)]
 fn mine_and_build_signed_payload_transaction(
     private_key: &[u8; 32],
     source_address: &KaspaAddress,
@@ -1128,6 +1530,33 @@ fn mine_and_build_signed_payload_transaction(
     tx_id_prefix: &[u8],
     timeout: Duration,
     utxos: &[RpcUtxosByAddressesEntry],
+) -> Result<(u64, KaspaTransaction), String> {
+    // Backwards-compatible entrypoint uses legacy fixed-fee heuristic.
+    let payload_len = 1usize.saturating_add(l2data.len()).saturating_add(4);
+    let fee = estimated_fee_sompi(payload_len, 1);
+    mine_and_build_signed_payload_transaction_with_fee(
+        private_key,
+        source_address,
+        network_type,
+        payload_header,
+        l2data,
+        tx_id_prefix,
+        timeout,
+        utxos,
+        fee,
+    )
+}
+
+fn mine_and_build_signed_payload_transaction_with_fee(
+    private_key: &[u8; 32],
+    source_address: &KaspaAddress,
+    network_type: KaspaNetworkType,
+    payload_header: u8,
+    l2data: &[u8],
+    tx_id_prefix: &[u8],
+    timeout: Duration,
+    utxos: &[RpcUtxosByAddressesEntry],
+    fee: u64,
 ) -> Result<(u64, KaspaTransaction), String> {
     if utxos.is_empty() {
         return Err(format!(
@@ -1139,10 +1568,6 @@ fn mine_and_build_signed_payload_transaction(
         return Err("IGRA config error: `tx_id_prefix` cannot be empty".to_string());
     }
 
-    // Select inputs once; payload nonce changes do not change payload length.
-    // IGRA payload: 1-byte header + L2Data + 4-byte nonce.
-    let payload_len = 1usize.saturating_add(l2data.len()).saturating_add(4);
-
     let mut sorted = utxos.to_vec();
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
     let mut selected = Vec::new();
@@ -1150,13 +1575,11 @@ fn mine_and_build_signed_payload_transaction(
     for entry in sorted {
         total_input = total_input.saturating_add(entry.utxo_entry.amount);
         selected.push(entry);
-        let required_fee = estimated_fee_sompi(payload_len, selected.len());
-        if total_input >= required_fee.saturating_add(MIN_CHANGE_SOMPI) {
+        if total_input >= fee.saturating_add(MIN_CHANGE_SOMPI) {
             break;
         }
     }
 
-    let fee = estimated_fee_sompi(payload_len, selected.len());
     if total_input < fee.saturating_add(MIN_CHANGE_SOMPI) {
         return Err(format!(
             "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
@@ -1256,6 +1679,175 @@ fn mine_and_build_signed_payload_transaction(
     let tx = signed.tx;
     tx.set_mass(mass);
     Ok((nonce as u64, tx))
+}
+
+fn mine_and_build_signed_payload_transaction_single_input_with_fee(
+    private_key: &[u8; 32],
+    source_address: &KaspaAddress,
+    network_type: KaspaNetworkType,
+    payload_header: u8,
+    l2data: &[u8],
+    tx_id_prefix: &[u8],
+    timeout: Duration,
+    tip: &RpcUtxosByAddressesEntry,
+    fee: u64,
+) -> Result<(u64, KaspaTransaction, RpcUtxosByAddressesEntry), String> {
+    if tx_id_prefix.is_empty() {
+        return Err("IGRA config error: `tx_id_prefix` cannot be empty".to_string());
+    }
+
+    let input_amount = tip.utxo_entry.amount;
+    if input_amount < fee.saturating_add(MIN_CHANGE_SOMPI) {
+        return Err(format!(
+            "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
+        ));
+    }
+    let output_value = input_amount.saturating_sub(fee);
+    if output_value < MIN_CHANGE_SOMPI {
+        return Err(format!(
+            "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
+        ));
+    }
+
+    let script_public_key = pay_to_address_script(source_address);
+    let inputs = vec![KaspaTransactionInput::new(tip.outpoint.clone().into(), Vec::new(), 0, 1)];
+    let outputs = vec![KaspaTransactionOutput::new(output_value, script_public_key.clone())];
+
+    let payload = build_payload_with_nonce(payload_header, l2data, 0);
+    let nonce_offset = payload.len().saturating_sub(4);
+    let mut tx = KaspaTransaction::new(
+        0,
+        inputs,
+        outputs,
+        0,
+        SubnetworkId::default(),
+        0,
+        payload,
+    );
+
+    let start = Instant::now();
+    let mut nonce = 0_u32;
+    loop {
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "{IGRA_MINING_TIMEOUT_ERROR_CODE}: timed out mining kaspa txid prefix after {}ms",
+                timeout.as_millis()
+            ));
+        }
+
+        tx.payload[nonce_offset..].copy_from_slice(&nonce.to_be_bytes());
+        tx.finalize();
+        let tx_id = tx.id();
+        if tx_id.as_bytes().starts_with(tx_id_prefix) {
+            break;
+        }
+
+        nonce = nonce.wrapping_add(1);
+        if nonce == 0 {
+            // Extremely unlikely: exhausted full u32 space. Perturb outputs to create variance.
+            if let Some(first) = tx.outputs.first_mut() {
+                first.value = first.value.saturating_sub(1);
+            }
+            tx.finalize();
+        }
+    }
+
+    let entries = vec![KaspaUtxoEntry {
+        amount: tip.utxo_entry.amount,
+        script_public_key: tip.utxo_entry.script_public_key.clone(),
+        block_daa_score: tip.utxo_entry.block_daa_score,
+        is_coinbase: tip.utxo_entry.is_coinbase,
+    }];
+
+    let signable = KaspaSignableTransaction::with_entries(tx, entries);
+    let signed = kaspa_sign_with_multiple_v2(signable, std::slice::from_ref(private_key))
+        .fully_signed()
+        .map_err(|err| format!("IGRA submit error: failed to sign Kaspa tx: {err}"))?;
+    kaspa_verify(&signed.as_verifiable())
+        .map_err(|err| format!("IGRA submit error: invalid Kaspa signature set: {err}"))?;
+
+    if !signed.tx.id().as_bytes().starts_with(tx_id_prefix) {
+        return Err("IGRA submit error: mined Kaspa txid prefix changed after signing; refusing to broadcast".to_string());
+    }
+
+    let mass_calculator = KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
+    let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
+    let contextual = mass_calculator
+        .calc_contextual_masses(&signed.as_verifiable())
+        .ok_or_else(|| "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string())?;
+    let mass = contextual.max(non_contextual);
+    if mass > MAX_STANDARD_KASPA_TX_MASS {
+        return Err(format!(
+            "IGRA submit error: Kaspa transaction mass {mass} exceeds standard limit {MAX_STANDARD_KASPA_TX_MASS}"
+        ));
+    }
+
+    let tx_id = signed.tx.id();
+    let tx = signed.tx;
+    tx.set_mass(mass);
+
+    // Next tip is the change output (index 0).
+    let next_tip = RpcUtxosByAddressesEntry {
+        address: None,
+        outpoint: kaspa_rpc_core::RpcTransactionOutpoint { transaction_id: tx_id, index: 0 },
+        utxo_entry: kaspa_rpc_core::RpcUtxoEntry::new(output_value, script_public_key, 0, false),
+    };
+
+    Ok((nonce as u64, tx, next_tip))
+}
+
+fn compute_kaspa_tx_mass_template(
+    private_key: &[u8; 32],
+    source_address: &KaspaAddress,
+    network_type: KaspaNetworkType,
+    payload_header: u8,
+    l2data: &[u8],
+    utxos: &[RpcUtxosByAddressesEntry],
+) -> Result<u64, String> {
+    let tip = utxos
+        .iter()
+        .max_by_key(|entry| entry.utxo_entry.amount)
+        .ok_or_else(|| "IGRA submit error: insufficient Kaspa UTXOs for fee payment".to_string())?;
+    let input_amount = tip.utxo_entry.amount;
+    if input_amount <= MIN_CHANGE_SOMPI {
+        return Err("IGRA submit error: insufficient Kaspa UTXOs for fee payment".to_string());
+    }
+    let output_value = input_amount.saturating_sub(MIN_CHANGE_SOMPI);
+
+    let script_public_key = pay_to_address_script(source_address);
+    let inputs = vec![KaspaTransactionInput::new(tip.outpoint.clone().into(), Vec::new(), 0, 1)];
+    let outputs = vec![KaspaTransactionOutput::new(output_value, script_public_key)];
+
+    let payload = build_payload_with_nonce(payload_header, l2data, 0);
+    let mut tx = KaspaTransaction::new(
+        0,
+        inputs,
+        outputs,
+        0,
+        SubnetworkId::default(),
+        0,
+        payload,
+    );
+    tx.finalize();
+
+    let entries = vec![KaspaUtxoEntry {
+        amount: tip.utxo_entry.amount,
+        script_public_key: tip.utxo_entry.script_public_key.clone(),
+        block_daa_score: tip.utxo_entry.block_daa_score,
+        is_coinbase: tip.utxo_entry.is_coinbase,
+    }];
+
+    let signable = KaspaSignableTransaction::with_entries(tx, entries);
+    let signed = kaspa_sign_with_multiple_v2(signable, std::slice::from_ref(private_key))
+        .fully_signed()
+        .map_err(|err| format!("IGRA submit error: failed to sign Kaspa tx for mass estimation: {err}"))?;
+
+    let mass_calculator = KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
+    let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
+    let contextual = mass_calculator
+        .calc_contextual_masses(&signed.as_verifiable())
+        .ok_or_else(|| "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string())?;
+    Ok(contextual.max(non_contextual))
 }
 
 fn now_ms() -> u64 {
@@ -1661,6 +2253,9 @@ mod tests {
             kaspa_rpc_url: Some("grpc://127.0.0.1:16110".to_string()),
             kaspa_network: Some("testnet-10".to_string()),
             payload_compression: None,
+            kaspa_utxo_mode: None,
+            kaspa_fee_mode: None,
+            kaspa_fee_bucket: None,
             kaspa_wallet: IgraKaspaWalletConfig::default(),
         }
     }
