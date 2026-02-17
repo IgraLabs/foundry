@@ -104,14 +104,16 @@ py_ms() {
 
 split_csv() {
   local input="${1:-}"
-  local -n out_ref="$2"
-  out_ref=()
+  local out_var="$2"
+  local out_ref=()
   if [[ -z "${input}" ]]; then
+    eval "${out_var}=()"
     return 0
   fi
   # No fancy CSV; we expect comma-separated tokens.
   local IFS=,
   read -r -a out_ref <<< "${input}"
+  eval "${out_var}=(\"\${out_ref[@]}\")"
 }
 
 echo "[igra-stress] checking EL chain id via ${IGRA_EL_RPC_URL}"
@@ -294,7 +296,7 @@ EOF
     --argjson fail "${fail}" \
     --argjson elapsed_ms "${elapsed_ms}" \
     --argjson tps "${tps}" \
-    '{worker: $worker, evm_sender: $evm_sender, kaspa_private_key: ($kaspa_key_used|select(length>0)?), target: {contract: $contract, sig: $sig, to: $to, amount: $amount}, endpoints: {el_rpc_url: $el_rpc, kaspa_rpc_url: $kaspa_rpc, kaspa_network: $kaspa_network, tx_id_prefix: $prefix}, results: {ok: $ok, fail: $fail, elapsed_ms: $elapsed_ms, ok_tps: $tps}}' \
+    '{worker: $worker, evm_sender: $evm_sender, kaspa_private_key: (if ($kaspa_key_used|length) > 0 then $kaspa_key_used else null end), target: {contract: $contract, sig: $sig, to: $to, amount: $amount}, endpoints: {el_rpc_url: $el_rpc, kaspa_rpc_url: $kaspa_rpc, kaspa_network: $kaspa_network, tx_id_prefix: $prefix}, results: {ok: $ok, fail: $fail, elapsed_ms: $elapsed_ms, ok_tps: $tps}}' \
     > "${worker_dir}/summary.json"
 }
 
@@ -324,7 +326,7 @@ done
 
 # Aggregate results.
 if ls "${TMP_DIR}"/w*/summary.json >/dev/null 2>&1; then
-  jq -s '{workers: ., totals: {ok: (map(.results.ok) | add), fail: (map(.results.fail) | add), elapsed_ms: (map(.results.elapsed_ms) | max), ok_tps: (map(.results.ok) | add) / ((map(.results.elapsed_ms) | max) / 1000.0)}}' \
+  jq -s '{workers: ., totals: {ok: (map(.results.ok // 0) | add), fail: (map(.results.fail // 0) | add), elapsed_ms: (map(.results.elapsed_ms // 0) | max), ok_tps: (if ((map(.results.elapsed_ms // 0) | max) > 0) then ((map(.results.ok // 0) | add) / ((map(.results.elapsed_ms // 0) | max) / 1000.0)) else 0 end)}}' \
     "${TMP_DIR}"/w*/summary.json \
     | tee "${TMP_DIR}/summary.json" >/dev/null
   echo "[igra-stress] summary written: ${TMP_DIR}/summary.json"
