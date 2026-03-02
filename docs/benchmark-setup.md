@@ -5,6 +5,24 @@
 - A funded Kaspa testnet wallet (private key in hex)
 - Galleon testnet must be running (EVM RPC + Kaspa gRPC accessible)
 
+## Dependencies
+
+| Repository | Required for | Branch |
+|---|---|---|
+| [IgraLabs/foundry](https://github.com/IgraLabs/foundry) | Benchmark binary + full cast/forge | `emdin-benchmarks` |
+| [IgraLabs/rusty-kaspa](https://github.com/IgraLabs/rusty-kaspa) | Kaspa crypto, gRPC client, consensus types (6 crates) | `master` |
+| [IgraLabs/kaswallet](https://github.com/IgraLabs/kaswallet) | Only needed if building full `cast`/`forge` (not needed for benchmark alone) | `roman/utxo-perf-opt` |
+
+The benchmark binary (`igra_tps_bench`) uses only `rusty-kaspa`. It reimplements UTXO selection, signing, and prefix mining directly without `kaswallet`.
+
+**Directory layout** — the workspace `Cargo.toml` uses path dependencies to sibling directories:
+```
+~/igra/
+├── igra-foundry/    ← Cargo.toml references ../rusty-kaspa
+├── rusty-kaspa/     ← required
+└── kaswallet/       ← only if building cast/forge
+```
+
 ## Option A: Local Machine (macOS/Linux)
 
 ### 1. Clone repositories
@@ -17,12 +35,14 @@ git clone https://github.com/IgraLabs/foundry.git igra-foundry
 cd igra-foundry
 git checkout emdin-benchmarks
 
-# Rusty Kaspa (dependency, path-referenced from Cargo.toml)
+# Rusty Kaspa (required — Kaspa crypto + gRPC crates)
 cd ~/igra
 git clone https://github.com/IgraLabs/rusty-kaspa.git rusty-kaspa
-```
 
-The workspace `Cargo.toml` expects `rusty-kaspa` as a sibling directory (`../rusty-kaspa`).
+# Kaswallet (only if building full cast/forge, NOT needed for benchmark)
+# git clone https://github.com/IgraLabs/kaswallet.git kaswallet
+# cd kaswallet && git checkout roman/utxo-perf-opt
+```
 
 ### 2. Install dependencies
 
