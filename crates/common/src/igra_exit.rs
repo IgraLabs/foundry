@@ -4,7 +4,7 @@ use kaspa_addresses::{Address as KaspaAddress, Prefix as KaspaAddressPrefix};
 use kaspa_bip32::{
     ChildNumber as KaspaChildNumber, DerivationPath as KaspaDerivationPath,
     ExtendedPublicKey as KaspaExtendedPublicKey, Prefix as KaspaBip32Prefix,
-    secp256k1::PublicKey as KaspaSecpPublicKey,
+    PublicKey as KaspaBip32PublicKey, secp256k1::PublicKey as KaspaSecpPublicKey,
 };
 use kaspa_consensus_core::{
     subnets::SubnetworkId,
@@ -14,7 +14,10 @@ use kaspa_consensus_core::{
         TransactionOutput as KaspaTransactionOutput,
     },
 };
-use kaspa_txscript::pay_to_address_script;
+use kaspa_txscript::{
+    multisig_redeem_script, multisig_redeem_script_ecdsa, pay_to_address_script,
+    pay_to_script_hash_script,
+};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,6 +49,8 @@ pub struct VerifyExitOptions {
 pub struct BuildExitInput {
     pub locking_utxos: Vec<LockingUtxo>,
     pub exits: Vec<ExitRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<ChangeOutput>,
     pub fee_sompi: u64,
     pub multisig: MultisigSpec,
 }
@@ -73,6 +78,12 @@ pub struct ExitRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ChangeOutput {
+    pub derivation_path: String,
+    pub amount_sompi: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MultisigSpec {
     pub minimum_signatures: u32,
     pub extended_public_keys: Vec<String>,
@@ -87,6 +98,8 @@ pub struct UnsignedExitManifest {
     pub protocol: ExitProtocolManifest,
     pub locking_utxos: Vec<LockingUtxo>,
     pub exits: Vec<ExitRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<ChangeOutput>,
     pub fee_sompi: u64,
     pub total_input_sompi: u64,
     pub total_output_sompi: u64,
@@ -244,7 +257,8 @@ pub fn build_unsigned_exit(
     }
 
     let payload_l2data = exit_l2data(&input.exits)?;
-    let outputs = exit_outputs(&input.exits, network_prefix)?;
+    let outputs =
+        transaction_outputs(&input.exits, input.change.as_ref(), &input.multisig, network_prefix)?;
     let total_output_sompi = outputs.iter().map(|output| output.value).sum::<u64>();
     let total_input_sompi = input.locking_utxos.iter().map(|utxo| utxo.amount_sompi).sum::<u64>();
     let required = total_output_sompi
@@ -296,6 +310,7 @@ pub fn build_unsigned_exit(
         },
         locking_utxos: input.locking_utxos,
         exits: input.exits,
+        change: input.change,
         fee_sompi: input.fee_sompi,
         total_input_sompi,
         total_output_sompi,
@@ -323,6 +338,7 @@ pub fn verify_unsigned_exit(
     validate_build_input(&BuildExitInput {
         locking_utxos: manifest.locking_utxos.clone(),
         exits: manifest.exits.clone(),
+        change: manifest.change.clone(),
         fee_sompi: manifest.fee_sompi,
         multisig: manifest.multisig.clone(),
     })?;
@@ -347,7 +363,8 @@ pub fn verify_unsigned_exit(
     if tx.inputs.len() != manifest.locking_utxos.len() {
         bail!("input count mismatch");
     }
-    if tx.outputs.len() != manifest.exits.len() {
+    let expected_output_count = manifest.exits.len() + usize::from(manifest.change.is_some());
+    if tx.outputs.len() != expected_output_count {
         bail!("output count mismatch");
     }
     if pst.partially_signed_inputs.len() != tx.inputs.len() {
@@ -460,6 +477,16 @@ fn validate_build_input(input: &BuildExitInput) -> Result<()> {
         }
     }
 
+    if let Some(change) = input.change.as_ref() {
+        if change.amount_sompi == 0 {
+            bail!("change.amount_sompi must be greater than zero");
+        }
+        validate_canonical_multisig_receive_derivation_path(
+            &change.derivation_path,
+            "change.derivation_path",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -568,7 +595,12 @@ fn verify_inputs(
 
 fn verify_outputs(tx: &KaspaTransaction, manifest: &UnsignedExitManifest) -> Result<()> {
     let network_prefix = parse_network_prefix(&manifest.network)?;
-    let expected_outputs = exit_outputs(&manifest.exits, network_prefix)?;
+    let expected_outputs = transaction_outputs(
+        &manifest.exits,
+        manifest.change.as_ref(),
+        &manifest.multisig,
+        network_prefix,
+    )?;
     if tx.outputs != expected_outputs {
         bail!("transaction outputs do not match manifest exits");
     }
@@ -827,6 +859,54 @@ fn exit_outputs(
         .collect()
 }
 
+fn transaction_outputs(
+    exits: &[ExitRequest],
+    change: Option<&ChangeOutput>,
+    multisig: &MultisigSpec,
+    network_prefix: KaspaAddressPrefix,
+) -> Result<Vec<KaspaTransactionOutput>> {
+    let mut outputs = exit_outputs(exits, network_prefix)?;
+    if let Some(change) = change {
+        outputs.push(multisig_change_output(change, multisig)?);
+    }
+    Ok(outputs)
+}
+
+fn multisig_change_output(
+    change: &ChangeOutput,
+    multisig: &MultisigSpec,
+) -> Result<KaspaTransactionOutput> {
+    validate_canonical_multisig_receive_derivation_path(
+        &change.derivation_path,
+        "change.derivation_path",
+    )?;
+
+    let path = change.derivation_path.parse::<KaspaDerivationPath>().wrap_err_with(|| {
+        format!("invalid Kaspa change derivation path `{}`", change.derivation_path)
+    })?;
+    let derived = multisig
+        .extended_public_keys
+        .iter()
+        .map(|key| {
+            let xpub = key
+                .parse::<KaspaExtendedPublicKey<KaspaSecpPublicKey>>()
+                .wrap_err_with(|| format!("invalid Kaspa extended public key `{key}`"))?;
+            Ok(xpub.derive_path(&path)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let redeem_script = if multisig.ecdsa {
+        let public_keys = derived.iter().map(|xpub| xpub.public_key().to_bytes());
+        multisig_redeem_script_ecdsa(public_keys, multisig.minimum_signatures as usize)?
+    } else {
+        let public_keys =
+            derived.iter().map(|xpub| xpub.public_key().x_only_public_key().0.serialize());
+        multisig_redeem_script(public_keys, multisig.minimum_signatures as usize)?
+    };
+
+    Ok(KaspaTransactionOutput::new(change.amount_sompi, pay_to_script_hash_script(&redeem_script)))
+}
+
 fn derived_extended_public_keys(
     extended_public_keys: &[String],
     derivation_path: &str,
@@ -948,6 +1028,7 @@ mod tests {
                     .to_string(),
                 amount_sompi: 300_000_000,
             }],
+            change: None,
             fee_sompi: 10_000,
             multisig: MultisigSpec {
                 minimum_signatures: 2,
@@ -1054,6 +1135,50 @@ mod tests {
             VerifyExitOptions { allow_signatures: false, require_fully_signed: false },
         )
         .expect("verify unsigned exit");
+    }
+
+    #[test]
+    fn build_and_verify_exit_with_change_back_to_canonical_multisig() {
+        let mut input = sample_input();
+        input.locking_utxos[0].amount_sompi = 301_010_000;
+        input.change = Some(ChangeOutput {
+            derivation_path: canonical_multisig_receive_derivation_path(2),
+            amount_sompi: 1_000_000,
+        });
+
+        let output = build_unsigned_exit(
+            input,
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(30),
+                max_nonce: Some(1_000_000),
+            },
+        )
+        .expect("build unsigned exit");
+
+        assert_eq!(output.manifest.wallet.outputs, 2);
+        assert_eq!(output.manifest.total_output_sompi, 301_000_000);
+        assert_eq!(output.manifest.change.as_ref().unwrap().amount_sompi, 1_000_000);
+        assert_eq!(output.manifest.change.as_ref().unwrap().derivation_path, "m/0/0/2");
+
+        let pst = PartiallySignedTransactionProto::decode(
+            decode_fixed_hex(&output.wallet_hex, "wallet hex").unwrap().as_slice(),
+        )
+        .expect("decode pst");
+        assert_eq!(pst.tx.as_ref().unwrap().outputs.len(), 2);
+        assert_ne!(
+            pst.tx.as_ref().unwrap().outputs[0].script_public_key,
+            pst.tx.as_ref().unwrap().outputs[1].script_public_key
+        );
+
+        let report = verify_unsigned_exit(
+            &output.manifest,
+            &output.wallet_hex,
+            VerifyExitOptions { allow_signatures: false, require_fully_signed: false },
+        )
+        .expect("verify unsigned exit");
+        assert_eq!(report.output_count, 2);
     }
 
     #[test]

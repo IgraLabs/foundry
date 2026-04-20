@@ -55,6 +55,10 @@ Create an input file, for example `exit-input.json`:
       "amount_sompi": 99000000
     }
   ],
+  "change": {
+    "derivation_path": "m/0/0/2",
+    "amount_sompi": 500000
+  },
   "fee_sompi": 1000000,
   "multisig": {
     "minimum_signatures": 2,
@@ -75,12 +79,17 @@ Rules:
 - `message_id` must be exactly 32 bytes, hex encoded.
 - `recipient` must match the selected network. Use `kaspa:` for mainnet.
 - `sum(locking_utxos.amount_sompi)` must equal `sum(exits.amount_sompi) + fee_sompi`.
+- If `change` is present, the arithmetic becomes
+  `sum(locking_utxos.amount_sompi) = sum(exits.amount_sompi) + change.amount_sompi + fee_sompi`.
 - `extended_public_keys` must be official kaspawallet multisig master public keys, not single-sig
   wallet public keys.
 - `derivation_path` must be the exact official kaspawallet path for the UTXO being spent. For IGRA
   multisig locking UTXOs, the CLI enforces the canonical receive-path shape `m/0/0/<index>`, where
   cosigner index `0` means the first signer after sorting all bridge kpubs, and keychain `0` means
   external receive.
+- `change` is optional. If present, it creates one extra output after all exit outputs. This output
+  is not included in the IGRA payload message ID list; it is locked back to the canonical bridge
+  multisig P2SH script at `change.derivation_path`.
 
 ## Build Unsigned Exit
 
@@ -109,6 +118,9 @@ The exit payload format is:
 ```text
 0x93 || message_id_1 || message_id_2 || ... || nonce_u32_be
 ```
+
+The optional change output is a normal Kaspa transaction output. It is not encoded into the `0x93`
+payload.
 
 ## Verify Unsigned Artifact
 
@@ -167,6 +179,7 @@ Each signer should inspect:
 - `payload_header` in the manifest, which must be `0x93`
 - input UTXO txid, index, amount, locking script, and derivation path
 - exit recipient addresses and amounts
+- optional change amount and derivation path
 - `fee_sompi`
 - `tx_id_prefix`
 - multisig xpubs and `minimum_signatures`
@@ -299,7 +312,7 @@ Before signing or broadcasting:
 4. Every input UTXO exists, is unspent, and has the expected amount.
 5. Every input uses the IGRA KAS locking script.
 6. Every input derivation path is known and correct for that UTXO.
-7. Input total equals output total plus fee.
+7. Input total equals exit outputs plus optional change output plus fee.
 8. Recipient addresses are correct mainnet `kaspa:` addresses.
 9. Multisig xpubs are official kaspawallet multisig master xpubs.
 10. The final signed file passes `verify-exit --allow-signatures --require-fully-signed`.
