@@ -24,8 +24,10 @@ alloy-transport.workspace = true
 
 kaspa-addresses.workspace = true
 kaspa-bip32.workspace = true
+kaspa-consensus-core.workspace = true
 kaspa-grpc-client.workspace = true
 kaspa-rpc-core.workspace = true
+kaspa-txscript.workspace = true
 
 clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
 chrono.workspace = true

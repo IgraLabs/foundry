@@ -22,22 +22,37 @@ Non-goals for this wave:
 
 ## 2. Baseline, Gaps, and Ownership Boundaries
 
-Current baseline:
+Current beta baseline:
 
 - `crates/igra-loadgen/src/main.rs` sends raw EIP-1559 txs via IGRA transport.
 - `scripts/igra/testnet-stress.sh` provides shell-driven stress flow.
+- Campaign manifests, metrics streams, warm-up coordination, deterministic worker mapping,
+  pass/fail window evaluation, calibration/preflight modes, endpoint lists, retry/failover, and
+  explicit recipient modes are implemented in the beta runner.
 
-Confirmed gaps vs spec:
+Recently closed items in this branch:
 
-- Missing campaign manifest and metrics streams.
-- Missing warm-up barrier and start synchronization.
-- Missing pass/fail 95%/95% window evaluation logic.
-- Missing calibration and preflight first-class modes.
-- Missing deterministic wallet/contract mapping with range validation.
-- Missing endpoint-list + retry/failover/degraded-pause policy.
-- Missing explicit recipient mode support (`ring|random-seeded`).
-- Missing network-derived defaults and Kaspa address-prefix validation.
-- Missing preflight checks (UTXO depth, fee floor, contract code existence).
+- `prebuild-send` now uses a bounded producer/consumer queue with nonce-tagged prebuilt raws and
+  dispatch-time stale-nonce dropping.
+- Optional Kaspa fan-out execution path is implemented with CLI/ENV controls and adaptive batch
+  splitting on mass-related errors.
+- Fan-out now includes mandatory fail-fast standardness validation:
+  - config-time minimum `amount_sompi` check from KIP-0009 constraints,
+  - pre-submit storage-mass guard with single-output hard-fail.
+
+Remaining gaps / verification items:
+
+- Network-derived defaults and Kaspa address-prefix validation still need a live-network smoke pass.
+- Preflight checks cover balance, UTXO depth, fee floor, and contract code presence, but need
+  devnet/testnet evidence before this can be marked production-stable.
+- Graceful shutdown/finalization semantics still need interrupt-path validation under load.
+- The 10-worker campaign and smoke/regression suites remain the acceptance gate for closing the
+  implementation wave.
+
+Operational caveat:
+
+- Fan-out execution success still depends on node policy and endpoint standardness limits; the
+  runner now enforces conservative limits and degrades batch size automatically before failing hard.
 
 Kaspa operation ownership (explicit):
 
@@ -432,4 +447,3 @@ Implementation is complete when:
 - network-derived defaults and address-prefix validation are verified.
 - signal handling finalizes artifacts and exits with 130/143 semantics.
 - 10-worker campaigns and smoke/regression suites pass without IGRA regressions.
-

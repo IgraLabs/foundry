@@ -21,15 +21,29 @@ use kaspa_bip32::{
     ExtendedPrivateKey as KaspaExtendedPrivateKey, Language as KaspaLanguage,
     Mnemonic as KaspaMnemonic,
 };
+use kaspa_consensus_core::{
+    config::params::Params as KaspaParams,
+    constants::STORAGE_MASS_PARAMETER as KASPA_STORAGE_MASS_PARAMETER,
+    mass::MassCalculator as KaspaMassCalculator,
+    network::NetworkType as KaspaNetworkType,
+    sign::{sign_with_multiple_v2 as kaspa_sign_with_multiple_v2, verify as kaspa_verify},
+    subnets::SubnetworkId,
+    tx::{
+        SignableTransaction as KaspaSignableTransaction, Transaction as KaspaTransaction,
+        TransactionInput as KaspaTransactionInput, TransactionOutput as KaspaTransactionOutput,
+        UtxoEntry as KaspaUtxoEntry,
+    },
+};
 use kaspa_grpc_client::GrpcClient;
-use kaspa_rpc_core::api::rpc::RpcApi;
+use kaspa_rpc_core::{RpcTransaction, RpcUtxosByAddressesEntry, api::rpc::RpcApi};
+use kaspa_txscript::pay_to_address_script;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -47,6 +61,9 @@ use tower::Service;
 const DEFAULT_WALLETS_JSON: &str = "docs/stress-test-prep/wallets_1000.json";
 const DEFAULT_CONTRACT_BASE: &str = "0x0000000000000000000000000000000000005000";
 const DEFAULT_CONTRACT_END: &str = "0x00000000000000000000000000000000000053e7";
+const MIN_CHANGE_SOMPI: u64 = 1_000;
+const MAX_STANDARD_KASPA_TX_MASS: u64 = 100_000;
+const FANOUT_TARGET_STORAGE_MASS: u64 = 50_000;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[value(rename_all = "kebab-case")]
@@ -284,6 +301,44 @@ struct Args {
     #[arg(long, env = "IGRA_STRESS_UTXO_SAFETY_FACTOR", default_value_t = 1.5)]
     utxo_safety_factor: f64,
 
+    #[arg(long, env = "IGRA_STRESS_KASPA_FANOUT", default_value_t = 0)]
+    kaspa_fanout: u8,
+
+    #[arg(long, env = "IGRA_STRESS_KASPA_FANOUT_SOURCE_PRIVATE_KEY")]
+    kaspa_fanout_source_private_key: Option<String>,
+
+    #[arg(long, env = "IGRA_STRESS_KASPA_FANOUT_SOURCE_MNEMONIC")]
+    kaspa_fanout_source_mnemonic: Option<String>,
+
+    #[arg(long, env = "IGRA_STRESS_KASPA_FANOUT_SOURCE_MNEMONIC_PASSPHRASE")]
+    kaspa_fanout_source_mnemonic_passphrase: Option<String>,
+
+    #[arg(
+        long,
+        env = "IGRA_STRESS_KASPA_FANOUT_SOURCE_MNEMONIC_PASSPHRASE_AS_MNEMONIC",
+        default_value_t = false
+    )]
+    kaspa_fanout_source_mnemonic_passphrase_as_mnemonic: bool,
+
+    #[arg(
+        long,
+        env = "IGRA_STRESS_KASPA_FANOUT_SOURCE_MNEMONIC_PASSPHRASE_EMPTY",
+        default_value_t = false
+    )]
+    kaspa_fanout_source_mnemonic_passphrase_empty: bool,
+
+    #[arg(long, env = "IGRA_STRESS_KASPA_FANOUT_SOURCE_MNEMONIC_INDEX", default_value_t = 0)]
+    kaspa_fanout_source_mnemonic_index: u32,
+
+    #[arg(long, env = "IGRA_STRESS_KASPA_FANOUT_AMOUNT_SOMPI", default_value_t = 100_000_000)]
+    kaspa_fanout_amount_sompi: u64,
+
+    #[arg(long, env = "IGRA_STRESS_KASPA_FANOUT_UTXOS_PER_WALLET", default_value_t = 1)]
+    kaspa_fanout_utxos_per_wallet: u32,
+
+    #[arg(long, env = "IGRA_STRESS_KASPA_FANOUT_MAX_OUTPUTS_PER_TX", default_value_t = 64)]
+    kaspa_fanout_max_outputs_per_tx: usize,
+
     #[arg(long, env = "IGRA_STRESS_IGRA_MIN_FEE_FLOOR_GWEI_EXPECTED")]
     igra_min_fee_floor_gwei_expected: Option<u64>,
 
@@ -337,12 +392,23 @@ struct ResolvedConfig {
     el_rpc_urls: Vec<String>,
     kaspa_rpc_urls: Vec<String>,
     endpoint_set_sha256: String,
+    parameter_sources: HashMap<String, String>,
     contract_base_address: Address,
     contract_end_address: Address,
     preflight_balance_check: bool,
     prebuild_horizon_secs: u64,
     utxo_refill_lag_secs: u64,
     utxo_safety_factor: f64,
+    kaspa_fanout_enabled: bool,
+    kaspa_fanout_source_private_key: Option<String>,
+    kaspa_fanout_source_mnemonic: Option<String>,
+    kaspa_fanout_source_mnemonic_passphrase: Option<String>,
+    kaspa_fanout_source_mnemonic_passphrase_as_mnemonic: bool,
+    kaspa_fanout_source_mnemonic_passphrase_empty: bool,
+    kaspa_fanout_source_mnemonic_index: u32,
+    kaspa_fanout_amount_sompi: u64,
+    kaspa_fanout_utxos_per_wallet: u32,
+    kaspa_fanout_max_outputs_per_tx: usize,
     kaspa_fee_mode: String,
     kaspa_fee_bucket: String,
     igra_min_fee_floor_gwei_expected: Option<u64>,
@@ -382,6 +448,12 @@ struct WorkerPlan {
     per_worker_total_target: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+struct PrebuiltTx {
+    nonce: u64,
+    raw: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct WorkerCounters {
     accepted: u64,
@@ -394,6 +466,9 @@ struct WorkerCounters {
     rpc_pending_nonce: u64,
     last_error_code: Option<String>,
     last_accept_instant: Option<Instant>,
+    last_el_rpc_latency_ms: Option<u64>,
+    last_kaspa_rpc_latency_ms: Option<u64>,
+    active_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -422,8 +497,24 @@ struct AggregateSample {
     timeout_1s: u64,
     dropped_1s: u64,
     terminal_error_1s: u64,
+    el_rpc_p95_ms: Option<u64>,
+    kaspa_rpc_p95_ms: Option<u64>,
+    el_pending_count: u64,
+    kaspa_mempool_mass_estimate: Option<u64>,
     active_workers: usize,
     stalled_workers: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TransportHealth {
+    consecutive_failures: u32,
+    backoff_until: Option<Instant>,
+}
+
+#[derive(Clone, Debug)]
+struct TransportSlot {
+    endpoint_id: String,
+    transport: IgraTransport<RuntimeTransport>,
 }
 
 #[derive(Clone, Debug)]
@@ -468,6 +559,10 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&cfg.campaign_output_dir)
         .wrap_err("failed to create campaign output dir")?;
 
+    if cfg.kaspa_fanout_enabled {
+        run_kaspa_fanout(&cfg, &plans).await?;
+    }
+
     let observed_fee_floor_gwei = preflight(&cfg, &plans).await?;
 
     let campaign_id = format!(
@@ -504,6 +599,10 @@ async fn main() -> Result<()> {
         run_result.warmup_completed_at_utc.as_deref(),
     )?;
 
+    if cfg.calibration_mode || cfg.preflight_sample_mode {
+        emit_calibration_report(&cfg, &run_result)?;
+    }
+
     let out = json!({
         "campaign_id": campaign_id,
         "pass": run_result.pass,
@@ -539,6 +638,7 @@ async fn main() -> Result<()> {
 }
 
 fn resolve_config(args: &Args) -> Result<ResolvedConfig> {
+    let cli_args: Vec<String> = std::env::args().collect();
     let target_tps = args.target_tps.or(args.legacy_tps).unwrap_or(0.0);
 
     if !target_tps.is_finite() {
@@ -573,6 +673,7 @@ fn resolve_config(args: &Args) -> Result<ResolvedConfig> {
         }
     }
 
+    let mut rpc_loaded_from_file = false;
     if (el_urls.is_empty() || kaspa_urls.is_empty()) && args.rpc_endpoints_json.is_some() {
         let p = PathBuf::from(args.rpc_endpoints_json.as_deref().expect("checked is_some"));
         let parsed: RpcEndpointsFile = serde_json::from_slice(
@@ -582,9 +683,11 @@ fn resolve_config(args: &Args) -> Result<ResolvedConfig> {
         .wrap_err("invalid rpc endpoints json")?;
         if el_urls.is_empty() {
             el_urls = parsed.igra_rpc_urls;
+            rpc_loaded_from_file = true;
         }
         if kaspa_urls.is_empty() {
             kaspa_urls = parsed.kaspa_rpc_urls;
+            rpc_loaded_from_file = true;
         }
     }
 
@@ -608,6 +711,33 @@ fn resolve_config(args: &Args) -> Result<ResolvedConfig> {
 
     if worker_count == 0 {
         return Err(eyre!("worker count resolved to 0"));
+    }
+    if args.kaspa_fanout > 1 {
+        return Err(eyre!("--kaspa-fanout must be 0 or 1"));
+    }
+    if args.kaspa_fanout == 1 {
+        if args.kaspa_fanout_amount_sompi == 0 {
+            return Err(eyre!("--kaspa-fanout-amount-sompi must be > 0"));
+        }
+        if args.kaspa_fanout_utxos_per_wallet == 0 {
+            return Err(eyre!("--kaspa-fanout-utxos-per-wallet must be > 0"));
+        }
+        if args.kaspa_fanout_max_outputs_per_tx == 0 {
+            return Err(eyre!("--kaspa-fanout-max-outputs-per-tx must be > 0"));
+        }
+        let min_amount_sompi =
+            min_fanout_amount_sompi_for_standardness(args.kaspa_fanout_max_outputs_per_tx);
+        if args.kaspa_fanout_amount_sompi < min_amount_sompi {
+            return Err(eyre!(
+                "--kaspa-fanout-amount-sompi={} is too low for standardness with --kaspa-fanout-max-outputs-per-tx={}; require at least {} sompi (~{:.4} KAS) to keep storage mass under {} (safety target {})",
+                args.kaspa_fanout_amount_sompi,
+                args.kaspa_fanout_max_outputs_per_tx,
+                min_amount_sompi,
+                sompi_to_kaspa(min_amount_sompi),
+                MAX_STANDARD_KASPA_TX_MASS,
+                FANOUT_TARGET_STORAGE_MASS
+            ));
+        }
     }
 
     let stop_condition = if calibration_mode {
@@ -662,6 +792,56 @@ fn resolve_config(args: &Args) -> Result<ResolvedConfig> {
 
     let endpoint_set_sha256 = endpoint_set_sha256(&el_urls, &kaspa_urls);
 
+    let mut parameter_sources = HashMap::new();
+    parameter_sources.insert(
+        "IGRA_STRESS_NETWORK".to_string(),
+        resolve_source(&cli_args, &["--network"], "IGRA_STRESS_NETWORK", false, "default"),
+    );
+    parameter_sources.insert(
+        "IGRA_STRESS_MODE".to_string(),
+        resolve_source(&cli_args, &["--mode"], "IGRA_STRESS_MODE", false, "default"),
+    );
+    parameter_sources.insert(
+        "IGRA_STRESS_TARGET_TPS".to_string(),
+        resolve_source(
+            &cli_args,
+            &["--target-tps", "--legacy-tps"],
+            "IGRA_STRESS_TARGET_TPS",
+            false,
+            if target_tps > 0.0 { "resolved" } else { "default" },
+        ),
+    );
+    parameter_sources.insert(
+        "IGRA_STRESS_EL_RPC_URLS".to_string(),
+        resolve_source(
+            &cli_args,
+            &["--el-rpc-urls", "--legacy-el-rpc-url"],
+            "IGRA_STRESS_EL_RPC_URLS",
+            rpc_loaded_from_file,
+            "default",
+        ),
+    );
+    parameter_sources.insert(
+        "IGRA_STRESS_KASPA_RPC_URLS".to_string(),
+        resolve_source(
+            &cli_args,
+            &["--kaspa-rpc-urls", "--legacy-kaspa-rpc-url"],
+            "IGRA_STRESS_KASPA_RPC_URLS",
+            rpc_loaded_from_file,
+            "default",
+        ),
+    );
+    parameter_sources.insert(
+        "IGRA_STRESS_WORKER_COUNT".to_string(),
+        resolve_source(
+            &cli_args,
+            &["--worker-count"],
+            "IGRA_STRESS_WORKER_COUNT",
+            false,
+            if args.worker_count.is_some() { "cli" } else { "derived" },
+        ),
+    );
+
     Ok(ResolvedConfig {
         network: args.network,
         mode: args.mode,
@@ -694,12 +874,27 @@ fn resolve_config(args: &Args) -> Result<ResolvedConfig> {
         el_rpc_urls: el_urls,
         kaspa_rpc_urls: kaspa_urls,
         endpoint_set_sha256,
+        parameter_sources,
         contract_base_address,
         contract_end_address,
         preflight_balance_check: args.preflight_balance_check == 1,
         prebuild_horizon_secs: args.prebuild_horizon_secs,
         utxo_refill_lag_secs: args.utxo_refill_lag_secs,
         utxo_safety_factor: args.utxo_safety_factor,
+        kaspa_fanout_enabled: args.kaspa_fanout == 1,
+        kaspa_fanout_source_private_key: args.kaspa_fanout_source_private_key.clone(),
+        kaspa_fanout_source_mnemonic: args.kaspa_fanout_source_mnemonic.clone(),
+        kaspa_fanout_source_mnemonic_passphrase: args
+            .kaspa_fanout_source_mnemonic_passphrase
+            .clone(),
+        kaspa_fanout_source_mnemonic_passphrase_as_mnemonic: args
+            .kaspa_fanout_source_mnemonic_passphrase_as_mnemonic,
+        kaspa_fanout_source_mnemonic_passphrase_empty: args
+            .kaspa_fanout_source_mnemonic_passphrase_empty,
+        kaspa_fanout_source_mnemonic_index: args.kaspa_fanout_source_mnemonic_index,
+        kaspa_fanout_amount_sompi: args.kaspa_fanout_amount_sompi,
+        kaspa_fanout_utxos_per_wallet: args.kaspa_fanout_utxos_per_wallet,
+        kaspa_fanout_max_outputs_per_tx: args.kaspa_fanout_max_outputs_per_tx,
         kaspa_fee_mode: args.kaspa_fee_mode.trim().to_lowercase(),
         kaspa_fee_bucket: args.kaspa_fee_bucket.trim().to_lowercase(),
         igra_min_fee_floor_gwei_expected: args.igra_min_fee_floor_gwei_expected,
@@ -1080,6 +1275,317 @@ async fn verify_kaspa_utxos(cfg: &ResolvedConfig, plans: &[WorkerPlan]) -> Resul
     Ok(())
 }
 
+async fn run_kaspa_fanout(cfg: &ResolvedConfig, plans: &[WorkerPlan]) -> Result<()> {
+    if plans.is_empty() {
+        return Ok(());
+    }
+    let source_private_key =
+        resolve_kaspa_fanout_source_key(cfg, plans).wrap_err("resolve fan-out source key")?;
+    let (network_type, address_prefix) =
+        kaspa_network_descriptor(cfg.network.as_str()).wrap_err("fan-out network mapping")?;
+    let source_address = kaspa_address_from_private_key(&source_private_key, address_prefix)
+        .wrap_err("derive fan-out source address")?;
+
+    let mut targets = Vec::<(KaspaAddress, u64)>::new();
+    for plan in plans {
+        let addr = KaspaAddress::try_from(plan.kaspa_address.as_str())
+            .wrap_err_with(|| format!("invalid worker Kaspa address {}", plan.kaspa_address))?;
+        for _ in 0..cfg.kaspa_fanout_utxos_per_wallet {
+            targets.push((addr.clone(), cfg.kaspa_fanout_amount_sompi));
+        }
+    }
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let client = GrpcClient::connect(cfg.kaspa_rpc_urls[0].clone())
+        .await
+        .wrap_err("fan-out: connect kaspa gRPC failed")?;
+    let feerate = get_kaspa_feerate_sompi_per_gram(&client, cfg).await?;
+    let mut tip = fetch_largest_utxo(&client, &source_address)
+        .await
+        .wrap_err("fan-out: failed to load source UTXO")?;
+
+    let mut submitted = 0usize;
+    let batch_size = cfg.kaspa_fanout_max_outputs_per_tx.max(1);
+    let mut queue: VecDeque<Vec<(KaspaAddress, u64)>> =
+        targets.chunks(batch_size).map(|chunk| chunk.to_vec()).collect();
+
+    while let Some(batch) = queue.pop_front() {
+        let built = build_signed_chained_fanout_tx(
+            &source_private_key,
+            &source_address,
+            network_type,
+            &tip,
+            &batch,
+            feerate,
+        );
+        let (tx, next_tip, _fee, mass) = match built {
+            Ok(v) => v,
+            Err(err) => {
+                if batch.len() > 1 && fanout_batch_too_large(err.to_string().as_str()) {
+                    split_fanout_batch(&batch, &mut queue);
+                    continue;
+                }
+                let hint = fanout_policy_hint(err.to_string().as_str());
+                return Err(err.wrap_err(format!(
+                    "fan-out build failed after {} outputs submitted{}",
+                    submitted, hint
+                )));
+            }
+        };
+        if mass > MAX_STANDARD_KASPA_TX_MASS {
+            if batch.len() > 1 {
+                split_fanout_batch(&batch, &mut queue);
+                continue;
+            }
+            let required = min_fanout_amount_sompi_for_standardness(1);
+            return Err(eyre!(
+                "fan-out pre-submit standardness validation failed: computed storage mass {} exceeds limit {} for single-output batch (amount_sompi={}); increase --kaspa-fanout-amount-sompi to at least {} (~{:.4} KAS), or use devnet prealloc",
+                mass,
+                MAX_STANDARD_KASPA_TX_MASS,
+                batch[0].1,
+                required,
+                sompi_to_kaspa(required)
+            ));
+        }
+
+        let rpc_tx = RpcTransaction::from(&tx);
+        match client.submit_transaction(rpc_tx, false).await {
+            Ok(_) => {
+                tip = next_tip;
+                submitted += batch.len();
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if batch.len() > 1 && fanout_batch_too_large(msg.as_str()) {
+                    split_fanout_batch(&batch, &mut queue);
+                    continue;
+                }
+                let hint = fanout_policy_hint(msg.as_str());
+                return Err(eyre!(
+                    "fan-out submit failed after {} outputs: {}{}",
+                    submitted,
+                    msg,
+                    hint
+                ));
+            }
+        }
+    }
+
+    println!(
+        "{{\"fanout\":\"ok\",\"source\":\"{}\",\"outputs_submitted\":{},\"utxos_per_wallet\":{},\"amount_sompi\":{},\"rpc\":\"{}\"}}",
+        source_address,
+        submitted,
+        cfg.kaspa_fanout_utxos_per_wallet,
+        cfg.kaspa_fanout_amount_sompi,
+        cfg.kaspa_rpc_urls[0]
+    );
+    Ok(())
+}
+
+fn fanout_policy_hint(err_text: &str) -> &'static str {
+    if fanout_batch_too_large(err_text) {
+        " (hint: this endpoint enforces strict Kaspa standardness for UTXO-growing fan-out; use devnet prealloc or a policy-relaxed node)"
+    } else {
+        ""
+    }
+}
+
+fn fanout_batch_too_large(err_text: &str) -> bool {
+    let lower = err_text.to_ascii_lowercase();
+    lower.contains("storage mass")
+        || lower.contains("mass")
+            && (lower.contains("max allowed size")
+                || lower.contains("exceeds standard limit")
+                || lower.contains("too large"))
+}
+
+fn split_fanout_batch(
+    batch: &[(KaspaAddress, u64)],
+    queue: &mut VecDeque<Vec<(KaspaAddress, u64)>>,
+) {
+    let mid = batch.len() / 2;
+    let left = batch[..mid].to_vec();
+    let right = batch[mid..].to_vec();
+    if !right.is_empty() {
+        queue.push_front(right);
+    }
+    if !left.is_empty() {
+        queue.push_front(left);
+    }
+}
+
+fn min_fanout_amount_sompi_for_standardness(outputs_per_tx: usize) -> u64 {
+    let outputs = outputs_per_tx.max(1) as u128;
+    let numerator = outputs.saturating_mul(KASPA_STORAGE_MASS_PARAMETER as u128);
+    let denominator = FANOUT_TARGET_STORAGE_MASS as u128;
+    let required = numerator.div_ceil(denominator);
+    required.min(u64::MAX as u128) as u64
+}
+
+fn sompi_to_kaspa(sompi: u64) -> f64 {
+    sompi as f64 / 100_000_000.0
+}
+
+fn resolve_kaspa_fanout_source_key(cfg: &ResolvedConfig, plans: &[WorkerPlan]) -> Result<[u8; 32]> {
+    if let Some(pk) = cfg.kaspa_fanout_source_private_key.as_deref() {
+        return parse_private_key_hex(pk);
+    }
+    if let Some(mnemonic) = cfg.kaspa_fanout_source_mnemonic.as_deref() {
+        let keys = derive_kaspa_private_keys(
+            mnemonic,
+            cfg.kaspa_fanout_source_mnemonic_passphrase.as_deref(),
+            cfg.kaspa_fanout_source_mnemonic_passphrase_as_mnemonic,
+            cfg.kaspa_fanout_source_mnemonic_passphrase_empty,
+            None,
+            cfg.kaspa_fanout_source_mnemonic_index,
+            1,
+        )?;
+        return parse_private_key_hex(keys[0].as_str());
+    }
+    parse_private_key_hex(&plans[0].kaspa_key)
+}
+
+async fn get_kaspa_feerate_sompi_per_gram(
+    client: &GrpcClient,
+    cfg: &ResolvedConfig,
+) -> Result<f64> {
+    if cfg.kaspa_fee_mode == "fixed" {
+        return Ok(1.0);
+    }
+    let estimate = client.get_fee_estimate().await.wrap_err("fan-out fee estimate failed")?;
+    let feerate = match cfg.kaspa_fee_bucket.as_str() {
+        "priority" => estimate.priority_bucket.feerate,
+        "low" => estimate
+            .low_buckets
+            .first()
+            .map(|b| b.feerate)
+            .unwrap_or(estimate.priority_bucket.feerate),
+        _ => estimate
+            .normal_buckets
+            .first()
+            .map(|b| b.feerate)
+            .unwrap_or(estimate.priority_bucket.feerate),
+    };
+    Ok(feerate.max(1.0))
+}
+
+async fn fetch_largest_utxo(
+    client: &GrpcClient,
+    source_address: &KaspaAddress,
+) -> Result<RpcUtxosByAddressesEntry> {
+    let mut utxos = client
+        .get_utxos_by_addresses(vec![source_address.clone()])
+        .await
+        .wrap_err("get_utxos_by_addresses failed")?;
+    utxos.sort_by_key(|u| std::cmp::Reverse(u.utxo_entry.amount));
+    utxos.into_iter().next().ok_or_else(|| eyre!("source address has no spendable UTXOs"))
+}
+
+fn build_signed_chained_fanout_tx(
+    private_key: &[u8; 32],
+    source_address: &KaspaAddress,
+    network_type: KaspaNetworkType,
+    tip: &RpcUtxosByAddressesEntry,
+    outputs: &[(KaspaAddress, u64)],
+    feerate: f64,
+) -> Result<(KaspaTransaction, RpcUtxosByAddressesEntry, u64, u64)> {
+    let total_out: u64 = outputs.iter().map(|(_, amount)| *amount).sum();
+    let input_amount = tip.utxo_entry.amount;
+    let input = KaspaTransactionInput::new(tip.outpoint.clone().into(), Vec::new(), 0, 1);
+    let entry = KaspaUtxoEntry {
+        amount: tip.utxo_entry.amount,
+        script_public_key: tip.utxo_entry.script_public_key.clone(),
+        block_daa_score: tip.utxo_entry.block_daa_score,
+        is_coinbase: tip.utxo_entry.is_coinbase,
+    };
+    let entries = vec![entry];
+    let mass_calculator =
+        KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
+    let change_script = pay_to_address_script(source_address);
+
+    let mut fee = 1u64;
+    for _ in 0..6 {
+        let required = total_out.saturating_add(fee).saturating_add(MIN_CHANGE_SOMPI);
+        if input_amount < required {
+            return Err(eyre!(
+                "fan-out insufficient input: have={} need={} (outputs={}, fee={})",
+                input_amount,
+                required,
+                total_out,
+                fee
+            ));
+        }
+        let change = input_amount.saturating_sub(total_out).saturating_sub(fee);
+        if change < MIN_CHANGE_SOMPI {
+            return Err(eyre!("fan-out change below MIN_CHANGE_SOMPI"));
+        }
+
+        let mut tx_outputs = Vec::with_capacity(outputs.len() + 1);
+        tx_outputs.push(KaspaTransactionOutput::new(change, change_script.clone()));
+        for (addr, amount) in outputs {
+            tx_outputs.push(KaspaTransactionOutput::new(*amount, pay_to_address_script(addr)));
+        }
+
+        let mut tx = KaspaTransaction::new(
+            0,
+            vec![input.clone()],
+            tx_outputs,
+            0,
+            SubnetworkId::default(),
+            0,
+            vec![],
+        );
+        tx.finalize();
+
+        let signable = KaspaSignableTransaction::with_entries(tx, entries.clone());
+        let signed = kaspa_sign_with_multiple_v2(signable, std::slice::from_ref(private_key))
+            .fully_signed()
+            .map_err(|err| eyre!("fan-out sign failed: {err}"))?;
+        kaspa_verify(&signed.as_verifiable())
+            .map_err(|err| eyre!("fan-out signature verify failed: {err}"))?;
+
+        let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
+        let contextual = mass_calculator
+            .calc_contextual_masses(&signed.as_verifiable())
+            .ok_or_else(|| eyre!("fan-out mass calculation failed"))?;
+        let mass = contextual.max(non_contextual);
+        let needed_fee = fee_from_feerate(mass, feerate);
+
+        if needed_fee == fee {
+            let tx = signed.tx;
+            let tx_id = tx.id();
+            // Some deployments report unexpectedly large local mass values for otherwise
+            // acceptable standard transactions; rely on node-side standardness checks.
+            tx.set_mass(0);
+            let next_tip = RpcUtxosByAddressesEntry {
+                address: None,
+                outpoint: kaspa_rpc_core::RpcTransactionOutpoint {
+                    transaction_id: tx_id,
+                    index: 0,
+                },
+                utxo_entry: kaspa_rpc_core::RpcUtxoEntry::new(change, change_script, 0, false),
+            };
+            return Ok((tx, next_tip, fee, mass));
+        }
+        fee = needed_fee;
+    }
+
+    Err(eyre!("fan-out fee did not converge"))
+}
+
+fn fee_from_feerate(mass: u64, feerate_sompi_per_gram: f64) -> u64 {
+    let fee = (feerate_sompi_per_gram * (mass as f64)).ceil();
+    if fee <= 1.0 {
+        1
+    } else if fee >= (u64::MAX as f64) {
+        u64::MAX
+    } else {
+        fee as u64
+    }
+}
+
 async fn run_campaign(
     cfg: &ResolvedConfig,
     plans: &[WorkerPlan],
@@ -1384,6 +1890,17 @@ async fn metrics_loop(
         let d_dropped = totals.dropped.saturating_sub(prev.dropped);
         let d_terminal = totals.terminal_error.saturating_sub(prev.terminal_error);
 
+        let mut el_latencies =
+            states.iter().filter_map(|s| s.counters.last_el_rpc_latency_ms).collect::<Vec<_>>();
+        let mut kaspa_latencies =
+            states.iter().filter_map(|s| s.counters.last_kaspa_rpc_latency_ms).collect::<Vec<_>>();
+        let el_rpc_p95_ms = percentile_u64(&mut el_latencies, 95.0);
+        let kaspa_rpc_p95_ms = percentile_u64(&mut kaspa_latencies, 95.0);
+        let el_pending_count = states
+            .iter()
+            .map(|s| s.counters.local_next_nonce.saturating_sub(s.counters.rpc_pending_nonce))
+            .sum::<u64>();
+
         let sample = AggregateSample {
             ts_utc: utc_now(),
             tps_1s: d_accept as f64,
@@ -1392,6 +1909,10 @@ async fn metrics_loop(
             timeout_1s: d_timeout,
             dropped_1s: d_dropped,
             terminal_error_1s: d_terminal,
+            el_rpc_p95_ms,
+            kaspa_rpc_p95_ms,
+            el_pending_count,
+            kaspa_mempool_mass_estimate: None,
             active_workers: active,
             stalled_workers: stalled,
         };
@@ -1406,10 +1927,10 @@ async fn metrics_loop(
             "timeout_1s": sample.timeout_1s,
             "dropped_1s": sample.dropped_1s,
             "terminal_error_1s": sample.terminal_error_1s,
-            "el_rpc_p95_ms": Value::Null,
-            "kaspa_rpc_p95_ms": Value::Null,
-            "el_pending_count": Value::Null,
-            "kaspa_mempool_mass_estimate": Value::Null,
+            "el_rpc_p95_ms": sample.el_rpc_p95_ms,
+            "kaspa_rpc_p95_ms": sample.kaspa_rpc_p95_ms,
+            "el_pending_count": sample.el_pending_count,
+            "kaspa_mempool_mass_estimate": sample.kaspa_mempool_mass_estimate,
             "active_workers": sample.active_workers,
             "stalled_workers": sample.stalled_workers,
         }))?);
@@ -1426,6 +1947,9 @@ async fn metrics_loop(
                     "local_next_nonce": s.counters.local_next_nonce,
                     "rpc_pending_nonce": s.counters.rpc_pending_nonce,
                     "replacement_count_total": s.counters.replacement_count_total,
+                    "el_rpc_latency_ms": s.counters.last_el_rpc_latency_ms,
+                    "kaspa_rpc_latency_ms": s.counters.last_kaspa_rpc_latency_ms,
+                    "endpoint": s.counters.active_endpoint,
                     "last_error_code": s.counters.last_error_code,
                 }))?,
             );
@@ -1475,15 +1999,20 @@ async fn run_worker(
     let mut rng = StdRng::seed_from_u64(cfg.rpc_random_seed.wrapping_add(plan.worker_id as u64));
 
     let transport_pool = build_transport_pool(cfg, &plan.kaspa_key)?;
+    let mut transport_health = vec![TransportHealth::default(); transport_pool.len()];
     let mut transport_index = rng.random_range(0..transport_pool.len());
-    let mut transport = transport_pool[transport_index].clone();
-
-    let mut nonce = eth_get_transaction_count_pending(&mut transport, plan.evm_sender).await?;
+    let mut nonce = {
+        let mut t = transport_pool[transport_index].transport.clone();
+        eth_get_transaction_count_pending(&mut t, plan.evm_sender).await?
+    };
     let signer = plan
         .evm_key
         .parse::<PrivateKeySigner>()
         .map_err(|e| eyre!("invalid signer for worker {}: {e}", plan.worker_id))?;
-    let chain_id = eth_chain_id(&mut transport).await?;
+    let chain_id = {
+        let mut t = transport_pool[transport_index].transport.clone();
+        eth_chain_id(&mut t).await?
+    };
 
     {
         let mut states = worker_states.lock().await;
@@ -1503,11 +2032,13 @@ async fn run_worker(
             &signer,
             chain_id,
             &transport_pool,
+            &mut transport_health,
             &mut transport_index,
-            &mut transport,
             &mut nonce,
             worker_states,
             false,
+            true,
+            None,
             &mut rng,
         )
         .await?;
@@ -1529,47 +2060,55 @@ async fn run_worker(
         None
     };
 
-    loop {
-        if stop_flag.load(Ordering::Relaxed) {
-            break;
-        }
-
-        if let Some(target) = plan.per_worker_total_target {
-            let states = worker_states.lock().await;
-            let current = states
-                .iter()
-                .find(|s| s.worker_id == plan.worker_id)
-                .map(|s| {
-                    s.counters.accepted
-                        + s.counters.rejected
-                        + s.counters.timeout
-                        + s.counters.dropped
-                        + s.counters.terminal_error
-                })
-                .unwrap_or(0);
-            if current >= target {
-                break;
-            }
-        }
-
-        if let Some(t) = ticker.as_mut() {
-            t.tick().await;
-        }
-
-        send_one(
+    if matches!(cfg.mode, Mode::PrebuildSend) {
+        run_worker_prebuild_pipeline(
             cfg,
             plan,
             &signer,
             chain_id,
             &transport_pool,
+            &mut transport_health,
             &mut transport_index,
-            &mut transport,
             &mut nonce,
             worker_states,
-            true,
+            stop_flag,
+            ticker,
             &mut rng,
         )
         .await?;
+    } else {
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+
+            if worker_reached_target(worker_states, plan.worker_id, plan.per_worker_total_target)
+                .await
+            {
+                break;
+            }
+
+            if let Some(t) = ticker.as_mut() {
+                t.tick().await;
+            }
+
+            send_one(
+                cfg,
+                plan,
+                &signer,
+                chain_id,
+                &transport_pool,
+                &mut transport_health,
+                &mut transport_index,
+                &mut nonce,
+                worker_states,
+                true,
+                false,
+                None,
+                &mut rng,
+            )
+            .await?;
+        }
     }
 
     {
@@ -1582,104 +2121,323 @@ async fn run_worker(
     Ok(())
 }
 
+async fn worker_reached_target(
+    worker_states: &Arc<Mutex<Vec<WorkerState>>>,
+    worker_id: usize,
+    target: Option<u64>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    let states = worker_states.lock().await;
+    let current = states
+        .iter()
+        .find(|s| s.worker_id == worker_id)
+        .map(|s| {
+            s.counters.accepted
+                + s.counters.rejected
+                + s.counters.timeout
+                + s.counters.dropped
+                + s.counters.terminal_error
+        })
+        .unwrap_or(0);
+    current >= target
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_worker_prebuild_pipeline(
+    cfg: &ResolvedConfig,
+    plan: &WorkerPlan,
+    signer: &PrivateKeySigner,
+    chain_id: u64,
+    transport_pool: &[TransportSlot],
+    transport_health: &mut [TransportHealth],
+    transport_index: &mut usize,
+    nonce: &mut u64,
+    worker_states: &Arc<Mutex<Vec<WorkerState>>>,
+    stop_flag: &Arc<AtomicBool>,
+    mut ticker: Option<tokio::time::Interval>,
+    rng: &mut StdRng,
+) -> Result<()> {
+    let per_worker_tps =
+        if cfg.target_tps > 0.0 { cfg.target_tps / cfg.worker_count as f64 } else { 0.0 };
+    let mut queue_capacity =
+        ((per_worker_tps * cfg.prebuild_horizon_secs as f64).ceil() as usize).max(1);
+    if let Some(target) = plan.per_worker_total_target {
+        queue_capacity = queue_capacity.min(target.max(1) as usize);
+    }
+
+    let (tx_prebuilt, mut rx_prebuilt) = mpsc::channel::<PrebuiltTx>(queue_capacity);
+    let producer_stop = stop_flag.clone();
+    let to = cfg.explicit_to.unwrap_or(plan.contract);
+    let data =
+        if let Some(d) = cfg.explicit_data.as_ref() { d.clone() } else { plan.call_data.clone() };
+    let signer_prebuild = signer.clone();
+    let cfg_cloned = cfg.clone();
+    let mut next_nonce = *nonce;
+    let per_worker_target = plan.per_worker_total_target;
+
+    let producer = tokio::spawn(async move {
+        let mut produced = 0u64;
+        loop {
+            if producer_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(target) = per_worker_target
+                && produced >= target
+            {
+                break;
+            }
+            let raw = build_signed_eip1559(
+                &signer_prebuild,
+                chain_id,
+                next_nonce,
+                cfg_cloned.gas_limit,
+                cfg_cloned.max_fee_per_gas,
+                cfg_cloned.max_priority_fee_per_gas,
+                to,
+                &data,
+            )?;
+            let tx = PrebuiltTx { nonce: next_nonce, raw };
+            if tx_prebuilt.send(tx).await.is_err() {
+                break;
+            }
+            next_nonce = next_nonce.saturating_add(1);
+            produced = produced.saturating_add(1);
+        }
+        Result::<()>::Ok(())
+    });
+
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
+        if worker_reached_target(worker_states, plan.worker_id, plan.per_worker_total_target).await
+        {
+            break;
+        }
+        if let Some(t) = ticker.as_mut() {
+            t.tick().await;
+        }
+
+        let Some(prebuilt) = rx_prebuilt.recv().await else {
+            break;
+        };
+        if prebuilt.nonce < *nonce {
+            let mut states = worker_states.lock().await;
+            if let Some(s) = states.iter_mut().find(|s| s.worker_id == plan.worker_id) {
+                s.counters.dropped = s.counters.dropped.saturating_add(1);
+                s.counters.last_error_code = Some("PREBUILD_STALE_NONCE".to_string());
+            }
+            continue;
+        }
+
+        send_one(
+            cfg,
+            plan,
+            signer,
+            chain_id,
+            transport_pool,
+            transport_health,
+            transport_index,
+            nonce,
+            worker_states,
+            true,
+            false,
+            Some(prebuilt),
+            rng,
+        )
+        .await?;
+    }
+
+    drop(rx_prebuilt);
+    match producer.await {
+        Ok(inner) => inner?,
+        Err(err) => return Err(eyre!("prebuild producer task failed: {err}")),
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_one(
     cfg: &ResolvedConfig,
     plan: &WorkerPlan,
     signer: &PrivateKeySigner,
     chain_id: u64,
-    transport_pool: &[IgraTransport<RuntimeTransport>],
+    transport_pool: &[TransportSlot],
+    transport_health: &mut [TransportHealth],
     transport_index: &mut usize,
-    transport: &mut IgraTransport<RuntimeTransport>,
     nonce: &mut u64,
     worker_states: &Arc<Mutex<Vec<WorkerState>>>,
     count_metrics: bool,
+    must_succeed: bool,
+    prebuilt_tx: Option<PrebuiltTx>,
     rng: &mut StdRng,
 ) -> Result<()> {
-    if matches!(cfg.rpc_selection_mode, RpcSelectionMode::RandomPerStep) && transport_pool.len() > 1
-    {
-        *transport_index = rng.random_range(0..transport_pool.len());
-        *transport = transport_pool[*transport_index].clone();
-    }
-
     let to = cfg.explicit_to.unwrap_or(plan.contract);
     let data =
         if let Some(d) = cfg.explicit_data.as_ref() { d.clone() } else { plan.call_data.clone() };
 
-    let raw = build_signed_eip1559(
-        signer,
-        chain_id,
-        *nonce,
-        cfg.gas_limit,
-        cfg.max_fee_per_gas,
-        cfg.max_priority_fee_per_gas,
-        to,
-        &data,
-    )?;
+    let mut local_nonce = prebuilt_tx.as_ref().map(|p| p.nonce).unwrap_or(*nonce);
+    let prebuilt_raw = prebuilt_tx.as_ref().map(|p| p.raw.clone());
+    let mut max_fee_per_gas = cfg.max_fee_per_gas;
+    let mut max_priority_fee_per_gas = cfg.max_priority_fee_per_gas;
+    let mut replacement_attempts = 0u64;
 
-    let send_result = transport.request(send_raw_packet(&raw)).await;
+    loop {
+        let selected_idx = select_transport_index(
+            cfg,
+            transport_pool.len(),
+            transport_health,
+            transport_index,
+            rng,
+        )
+        .await?;
+        *transport_index = selected_idx;
+        let endpoint_id = transport_pool[selected_idx].endpoint_id.clone();
+        let mut transport = transport_pool[selected_idx].transport.clone();
 
-    match send_result {
-        Ok(_) => {
-            *nonce = nonce.saturating_add(1);
-            let mut states = worker_states.lock().await;
-            if let Some(s) = states.iter_mut().find(|s| s.worker_id == plan.worker_id) {
-                s.counters.local_next_nonce = *nonce;
-                s.counters.rpc_pending_nonce = *nonce;
-                s.counters.last_error_code = None;
-                if count_metrics {
-                    s.counters.accepted = s.counters.accepted.saturating_add(1);
-                    s.counters.last_accept_instant = Some(Instant::now());
-                }
+        let raw = if replacement_attempts == 0 {
+            if let Some(raw) = prebuilt_raw.as_ref() {
+                raw.clone()
+            } else {
+                build_signed_eip1559(
+                    signer,
+                    chain_id,
+                    local_nonce,
+                    cfg.gas_limit,
+                    max_fee_per_gas,
+                    max_priority_fee_per_gas,
+                    to,
+                    &data,
+                )?
             }
-            Ok(())
-        }
-        Err(err) => {
-            let err_text = err.to_string();
-            let failure = classify_error(&err_text);
-            if std::env::var_os("IGRA_STRESS_DEBUG_ERRORS").is_some() {
-                eprintln!(
-                    "[igra-loadgen] worker-{:03} send error (class={:?}, nonce={}): {}",
-                    plan.worker_id, failure, *nonce, err_text
-                );
-            }
+        } else {
+            build_signed_eip1559(
+                signer,
+                chain_id,
+                local_nonce,
+                cfg.gas_limit,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                to,
+                &data,
+            )?
+        };
 
-            let mut maybe_refreshed_nonce = None;
-            if err_text.contains("IGRA_NONCE_") || err_text.to_ascii_lowercase().contains("nonce") {
-                maybe_refreshed_nonce =
-                    eth_get_transaction_count_pending(transport, plan.evm_sender).await.ok();
-                if let Some(n) = maybe_refreshed_nonce {
-                    *nonce = n;
-                }
-            }
+        let send_started = Instant::now();
+        let send_result = transport.request(send_raw_packet(&raw)).await;
+        let elapsed_ms = send_started.elapsed().as_millis() as u64;
 
-            if count_metrics {
+        match send_result {
+            Ok(_) => {
+                mark_transport_success(transport_health, selected_idx);
+                local_nonce = local_nonce.saturating_add(1);
+                *nonce = (*nonce).max(local_nonce);
                 let mut states = worker_states.lock().await;
                 if let Some(s) = states.iter_mut().find(|s| s.worker_id == plan.worker_id) {
-                    match failure {
-                        FailureClass::Rejected => {
-                            s.counters.rejected = s.counters.rejected.saturating_add(1)
-                        }
-                        FailureClass::Timeout => {
-                            s.counters.timeout = s.counters.timeout.saturating_add(1)
-                        }
-                        FailureClass::TerminalError => {
-                            s.counters.terminal_error = s.counters.terminal_error.saturating_add(1)
-                        }
+                    s.counters.local_next_nonce = local_nonce;
+                    s.counters.rpc_pending_nonce = local_nonce;
+                    s.counters.last_error_code = None;
+                    s.counters.last_kaspa_rpc_latency_ms = Some(elapsed_ms);
+                    s.counters.active_endpoint = Some(endpoint_id);
+                    if count_metrics {
+                        s.counters.accepted = s.counters.accepted.saturating_add(1);
+                        s.counters.replacement_count_total =
+                            s.counters.replacement_count_total.saturating_add(replacement_attempts);
+                        s.counters.last_accept_instant = Some(Instant::now());
                     }
-                    if let Some(n) = maybe_refreshed_nonce {
-                        s.counters.rpc_pending_nonce = n;
-                        s.counters.local_next_nonce = n;
-                    }
-                    s.counters.last_error_code = Some(classify_error_code(&err_text));
                 }
+                return Ok(());
             }
+            Err(err) => {
+                let err_text = err.to_string();
+                let failure = classify_error(&err_text);
+                if std::env::var_os("IGRA_STRESS_DEBUG_ERRORS").is_some() {
+                    eprintln!(
+                        "[igra-loadgen] worker-{:03} send error (class={:?}, nonce={}, endpoint={}): {}",
+                        plan.worker_id, failure, local_nonce, endpoint_id, err_text
+                    );
+                }
 
-            if matches!(failure, FailureClass::TerminalError) {
-                return Err(eyre!("terminal worker error: {err_text}"));
+                let mut refreshed_nonce = None;
+                let mut refreshed_nonce_latency_ms = None;
+                if err_text.contains("IGRA_NONCE_")
+                    || err_text.to_ascii_lowercase().contains("nonce")
+                {
+                    let t0 = Instant::now();
+                    refreshed_nonce =
+                        eth_get_transaction_count_pending(&mut transport, plan.evm_sender)
+                            .await
+                            .ok();
+                    refreshed_nonce_latency_ms = Some(t0.elapsed().as_millis() as u64);
+                    if let Some(n) = refreshed_nonce {
+                        local_nonce = n;
+                        *nonce = n;
+                    }
+                }
+
+                if matches!(failure, FailureClass::TerminalError | FailureClass::Timeout) {
+                    mark_transport_failure(
+                        transport_health,
+                        selected_idx,
+                        cfg.degraded_pause_max_secs,
+                    );
+                } else {
+                    mark_transport_success(transport_health, selected_idx);
+                }
+
+                let retryable = matches!(failure, FailureClass::Rejected | FailureClass::Timeout);
+                if retryable && replacement_attempts < cfg.max_replacements_per_nonce {
+                    replacement_attempts = replacement_attempts.saturating_add(1);
+                    max_fee_per_gas = bump_fee(max_fee_per_gas, cfg.replacement_fee_bump_pct);
+                    max_priority_fee_per_gas =
+                        bump_fee(max_priority_fee_per_gas, cfg.replacement_fee_bump_pct)
+                            .min(max_fee_per_gas);
+
+                    let backoff = replacement_backoff_secs(cfg, replacement_attempts);
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    continue;
+                }
+
+                if count_metrics {
+                    let mut states = worker_states.lock().await;
+                    if let Some(s) = states.iter_mut().find(|s| s.worker_id == plan.worker_id) {
+                        s.counters.replacement_count_total =
+                            s.counters.replacement_count_total.saturating_add(replacement_attempts);
+                        s.counters.last_error_code = Some(classify_error_code(&err_text));
+                        if let Some(el_ms) = refreshed_nonce_latency_ms {
+                            s.counters.last_el_rpc_latency_ms = Some(el_ms);
+                        }
+                        s.counters.last_kaspa_rpc_latency_ms = Some(elapsed_ms);
+                        s.counters.active_endpoint = Some(endpoint_id);
+                        if let Some(n) = refreshed_nonce {
+                            s.counters.rpc_pending_nonce = n;
+                            s.counters.local_next_nonce = n;
+                        }
+                        match failure {
+                            FailureClass::Rejected => {
+                                s.counters.rejected = s.counters.rejected.saturating_add(1)
+                            }
+                            FailureClass::Timeout => {
+                                s.counters.timeout = s.counters.timeout.saturating_add(1);
+                            }
+                            FailureClass::TerminalError => {
+                                s.counters.terminal_error =
+                                    s.counters.terminal_error.saturating_add(1)
+                            }
+                        }
+                    }
+                }
+
+                if must_succeed {
+                    return Err(eyre!("required send failed: {err_text}"));
+                }
+                if matches!(failure, FailureClass::TerminalError) {
+                    return Err(eyre!("terminal worker error: {err_text}"));
+                }
+                return Ok(());
             }
-
-            Ok(())
         }
     }
 }
@@ -1712,6 +2470,98 @@ fn classify_error_code(err_text: &str) -> String {
     } else {
         "IGRA_ERR".to_string()
     }
+}
+
+async fn select_transport_index(
+    cfg: &ResolvedConfig,
+    pool_len: usize,
+    health: &mut [TransportHealth],
+    current_index: &usize,
+    rng: &mut StdRng,
+) -> Result<usize> {
+    if pool_len == 0 {
+        return Err(eyre!("transport pool is empty"));
+    }
+    let wait_deadline = Instant::now() + Duration::from_secs(cfg.degraded_pause_max_secs.max(1));
+    loop {
+        let now = Instant::now();
+        let healthy: Vec<usize> = health
+            .iter()
+            .enumerate()
+            .filter_map(|(i, h)| {
+                if h.backoff_until.map(|t| now >= t).unwrap_or(true) { Some(i) } else { None }
+            })
+            .collect();
+        if !healthy.is_empty() {
+            if matches!(cfg.rpc_selection_mode, RpcSelectionMode::RandomPerStep) {
+                let idx = rng.random_range(0..healthy.len());
+                return Ok(healthy[idx]);
+            }
+            if healthy.contains(current_index) {
+                return Ok(*current_index);
+            }
+            return Ok(*healthy.first().expect("checked non-empty"));
+        }
+        if Instant::now() >= wait_deadline {
+            return Err(eyre!(
+                "all rpc endpoints remained unhealthy for > {}s",
+                cfg.degraded_pause_max_secs.max(1)
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn mark_transport_success(health: &mut [TransportHealth], idx: usize) {
+    if let Some(h) = health.get_mut(idx) {
+        h.consecutive_failures = 0;
+        h.backoff_until = None;
+    }
+}
+
+fn mark_transport_failure(health: &mut [TransportHealth], idx: usize, max_pause_secs: u64) {
+    if let Some(h) = health.get_mut(idx) {
+        h.consecutive_failures = h.consecutive_failures.saturating_add(1);
+        let exp = h.consecutive_failures.saturating_sub(1).min(6);
+        let base = 2u64.saturating_pow(exp);
+        let pause_secs = base.min(max_pause_secs.max(1));
+        h.backoff_until = Some(Instant::now() + Duration::from_secs(pause_secs));
+    }
+}
+
+fn replacement_backoff_secs(cfg: &ResolvedConfig, attempt: u64) -> u64 {
+    let base = cfg.pending_timeout_secs.max(1);
+    let exp = attempt.saturating_sub(1).min(6);
+    let backoff = base.saturating_mul(2u64.saturating_pow(exp as u32));
+    backoff.min(cfg.replacement_timeout_cap_secs.max(1))
+}
+
+fn bump_fee(value: u128, bump_pct: u64) -> u128 {
+    if bump_pct == 0 {
+        return value;
+    }
+    let bumped = value.saturating_mul(100u128.saturating_add(bump_pct as u128)) / 100;
+    bumped.max(value.saturating_add(1))
+}
+
+fn percentile_u64(samples: &mut [u64], percentile: f64) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let idx = ((samples.len() as f64) * (percentile / 100.0)).ceil() as usize;
+    let idx = idx.saturating_sub(1).min(samples.len().saturating_sub(1));
+    Some(samples[idx])
+}
+
+fn percentile_f64(samples: &mut [f64], percentile: f64) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((samples.len() as f64) * (percentile / 100.0)).ceil() as usize;
+    let idx = idx.saturating_sub(1).min(samples.len().saturating_sub(1));
+    Some(samples[idx])
 }
 
 fn evaluate_windows(cfg: &ResolvedConfig, samples: &[AggregateSample]) -> (f64, f64, f64, bool) {
@@ -1784,11 +2634,9 @@ fn emit_manifest(
     resolved_parameters.insert("IGRA_STRESS_NETWORK", cfg.network.as_str().to_string());
     resolved_parameters.insert("IGRA_STRESS_MODE", cfg.mode.as_str().to_string());
     resolved_parameters.insert("IGRA_STRESS_TARGET_TPS", format!("{}", cfg.target_tps));
-
-    let mut parameter_sources = HashMap::new();
-    for k in resolved_parameters.keys() {
-        parameter_sources.insert(*k, "resolved".to_string());
-    }
+    resolved_parameters.insert("IGRA_STRESS_WORKER_COUNT", format!("{}", cfg.worker_count));
+    resolved_parameters.insert("IGRA_STRESS_EL_RPC_URLS", cfg.el_rpc_urls.join(","));
+    resolved_parameters.insert("IGRA_STRESS_KASPA_RPC_URLS", cfg.kaspa_rpc_urls.join(","));
 
     let mut manifest = json!({
         "schema_version": "1.0.0",
@@ -1801,7 +2649,7 @@ fn emit_manifest(
         "worker_count": cfg.worker_count,
         "wallet_start_index": cfg.wallet_start_index,
         "resolved_parameters": resolved_parameters,
-        "parameter_sources": parameter_sources,
+        "parameter_sources": cfg.parameter_sources,
         "resolved_wallet_index_range": format!("{}..{}", wallet_start, wallet_end),
         "resolved_contract_index_range": format!("{}..{}", wallet_start, wallet_end),
         "resolved_endpoints": {
@@ -1870,6 +2718,69 @@ fn emit_manifest(
     Ok(())
 }
 
+fn emit_calibration_report(cfg: &ResolvedConfig, run_result: &RunResult) -> Result<()> {
+    let metrics_path = cfg.campaign_output_dir.join("metrics.ndjson");
+    if !metrics_path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&metrics_path)
+        .wrap_err_with(|| format!("failed to read metrics file {}", metrics_path.display()))?;
+
+    let mut tps_1s = Vec::<f64>::new();
+    let mut el_rpc_p95_ms = Vec::<u64>::new();
+    let mut kaspa_rpc_p95_ms = Vec::<u64>::new();
+
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(tps) = v.get("tps_1s").and_then(|x| x.as_f64()) {
+            tps_1s.push(tps);
+        }
+        if let Some(el) = v.get("el_rpc_p95_ms").and_then(|x| x.as_u64()) {
+            el_rpc_p95_ms.push(el);
+        }
+        if let Some(k) = v.get("kaspa_rpc_p95_ms").and_then(|x| x.as_u64()) {
+            kaspa_rpc_p95_ms.push(k);
+        }
+    }
+
+    let report = json!({
+        "schema_version": "1.0.0",
+        "network": cfg.network.as_str(),
+        "mode": cfg.mode.as_str(),
+        "target_tps": cfg.target_tps,
+        "worker_count": cfg.worker_count,
+        "totals": {
+            "accepted": run_result.totals.accepted,
+            "rejected": run_result.totals.rejected,
+            "timeout": run_result.totals.timeout,
+            "dropped": run_result.totals.dropped,
+            "terminal_error": run_result.totals.terminal_error,
+        },
+        "failure_ratio": run_result.failure_ratio,
+        "achieved_tps": {
+            "avg": run_result.achieved_tps_avg,
+            "p95_1m_windows": run_result.achieved_tps_p95_1m,
+            "p50_1s": percentile_f64(&mut tps_1s, 50.0),
+            "p95_1s": percentile_f64(&mut tps_1s, 95.0),
+        },
+        "latency_ms": {
+            "el_rpc_p95_observed_p50": percentile_u64(&mut el_rpc_p95_ms, 50.0),
+            "el_rpc_p95_observed_p95": percentile_u64(&mut el_rpc_p95_ms, 95.0),
+            "kaspa_rpc_p95_observed_p50": percentile_u64(&mut kaspa_rpc_p95_ms, 50.0),
+            "kaspa_rpc_p95_observed_p95": percentile_u64(&mut kaspa_rpc_p95_ms, 95.0),
+        },
+        "pass": run_result.pass,
+        "fail_reasons": run_result.fail_reasons,
+    });
+
+    let path = cfg.campaign_output_dir.join("calibration-report.json");
+    fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&report)?))
+        .wrap_err_with(|| format!("failed to write calibration report {}", path.display()))?;
+    Ok(())
+}
+
 fn build_transport(
     el_rpc_url: &str,
     kaspa_rpc_url: &str,
@@ -1895,16 +2806,17 @@ fn build_transport(
     }))
 }
 
-fn build_transport_pool(
-    cfg: &ResolvedConfig,
-    kaspa_key: &str,
-) -> Result<Vec<IgraTransport<RuntimeTransport>>> {
+fn build_transport_pool(cfg: &ResolvedConfig, kaspa_key: &str) -> Result<Vec<TransportSlot>> {
     let mut pool = Vec::new();
     let pair_count = cfg.el_rpc_urls.len().max(cfg.kaspa_rpc_urls.len());
     for i in 0..pair_count {
         let el = &cfg.el_rpc_urls[i % cfg.el_rpc_urls.len()];
         let kaspa = &cfg.kaspa_rpc_urls[i % cfg.kaspa_rpc_urls.len()];
-        pool.push(build_transport(el, kaspa, kaspa_key, cfg)?);
+        let endpoint_id = format!("el={} kaspa={}", el, kaspa);
+        pool.push(TransportSlot {
+            endpoint_id,
+            transport: build_transport(el, kaspa, kaspa_key, cfg)?,
+        });
     }
     Ok(pool)
 }
@@ -2091,6 +3003,28 @@ fn endpoint_set_sha256(el: &[String], kaspa: &[String]) -> String {
     hex::encode(digest)
 }
 
+fn resolve_source(
+    cli_args: &[String],
+    cli_flags: &[&str],
+    env_key: &str,
+    from_file: bool,
+    fallback: &str,
+) -> String {
+    if from_file {
+        return "file".to_string();
+    }
+    if cli_flags
+        .iter()
+        .any(|f| cli_args.iter().any(|arg| arg == f || arg.starts_with(&format!("{f}="))))
+    {
+        return "cli".to_string();
+    }
+    if std::env::var_os(env_key).is_some() {
+        return "env".to_string();
+    }
+    fallback.to_string()
+}
+
 fn parse_csv_list(v: &str) -> Vec<String> {
     v.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
 }
@@ -2144,6 +3078,38 @@ fn kaspa_address_from_private_key_hex(private_key: &str, network: &str) -> Resul
     fixed.copy_from_slice(&bytes);
 
     let secret = KaspaSecretKey::from_slice(&fixed)?;
+    let public_key = kaspa_bip32::secp256k1::PublicKey::from_secret_key_global(&secret);
+    let payload = public_key.x_only_public_key().0.serialize();
+    Ok(KaspaAddress::new(prefix, KaspaAddressVersion::PubKey, &payload))
+}
+
+fn parse_private_key_hex(private_key: &str) -> Result<[u8; 32]> {
+    let key = private_key.trim().strip_prefix("0x").unwrap_or(private_key.trim());
+    let bytes = hex::decode(key).map_err(|err| eyre!("invalid private key hex: {err}"))?;
+    if bytes.len() != 32 {
+        return Err(eyre!("expected 32-byte private key hex"));
+    }
+    let mut fixed = [0u8; 32];
+    fixed.copy_from_slice(&bytes);
+    Ok(fixed)
+}
+
+fn kaspa_network_descriptor(network: &str) -> Result<(KaspaNetworkType, KaspaAddressPrefix)> {
+    Ok(match network {
+        "mainnet" => (KaspaNetworkType::Mainnet, KaspaAddressPrefix::Mainnet),
+        "testnet-10" => (KaspaNetworkType::Testnet, KaspaAddressPrefix::Testnet),
+        "devnet" => (KaspaNetworkType::Devnet, KaspaAddressPrefix::Devnet),
+        "simnet" => (KaspaNetworkType::Simnet, KaspaAddressPrefix::Simnet),
+        other => return Err(eyre!("unsupported kaspa network: {other}")),
+    })
+}
+
+fn kaspa_address_from_private_key(
+    private_key: &[u8; 32],
+    prefix: KaspaAddressPrefix,
+) -> Result<KaspaAddress> {
+    let secret = KaspaSecretKey::from_slice(private_key)
+        .map_err(|err| eyre!("invalid private key: {err}"))?;
     let public_key = kaspa_bip32::secp256k1::PublicKey::from_secret_key_global(&secret);
     let payload = public_key.x_only_public_key().0.serialize();
     Ok(KaspaAddress::new(prefix, KaspaAddressVersion::PubKey, &payload))
@@ -2306,12 +3272,23 @@ mod tests {
             el_rpc_urls: vec!["https://x".to_string()],
             kaspa_rpc_urls: vec!["grpc://y".to_string()],
             endpoint_set_sha256: "x".to_string(),
+            parameter_sources: HashMap::new(),
             contract_base_address: parse_address(DEFAULT_CONTRACT_BASE).expect("base"),
             contract_end_address: parse_address(DEFAULT_CONTRACT_END).expect("end"),
             preflight_balance_check: false,
             prebuild_horizon_secs: 120,
             utxo_refill_lag_secs: 20,
             utxo_safety_factor: 1.5,
+            kaspa_fanout_enabled: false,
+            kaspa_fanout_source_private_key: None,
+            kaspa_fanout_source_mnemonic: None,
+            kaspa_fanout_source_mnemonic_passphrase: None,
+            kaspa_fanout_source_mnemonic_passphrase_as_mnemonic: false,
+            kaspa_fanout_source_mnemonic_passphrase_empty: false,
+            kaspa_fanout_source_mnemonic_index: 0,
+            kaspa_fanout_amount_sompi: 100_000_000,
+            kaspa_fanout_utxos_per_wallet: 1,
+            kaspa_fanout_max_outputs_per_tx: 64,
             kaspa_fee_mode: "estimate".to_string(),
             kaspa_fee_bucket: "normal".to_string(),
             igra_min_fee_floor_gwei_expected: None,
@@ -2331,6 +3308,10 @@ mod tests {
                 timeout_1s: 0,
                 dropped_1s: 0,
                 terminal_error_1s: 0,
+                el_rpc_p95_ms: Some(10),
+                kaspa_rpc_p95_ms: Some(20),
+                el_pending_count: 0,
+                kaspa_mempool_mass_estimate: None,
                 active_workers: 10,
                 stalled_workers: 0,
             });

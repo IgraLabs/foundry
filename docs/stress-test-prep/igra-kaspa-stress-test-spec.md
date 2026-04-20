@@ -294,6 +294,27 @@ Fan-out is optional and controlled by CLI/ENV.
 
 - Use fan-out for first bootstrap or after depletion.
 - Skip fan-out for repeated runs if balances/UTXO pools already prepared.
+- Fan-out must pass Kaspa mempool standardness checks (especially KIP-0009 storage mass) before
+  submission.
+
+Mandatory fan-out standardness requirement (fail-fast):
+
+- `MAXIMUM_STANDARD_TRANSACTION_MASS = 100000` (Kaspa mempool standardness ceiling).
+- Use conservative target `fanout_target_storage_mass = 50000` to keep safety headroom.
+- Let:
+  - `C = STORAGE_MASS_PARAMETER = 1_000_000_000_000`,
+  - `n = kaspa_fanout_max_outputs_per_tx`.
+- Minimum per-output amount must satisfy:
+  - `kaspa_fanout_amount_sompi >= ceil(n * C / fanout_target_storage_mass)`.
+- With these constants:
+  - `kaspa_fanout_amount_sompi >= n * 20_000_000` (0.2 KAS per output per tx).
+
+Runtime policy:
+
+- If computed storage mass for a fan-out batch exceeds `100000` and batch size `> 1`, split batch
+  and retry with smaller batches.
+- If computed storage mass exceeds `100000` for single-output batch, fail fast with required
+  minimum amount hint (do not rely on repeated rejected submissions).
 
 ### 5.2 Quantified UTXO depth requirement (`prebuild-send`)
 
@@ -475,10 +496,18 @@ Stop-condition rules:
 - `--kaspa-funder-private-key` (`IGRA_STRESS_KASPA_FUNDER_PRIVATE_KEY`) or mnemonic source.
 - `--kaspa-fanout-amount-sompi` (`IGRA_STRESS_KASPA_FANOUT_AMOUNT_SOMPI`).
 - `--kaspa-fanout-utxos-per-wallet` (`IGRA_STRESS_KASPA_FANOUT_UTXOS_PER_WALLET`).
+- `--kaspa-fanout-max-outputs-per-tx` (`IGRA_STRESS_KASPA_FANOUT_MAX_OUTPUTS_PER_TX`), default
+  `64`.
 - `--prebuild-horizon-secs` (`IGRA_STRESS_PREBUILD_HORIZON_SECS`), default `120`.
 - `--utxo-refill-lag-secs` (`IGRA_STRESS_UTXO_REFILL_LAG_SECS`), default `20`.
 - `--utxo-safety-factor` (`IGRA_STRESS_UTXO_SAFETY_FACTOR`), default `1.5`.
 - `--preflight-balance-check` (`IGRA_STRESS_PREFLIGHT_BALANCE_CHECK`): `0|1`, default `1`.
+
+Required validation when `kaspa-fanout=1`:
+
+- Runner must reject configuration where `kaspa-fanout-amount-sompi` is below
+  `ceil(kaspa-fanout-max-outputs-per-tx * 1_000_000_000_000 / 50_000)`.
+- This is equivalent to `20_000_000 * kaspa-fanout-max-outputs-per-tx` sompi minimum.
 
 ### 8.5 RPC inputs and selection
 
@@ -853,7 +882,8 @@ comparison.
 1. Choose `target_tps`, `wallet_start_index`, `mode`, stop condition.
 2. Compute required workers and validate index bounds.
 3. If `mode=prebuild-send`, validate UTXO depth formula.
-4. Optionally run Kaspa fan-out (`kaspa-fanout=1`).
+4. If `kaspa-fanout=1`, run fan-out standardness prechecks (amount/output constraints and
+   computed-storage-mass guard), then execute fan-out.
 5. Run preflight balance checks for selected wallet index range when `preflight-balance-check=1`.
 6. Run preflight calibration and fee sampling.
 7. Resolve and record observed IGRA fee floor behavior for active endpoints.
