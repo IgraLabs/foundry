@@ -218,6 +218,9 @@ impl<N: Network> ProviderBuilder<N> {
             kaspa_rpc_url: config.igra.kaspa_rpc_url.clone(),
             kaspa_network: config.igra.kaspa_network.clone(),
             payload_compression: config.igra.payload_compression.clone(),
+            kaspa_utxo_mode: None,
+            kaspa_fee_mode: None,
+            kaspa_fee_bucket: None,
             kaspa_wallet: config.igra.kaspa_wallet.clone(),
         });
 

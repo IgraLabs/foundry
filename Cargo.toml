@@ -22,6 +22,7 @@ members = [
     "crates/fmt/",
     "crates/forge/",
     "crates/igra-kaspa-derive/",
+    "crates/igra-loadgen/",
     "crates/lint/",
     "crates/macros/",
     "crates/primitives/",

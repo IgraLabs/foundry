@@ -170,6 +170,31 @@ pub struct KaspaWalletOpts {
     )]
     pub mnemonic_passphrase_kaspa: Option<String>,
 
+    /// Use the mnemonic phrase itself as the BIP39 passphrase for Kaspa derivation.
+    ///
+    /// This is non-standard behavior and must be explicitly enabled. Useful for reproducing
+    /// certain testnet wallet setups.
+    #[arg(
+        long = "mnemonic-passphrase-kaspa-as-mnemonic",
+        env = "KASPA_MNEMONIC_PASSPHRASE_AS_MNEMONIC",
+        default_value_t = false,
+        conflicts_with = "mnemonic_passphrase_kaspa",
+        conflicts_with = "mnemonic_passphrase_kaspa_empty"
+    )]
+    pub mnemonic_passphrase_kaspa_as_mnemonic: bool,
+
+    /// Explicitly set the Kaspa mnemonic passphrase to the empty string.
+    ///
+    /// This avoids shell-quoting pitfalls when you need to override a previously-set passphrase.
+    #[arg(
+        long = "mnemonic-passphrase-kaspa-empty",
+        env = "KASPA_MNEMONIC_PASSPHRASE_EMPTY",
+        default_value_t = false,
+        conflicts_with = "mnemonic_passphrase_kaspa",
+        conflicts_with = "mnemonic_passphrase_kaspa_as_mnemonic"
+    )]
+    pub mnemonic_passphrase_kaspa_empty: bool,
+
     /// Kaspa mnemonic derivation path override.
     #[arg(
         long = "mnemonic-derivation-path-kaspa",
@@ -210,6 +235,8 @@ impl KaspaWalletOpts {
         self.private_key_kaspa.is_some() ||
             self.mnemonic_kaspa.is_some() ||
             self.mnemonic_passphrase_kaspa.is_some() ||
+            self.mnemonic_passphrase_kaspa_as_mnemonic ||
+            self.mnemonic_passphrase_kaspa_empty ||
             self.mnemonic_derivation_path_kaspa.is_some() ||
             self.mnemonic_index_kaspa.is_some() ||
             self.keystore_kaspa.is_some() ||
@@ -219,10 +246,16 @@ impl KaspaWalletOpts {
 
     /// Converts CLI/env Kaspa options to config shape.
     pub fn as_config(&self) -> IgraKaspaWalletConfig {
+        let mnemonic_passphrase = if self.mnemonic_passphrase_kaspa_empty {
+            Some(String::new())
+        } else {
+            self.mnemonic_passphrase_kaspa.clone()
+        };
         IgraKaspaWalletConfig {
             private_key: self.private_key_kaspa.clone(),
             mnemonic: self.mnemonic_kaspa.clone(),
-            mnemonic_passphrase: self.mnemonic_passphrase_kaspa.clone(),
+            mnemonic_passphrase,
+            mnemonic_passphrase_as_mnemonic: self.mnemonic_passphrase_kaspa_as_mnemonic,
             mnemonic_derivation_path: self.mnemonic_derivation_path_kaspa.clone(),
             mnemonic_index: self.mnemonic_index_kaspa,
             keystore: self.keystore_kaspa.clone(),

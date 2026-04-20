@@ -48,8 +48,11 @@ $ make pr
 ## Contents
 
 - [Architecture](./architecture.md)
+- [IGRA Foundry Fork: Dev Guide](./igra-foundry-fork-dev-guide.md)
 - [IGRA-Kaspa Integration Plan](./igra-kaspa-integration-plan.md)
 - [IGRA Deterministic Harness](./igra-deterministic-harness.md)
+- [IGRA Loadgen (10 Accounts)](./igra-loadgen-10-accounts.md)
+- [Kaspa Mnemonic Passphrase Semantics](./igra-kaspa-mnemonic-passphrase-semantics.md)
 - [Cheatcodes](./cheatcodes.md)
 - [Debugging](./debugging.md)
 - [Scripting](./scripting.md)
