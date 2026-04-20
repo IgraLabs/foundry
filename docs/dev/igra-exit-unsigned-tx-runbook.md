@@ -91,6 +91,58 @@ Rules:
   is not included in the IGRA payload message ID list; it is locked back to the canonical bridge
   multisig P2SH script at `change.derivation_path`.
 
+### Change Back To The Same Canonical Multisig Address
+
+Operators may intentionally send change back to the same canonical multisig address that provided
+the input UTXO. To do that, set `change.derivation_path` to the same path as the spent
+`locking_utxos[*].derivation_path`.
+
+Example:
+
+```json
+{
+  "locking_utxos": [
+    {
+      "transaction_id": "PUT_REAL_KASPA_UTXO_TXID_HERE",
+      "index": 0,
+      "amount_sompi": 100500000,
+      "script_public_key": {
+        "version": 0,
+        "script": "aa205933185b78c71f0833770ca4aa6b62423af00d0efc2832025a23999543f220f787"
+      },
+      "derivation_path": "m/0/0/1"
+    }
+  ],
+  "exits": [
+    {
+      "message_id": "PUT_32_BYTE_EXIT_MESSAGE_ID_HEX_HERE",
+      "recipient": "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e",
+      "amount_sompi": 99000000
+    }
+  ],
+  "change": {
+    "derivation_path": "m/0/0/1",
+    "amount_sompi": 500000
+  },
+  "fee_sompi": 1000000,
+  "multisig": {
+    "minimum_signatures": 2,
+    "extended_public_keys": [
+      "kpub_SIGNER_1_MULTISIG_MASTER_XPUB",
+      "kpub_SIGNER_2_MULTISIG_MASTER_XPUB",
+      "kpub_SIGNER_3_MULTISIG_MASTER_XPUB"
+    ],
+    "ecdsa": false
+  }
+}
+```
+
+This creates an exit output to the recipient and a change output back to the same canonical bridge
+multisig script/address derived from `m/0/0/1`.
+
+This is valid when the bridge operations policy uses one canonical treasury address. If the policy
+rotates addresses, use a fresh canonical receive path such as `m/0/0/2` for change instead.
+
 ## Build Unsigned Exit
 
 For mainnet:
