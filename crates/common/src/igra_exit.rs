@@ -2,8 +2,9 @@ use alloy_primitives::hex;
 use eyre::{Context, Result, bail, eyre};
 use kaspa_addresses::{Address as KaspaAddress, Prefix as KaspaAddressPrefix};
 use kaspa_bip32::{
-    DerivationPath as KaspaDerivationPath, ExtendedPublicKey as KaspaExtendedPublicKey,
-    Prefix as KaspaBip32Prefix, secp256k1::PublicKey as KaspaSecpPublicKey,
+    ChildNumber as KaspaChildNumber, DerivationPath as KaspaDerivationPath,
+    ExtendedPublicKey as KaspaExtendedPublicKey, Prefix as KaspaBip32Prefix,
+    secp256k1::PublicKey as KaspaSecpPublicKey,
 };
 use kaspa_consensus_core::{
     subnets::SubnetworkId,
@@ -24,6 +25,8 @@ pub const IGRA_EXIT_TX_TYPE_ID: u8 = 0x3;
 pub const IGRA_EXIT_PAYLOAD_HEADER: u8 = (IGRA_PROTOCOL_VERSION << 4) | IGRA_EXIT_TX_TYPE_ID;
 pub const KAS_LOCKING_SCRIPT_HEX: &str =
     "aa205933185b78c71f0833770ca4aa6b62423af00d0efc2832025a23999543f220f787";
+const KASPAWALLET_CANONICAL_COSIGNER_INDEX: u32 = 0;
+const KASPAWALLET_EXTERNAL_KEYCHAIN: u32 = 0;
 
 #[derive(Clone, Debug)]
 pub struct BuildExitOptions {
@@ -432,6 +435,12 @@ fn validate_build_input(input: &BuildExitInput) -> Result<()> {
         if utxo.derivation_path.trim().is_empty() {
             bail!("locking_utxos[{index}].derivation_path cannot be empty");
         }
+        if input.multisig.extended_public_keys.len() > 1 {
+            validate_canonical_multisig_receive_derivation_path(
+                &utxo.derivation_path,
+                &format!("locking_utxos[{index}].derivation_path"),
+            )?;
+        }
         let script = decode_fixed_hex(&utxo.script_public_key.script, "locking UTXO script")?;
         if utxo.script_public_key.version != 0 || script != locking_script {
             bail!(
@@ -452,6 +461,37 @@ fn validate_build_input(input: &BuildExitInput) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_canonical_multisig_receive_derivation_path(path: &str, field: &str) -> Result<()> {
+    let path = path
+        .parse::<KaspaDerivationPath>()
+        .wrap_err_with(|| format!("{field} is not a valid Kaspa derivation path"))?;
+    let children = path.as_ref();
+    if children.len() != 3 {
+        bail!(
+            "{field} must use the official kaspawallet canonical multisig receive path m/0/0/<index>"
+        );
+    }
+
+    let cosigner_index = children[0];
+    let keychain = children[1];
+    let address_index = children[2];
+    if is_hardened(cosigner_index) || is_hardened(keychain) || is_hardened(address_index) {
+        bail!("{field} must use non-hardened official kaspawallet child indexes: m/0/0/<index>");
+    }
+    if cosigner_index.index() != KASPAWALLET_CANONICAL_COSIGNER_INDEX {
+        bail!("{field} must use canonical sorted-signer cosigner index 0: m/0/0/<index>");
+    }
+    if keychain.index() != KASPAWALLET_EXTERNAL_KEYCHAIN {
+        bail!("{field} must use kaspawallet external receive keychain 0: m/0/0/<index>");
+    }
+
+    Ok(())
+}
+
+fn is_hardened(child: KaspaChildNumber) -> bool {
+    child.is_hardened()
 }
 
 fn verify_inputs(
@@ -881,6 +921,13 @@ fn prefixed_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn canonical_multisig_receive_derivation_path(address_index: u32) -> String {
+        format!(
+            "m/{}/{}/{}",
+            KASPAWALLET_CANONICAL_COSIGNER_INDEX, KASPAWALLET_EXTERNAL_KEYCHAIN, address_index
+        )
+    }
+
     fn sample_input() -> BuildExitInput {
         BuildExitInput {
             locking_utxos: vec![LockingUtxo {
@@ -892,7 +939,7 @@ mod tests {
                     version: 0,
                     script: KAS_LOCKING_SCRIPT_HEX.to_string(),
                 },
-                derivation_path: "m/0/0".to_string(),
+                derivation_path: canonical_multisig_receive_derivation_path(1),
             }],
             exits: vec![ExitRequest {
                 message_id: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1007,6 +1054,74 @@ mod tests {
             VerifyExitOptions { allow_signatures: false, require_fully_signed: false },
         )
         .expect("verify unsigned exit");
+    }
+
+    #[test]
+    fn derives_official_kaspawallet_canonical_receive_path_public_keys() {
+        let mut input = sample_input();
+        input.multisig.extended_public_keys.reverse();
+        input.locking_utxos[0].derivation_path = canonical_multisig_receive_derivation_path(1);
+
+        let output = build_unsigned_exit(
+            input,
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(30),
+                max_nonce: Some(1_000_000),
+            },
+        )
+        .expect("build unsigned exit");
+        let pst = PartiallySignedTransactionProto::decode(
+            decode_fixed_hex(&output.wallet_hex, "wallet hex").unwrap().as_slice(),
+        )
+        .expect("decode pst");
+        let partial_input = &pst.partially_signed_inputs[0];
+
+        assert_eq!(partial_input.derivation_path, "m/0/0/1");
+        assert_eq!(
+            partial_input
+                .pub_key_signature_pairs
+                .iter()
+                .map(|pair| pair.extended_pub_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                // These values were cross-checked against official kaspawallet's
+                // libkaspawallet/bip32 DeriveFromPath("m/0/0/1").
+                "kpub2HmC6PuGMkqBB1rjvaRTVrKDgBxBFCKXrzHq5GbfHi796kwBAnorViyPyeuqX7SqrRNzPQBteWKpMGi7hyyDSS24bsJtTQyb1YJbeRbnxGy",
+                "kpub2LRq4jzk6NcvqgKzZkgFTsVLqzbFdRe6XtUSEGevhJQKBw9gD8Viq2mh84TqHQvec3N8ZavLrBRE6fGTR4bRPLJgyx9nivnLJSkKBoHhXNq",
+                "kpub2NHxXk4U63VdJZtmiUHxowkG9m7EGA4ERTsHY4Pt51sERVHfVcRr8hWCh76kHnAkUUsNgFyqhbJuFKEsu5yQd9BJkMPzHTY2J1TmteQxWxu",
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_non_canonical_multisig_receive_derivation_path() {
+        let cases = [
+            ("m/0/0", "canonical multisig receive path"),
+            ("m/1/0/1", "cosigner index 0"),
+            ("m/0/1/1", "external receive keychain 0"),
+            ("m/0/0/1'", "non-hardened"),
+        ];
+
+        for (path, expected) in cases {
+            let mut input = sample_input();
+            input.locking_utxos[0].derivation_path = path.to_string();
+            let err = build_unsigned_exit(
+                input,
+                BuildExitOptions {
+                    network: "mainnet".to_string(),
+                    tx_id_prefix: "00".to_string(),
+                    mining_timeout: Duration::from_secs(1),
+                    max_nonce: Some(1),
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "path {path} error did not contain {expected}: {err}"
+            );
+        }
     }
 
     #[test]

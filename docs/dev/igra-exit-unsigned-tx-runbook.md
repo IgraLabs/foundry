@@ -77,8 +77,10 @@ Rules:
 - `sum(locking_utxos.amount_sompi)` must equal `sum(exits.amount_sompi) + fee_sompi`.
 - `extended_public_keys` must be official kaspawallet multisig master public keys, not single-sig
   wallet public keys.
-- `derivation_path` must be the exact official kaspawallet path for the UTXO being spent. Do not
-  guess it on mainnet.
+- `derivation_path` must be the exact official kaspawallet path for the UTXO being spent. For IGRA
+  multisig locking UTXOs, the CLI enforces the canonical receive-path shape `m/0/0/<index>`, where
+  cosigner index `0` means the first signer after sorting all bridge kpubs, and keychain `0` means
+  external receive.
 
 ## Build Unsigned Exit
 
@@ -364,10 +366,9 @@ Alignment conclusion:
   path for the UTXO.
 - The builder correctly writes per-input derived xpubs, not master xpubs.
 - The builder correctly canonicalizes multisig xpub order before deriving per-input xpubs.
-- A path like `m/0/0/0` is valid as a derivation path and was useful for interop testing, but it is
-  not the normal first path produced by `kaspawallet new-address`. For real mainnet UTXOs, use the
-  path that created or tracks the UTXO, commonly shaped as `m/<cosignerIndex>/0/<index>` for receive
-  addresses.
+- A path like `m/0/0/0` is valid as a kaspawallet derivation path, but it is not the normal first
+  path produced by `kaspawallet new-address`. For IGRA exit builds, the CLI now accepts only the
+  canonical sorted-first-signer receive shape `m/0/0/<index>`.
 
 ## Known Limitations
 
