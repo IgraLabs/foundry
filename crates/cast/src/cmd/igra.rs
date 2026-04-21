@@ -51,6 +51,14 @@ pub struct BuildExitArgs {
     #[arg(long)]
     pub max_nonce: Option<u32>,
 
+    /// Allow non-official IGRA locking scripts. Testing only; never use for bridge exits.
+    #[arg(long)]
+    pub allow_non_igra_lock_script_for_testing: bool,
+
+    /// Permit mass-invalid artifacts for signing rehearsal only. Do not broadcast these.
+    #[arg(long)]
+    pub allow_mass_limit_override_for_testing: bool,
+
     /// Overwrite existing output files.
     #[arg(long)]
     pub force: bool,
@@ -73,6 +81,10 @@ pub struct VerifyExitArgs {
     /// Require every input to have at least minimum_signatures populated signatures.
     #[arg(long)]
     pub require_fully_signed: bool,
+
+    /// Allow non-official IGRA locking scripts. Testing only; never use for bridge exits.
+    #[arg(long)]
+    pub allow_non_igra_lock_script_for_testing: bool,
 }
 
 impl IgraArgs {
@@ -106,6 +118,8 @@ impl BuildExitArgs {
                 tx_id_prefix: self.tx_id_prefix,
                 mining_timeout: Duration::from_secs(self.mining_timeout_secs),
                 max_nonce: self.max_nonce,
+                allow_non_igra_lock_script_for_testing: self.allow_non_igra_lock_script_for_testing,
+                allow_mass_limit_override_for_testing: self.allow_mass_limit_override_for_testing,
             },
         )?;
 
@@ -143,6 +157,7 @@ impl VerifyExitArgs {
             VerifyExitOptions {
                 allow_signatures: self.allow_signatures,
                 require_fully_signed: self.require_fully_signed,
+                allow_non_igra_lock_script_for_testing: self.allow_non_igra_lock_script_for_testing,
             },
         )?;
 

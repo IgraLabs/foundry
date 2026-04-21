@@ -7,16 +7,19 @@ use kaspa_bip32::{
     PublicKey as KaspaBip32PublicKey, secp256k1::PublicKey as KaspaSecpPublicKey,
 };
 use kaspa_consensus_core::{
+    config::params::Params as KaspaParams,
+    mass::{MassCalculator as KaspaMassCalculator, UtxoCell, calc_storage_mass},
+    network::NetworkType as KaspaNetworkType,
     subnets::SubnetworkId,
     tx::{
         ScriptPublicKey, Transaction as KaspaTransaction, TransactionId,
         TransactionInput as KaspaTransactionInput, TransactionOutpoint,
-        TransactionOutput as KaspaTransactionOutput,
+        TransactionOutput as KaspaTransactionOutput, UtxoEntry,
     },
 };
 use kaspa_txscript::{
-    multisig_redeem_script, multisig_redeem_script_ecdsa, pay_to_address_script,
-    pay_to_script_hash_script,
+    extract_script_pub_key_address, multisig_redeem_script, multisig_redeem_script_ecdsa,
+    pay_to_address_script, pay_to_script_hash_script, script_builder::ScriptBuilder,
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,10 @@ pub const KAS_LOCKING_SCRIPT_HEX: &str =
     "aa205933185b78c71f0833770ca4aa6b62423af00d0efc2832025a23999543f220f787";
 const KASPAWALLET_CANONICAL_COSIGNER_INDEX: u32 = 0;
 const KASPAWALLET_EXTERNAL_KEYCHAIN: u32 = 0;
+const SOMPI_PER_KAS: u64 = 100_000_000;
+const KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS: u64 = 100_000;
+const KASPA_MINIMUM_RELAY_TRANSACTION_FEE: u64 = 1_000;
+const KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE: usize = 65;
 
 #[derive(Clone, Debug)]
 pub struct BuildExitOptions {
@@ -37,12 +44,15 @@ pub struct BuildExitOptions {
     pub tx_id_prefix: String,
     pub mining_timeout: Duration,
     pub max_nonce: Option<u32>,
+    pub allow_non_igra_lock_script_for_testing: bool,
+    pub allow_mass_limit_override_for_testing: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct VerifyExitOptions {
     pub allow_signatures: bool,
     pub require_fully_signed: bool,
+    pub allow_non_igra_lock_script_for_testing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,6 +62,12 @@ pub struct BuildExitInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change: Option<ChangeOutput>,
     pub fee_sompi: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_kas_amount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fee_kas: Option<String>,
     pub multisig: MultisigSpec,
 }
 
@@ -60,6 +76,14 @@ pub struct LockingUtxo {
     pub transaction_id: String,
     pub index: u32,
     pub amount_sompi: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_kas_amount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub amount_kas: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
     pub script_public_key: ScriptPublicKeyJson,
     pub derivation_path: String,
 }
@@ -75,12 +99,26 @@ pub struct ExitRequest {
     pub message_id: String,
     pub recipient: String,
     pub amount_sompi: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_kas_amount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub amount_kas: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChangeOutput {
     pub derivation_path: String,
     pub amount_sompi: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_kas_amount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub amount_kas: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -101,9 +139,29 @@ pub struct UnsignedExitManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change: Option<ChangeOutput>,
     pub fee_sompi: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_kas_amount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fee_kas: Option<String>,
     pub total_input_sompi: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_kas_amount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub total_input_kas: Option<String>,
     pub total_output_sompi: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_kas_amount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub total_output_kas: Option<String>,
     pub multisig: MultisigSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mass: Option<KaspaMassManifest>,
     pub wallet: WalletArtifactManifest,
 }
 
@@ -113,6 +171,10 @@ pub struct ExitProtocolManifest {
     pub tx_type_id: u8,
     pub payload_header: String,
     pub tx_id_prefix: String,
+    #[serde(
+        serialize_with = "serialize_u32_hex",
+        deserialize_with = "deserialize_u32_hex_or_decimal"
+    )]
     pub nonce: u32,
     pub kaspa_tx_id: String,
     pub payload_hex: String,
@@ -125,6 +187,23 @@ pub struct WalletArtifactManifest {
     pub transaction_version: u16,
     pub inputs: usize,
     pub outputs: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct KaspaMassManifest {
+    pub estimated_signed_compute_mass: u64,
+    pub transient_mass: u64,
+    pub storage_mass: u64,
+    pub effective_mass: u64,
+    pub fee_sompi: u64,
+    pub fee_kas: String,
+    pub minimum_relay_fee_sompi: u64,
+    pub minimum_relay_fee_kas: String,
+    pub standard_transaction_mass_limit: u64,
+    pub block_mass_limit: u64,
+    pub standard_limit_exceeded: bool,
+    pub block_limit_exceeded: bool,
+    pub fee_below_minimum_relay: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -244,10 +323,12 @@ pub fn build_unsigned_exit(
     options: BuildExitOptions,
 ) -> Result<BuildExitOutput> {
     let mut input = input;
-    validate_build_input(&input)?;
+    validate_build_input(&input, options.allow_non_igra_lock_script_for_testing)?;
     input.multisig.extended_public_keys.sort();
 
     let network_prefix = parse_network_prefix(&options.network)?;
+    validate_human_readable_addresses(&input, network_prefix)?;
+    enrich_human_readable_fields(&mut input, network_prefix)?;
     let tx_id_prefix = decode_fixed_hex(&options.tx_id_prefix, "tx-id prefix")?;
     if tx_id_prefix.is_empty() {
         bail!("tx-id prefix cannot be empty");
@@ -287,6 +368,14 @@ pub fn build_unsigned_exit(
 
     let payload = build_payload_with_nonce(IGRA_EXIT_PAYLOAD_HEADER, &payload_l2data, 0);
     let mut tx = KaspaTransaction::new(0, inputs, outputs, 0, SubnetworkId::default(), 0, payload);
+    let mass = calculate_mass_preflight(&tx, &input, &options.network)?;
+    validate_mass_preflight(
+        &mass,
+        &input,
+        network_prefix,
+        &options.network,
+        options.allow_mass_limit_override_for_testing,
+    )?;
     let nonce =
         mine_payload_nonce(&mut tx, &tx_id_prefix, options.mining_timeout, options.max_nonce)?;
 
@@ -312,9 +401,13 @@ pub fn build_unsigned_exit(
         exits: input.exits,
         change: input.change,
         fee_sompi: input.fee_sompi,
+        fee_kas: input.fee_kas,
         total_input_sompi,
+        total_input_kas: Some(sompi_to_kas_string(total_input_sompi)),
         total_output_sompi,
+        total_output_kas: Some(sompi_to_kas_string(total_output_sompi)),
         multisig: input.multisig,
+        mass: Some(mass),
         wallet: WalletArtifactManifest {
             format: "kaspawallet.PartiallySignedTransaction.hex".to_string(),
             hex_sha256: prefixed_hex(&Sha256::digest(wallet_hex.as_bytes())),
@@ -335,13 +428,38 @@ pub fn verify_unsigned_exit(
     if manifest.schema != "igra.exit.unsigned.v1" {
         bail!("unsupported manifest schema: {}", manifest.schema);
     }
-    validate_build_input(&BuildExitInput {
-        locking_utxos: manifest.locking_utxos.clone(),
-        exits: manifest.exits.clone(),
-        change: manifest.change.clone(),
-        fee_sompi: manifest.fee_sompi,
-        multisig: manifest.multisig.clone(),
-    })?;
+    validate_build_input(
+        &BuildExitInput {
+            locking_utxos: manifest.locking_utxos.clone(),
+            exits: manifest.exits.clone(),
+            change: manifest.change.clone(),
+            fee_sompi: manifest.fee_sompi,
+            fee_kas: manifest.fee_kas.clone(),
+            multisig: manifest.multisig.clone(),
+        },
+        options.allow_non_igra_lock_script_for_testing,
+    )?;
+    validate_human_readable_addresses(
+        &BuildExitInput {
+            locking_utxos: manifest.locking_utxos.clone(),
+            exits: manifest.exits.clone(),
+            change: manifest.change.clone(),
+            fee_sompi: manifest.fee_sompi,
+            fee_kas: manifest.fee_kas.clone(),
+            multisig: manifest.multisig.clone(),
+        },
+        parse_network_prefix(&manifest.network)?,
+    )?;
+    validate_amount_kas_field(
+        manifest.total_input_kas.as_deref(),
+        manifest.total_input_sompi,
+        "total_input_kas",
+    )?;
+    validate_amount_kas_field(
+        manifest.total_output_kas.as_deref(),
+        manifest.total_output_sompi,
+        "total_output_kas",
+    )?;
 
     let wallet_bytes = decode_wallet_hex(wallet_hex)?;
     let actual_sha256 = prefixed_hex(&Sha256::digest(wallet_hex.trim().as_bytes()));
@@ -394,8 +512,15 @@ pub fn verify_unsigned_exit(
         bail!("payload hex mismatch");
     }
 
-    verify_inputs(&tx, &pst, manifest, options.allow_signatures)?;
+    verify_inputs(
+        &tx,
+        &pst,
+        manifest,
+        options.allow_signatures,
+        options.allow_non_igra_lock_script_for_testing,
+    )?;
     verify_outputs(&tx, manifest)?;
+    verify_mass_manifest(&tx, manifest)?;
 
     let signed_inputs = pst
         .partially_signed_inputs
@@ -424,7 +549,10 @@ pub fn verify_unsigned_exit(
     })
 }
 
-fn validate_build_input(input: &BuildExitInput) -> Result<()> {
+fn validate_build_input(
+    input: &BuildExitInput,
+    allow_non_igra_lock_script_for_testing: bool,
+) -> Result<()> {
     if input.locking_utxos.is_empty() {
         bail!("at least one KAS locking UTXO is required");
     }
@@ -449,6 +577,11 @@ fn validate_build_input(input: &BuildExitInput) -> Result<()> {
         if utxo.amount_sompi == 0 {
             bail!("locking_utxos[{index}].amount_sompi must be greater than zero");
         }
+        validate_amount_kas_field(
+            utxo.amount_kas.as_deref(),
+            utxo.amount_sompi,
+            &format!("locking_utxos[{index}].amount_kas"),
+        )?;
         if utxo.derivation_path.trim().is_empty() {
             bail!("locking_utxos[{index}].derivation_path cannot be empty");
         }
@@ -459,7 +592,9 @@ fn validate_build_input(input: &BuildExitInput) -> Result<()> {
             )?;
         }
         let script = decode_fixed_hex(&utxo.script_public_key.script, "locking UTXO script")?;
-        if utxo.script_public_key.version != 0 || script != locking_script {
+        if !allow_non_igra_lock_script_for_testing
+            && (utxo.script_public_key.version != 0 || script != locking_script)
+        {
             bail!(
                 "locking_utxos[{index}] is not the IGRA KAS locking script from the transaction protocol spec"
             );
@@ -475,17 +610,28 @@ fn validate_build_input(input: &BuildExitInput) -> Result<()> {
         if exit.amount_sompi == 0 {
             bail!("exits[{index}].amount_sompi must be greater than zero");
         }
+        validate_amount_kas_field(
+            exit.amount_kas.as_deref(),
+            exit.amount_sompi,
+            &format!("exits[{index}].amount_kas"),
+        )?;
     }
 
     if let Some(change) = input.change.as_ref() {
         if change.amount_sompi == 0 {
             bail!("change.amount_sompi must be greater than zero");
         }
+        validate_amount_kas_field(
+            change.amount_kas.as_deref(),
+            change.amount_sompi,
+            "change.amount_kas",
+        )?;
         validate_canonical_multisig_receive_derivation_path(
             &change.derivation_path,
             "change.derivation_path",
         )?;
     }
+    validate_amount_kas_field(input.fee_kas.as_deref(), input.fee_sompi, "fee_kas")?;
 
     Ok(())
 }
@@ -521,11 +667,88 @@ fn is_hardened(child: KaspaChildNumber) -> bool {
     child.is_hardened()
 }
 
+fn validate_amount_kas_field(
+    amount_kas: Option<&str>,
+    amount_sompi: u64,
+    field: &str,
+) -> Result<()> {
+    if let Some(amount_kas) = amount_kas {
+        let parsed = kas_string_to_sompi(amount_kas)
+            .wrap_err_with(|| format!("{field} does not match amount_sompi"))?;
+        if parsed != amount_sompi {
+            bail!(
+                "{field} does not match amount_sompi: {amount_kas} KAS = {parsed} sompi, expected {amount_sompi}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_human_readable_addresses(
+    input: &BuildExitInput,
+    network_prefix: KaspaAddressPrefix,
+) -> Result<()> {
+    for (index, utxo) in input.locking_utxos.iter().enumerate() {
+        if let Some(address) = utxo.address.as_deref() {
+            let expected = locking_utxo_address(utxo, network_prefix)?;
+            if address != expected {
+                bail!(
+                    "locking_utxos[{index}].address does not match script_public_key: {address} != {expected}"
+                );
+            }
+        }
+    }
+
+    if let Some(change) = input.change.as_ref() {
+        if let Some(address) = change.address.as_deref() {
+            let expected = multisig_change_address(change, &input.multisig, network_prefix)?;
+            if address != expected {
+                bail!(
+                    "change.address does not match derivation_path/multisig: {address} != {expected}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn enrich_human_readable_fields(
+    input: &mut BuildExitInput,
+    network_prefix: KaspaAddressPrefix,
+) -> Result<()> {
+    for utxo in &mut input.locking_utxos {
+        utxo.amount_kas = Some(sompi_to_kas_string(utxo.amount_sompi));
+        utxo.address = Some(locking_utxo_address(utxo, network_prefix)?);
+    }
+
+    for exit in &mut input.exits {
+        exit.amount_kas = Some(sompi_to_kas_string(exit.amount_sompi));
+    }
+
+    if let Some(change) = input.change.as_mut() {
+        change.amount_kas = Some(sompi_to_kas_string(change.amount_sompi));
+        change.address = Some(multisig_change_address(change, &input.multisig, network_prefix)?);
+    }
+
+    input.fee_kas = Some(sompi_to_kas_string(input.fee_sompi));
+    Ok(())
+}
+
+fn locking_utxo_address(utxo: &LockingUtxo, network_prefix: KaspaAddressPrefix) -> Result<String> {
+    let script = decode_fixed_hex(&utxo.script_public_key.script, "locking UTXO script")?;
+    let script_public_key = ScriptPublicKey::from_vec(utxo.script_public_key.version, script);
+    Ok(extract_script_pub_key_address(&script_public_key, network_prefix)
+        .wrap_err("failed to derive locking UTXO address from script_public_key")?
+        .to_string())
+}
+
 fn verify_inputs(
     tx: &KaspaTransaction,
     pst: &PartiallySignedTransactionProto,
     manifest: &UnsignedExitManifest,
     allow_signatures: bool,
+    allow_non_igra_lock_script_for_testing: bool,
 ) -> Result<()> {
     let locking_script = kas_locking_script()?;
 
@@ -559,9 +782,18 @@ fn verify_inputs(
         if prev_output.value != manifest_utxo.amount_sompi {
             bail!("partial input {index} prevOutput amount mismatch");
         }
-        if prev_spk.version != manifest_utxo.script_public_key.version as u32
-            || prev_spk.script != locking_script
+        if prev_spk.version != manifest_utxo.script_public_key.version as u32 {
+            bail!("partial input {index} prevOutput scriptPublicKey version mismatch");
+        }
+        if prev_spk.script
+            != decode_fixed_hex(
+                &manifest_utxo.script_public_key.script,
+                "manifest locking UTXO script",
+            )?
         {
+            bail!("partial input {index} prevOutput script mismatch");
+        }
+        if !allow_non_igra_lock_script_for_testing && prev_spk.script != locking_script {
             bail!("partial input {index} prevOutput is not the IGRA KAS locking script");
         }
         if partial_input.minimum_signatures != manifest.multisig.minimum_signatures {
@@ -615,6 +847,341 @@ fn verify_outputs(tx: &KaspaTransaction, manifest: &UnsignedExitManifest) -> Res
     }
 
     Ok(())
+}
+
+fn verify_mass_manifest(tx: &KaspaTransaction, manifest: &UnsignedExitManifest) -> Result<()> {
+    let Some(expected) = manifest.mass.as_ref() else {
+        return Ok(());
+    };
+
+    let actual = calculate_mass_preflight(
+        tx,
+        &BuildExitInput {
+            locking_utxos: manifest.locking_utxos.clone(),
+            exits: manifest.exits.clone(),
+            change: manifest.change.clone(),
+            fee_sompi: manifest.fee_sompi,
+            fee_kas: manifest.fee_kas.clone(),
+            multisig: manifest.multisig.clone(),
+        },
+        &manifest.network,
+    )?;
+    if &actual != expected {
+        bail!("manifest mass preflight does not match transaction data");
+    }
+
+    Ok(())
+}
+
+fn calculate_mass_preflight(
+    tx: &KaspaTransaction,
+    input: &BuildExitInput,
+    network: &str,
+) -> Result<KaspaMassManifest> {
+    let params = KaspaParams::from(parse_kaspa_network_type(network)?);
+    let calculator = KaspaMassCalculator::new_with_consensus_params(&params);
+    let storage_mass = calculate_storage_mass(tx, input, &params)?;
+
+    let mut signed_tx_for_mass = tx.clone();
+    apply_kaspawallet_signature_placeholders(&mut signed_tx_for_mass, input)?;
+    let non_contextual = calculator.calc_non_contextual_masses(&signed_tx_for_mass);
+
+    let estimated_signed_compute_mass = non_contextual.compute_mass;
+    let transient_mass = non_contextual.transient_mass;
+    let effective_mass = estimated_signed_compute_mass.max(transient_mass).max(storage_mass);
+    let minimum_relay_fee_sompi = minimum_required_transaction_relay_fee(effective_mass);
+
+    Ok(KaspaMassManifest {
+        estimated_signed_compute_mass,
+        transient_mass,
+        storage_mass,
+        effective_mass,
+        fee_sompi: input.fee_sompi,
+        fee_kas: sompi_to_kas_string(input.fee_sompi),
+        minimum_relay_fee_sompi,
+        minimum_relay_fee_kas: sompi_to_kas_string(minimum_relay_fee_sompi),
+        standard_transaction_mass_limit: KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS,
+        block_mass_limit: params.max_block_mass,
+        standard_limit_exceeded: estimated_signed_compute_mass
+            > KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS
+            || transient_mass > KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS
+            || storage_mass > KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS,
+        block_limit_exceeded: effective_mass > params.max_block_mass,
+        fee_below_minimum_relay: input.fee_sompi < minimum_relay_fee_sompi,
+    })
+}
+
+fn calculate_storage_mass(
+    tx: &KaspaTransaction,
+    input: &BuildExitInput,
+    params: &KaspaParams,
+) -> Result<u64> {
+    let input_cells = input
+        .locking_utxos
+        .iter()
+        .map(|utxo| {
+            let script = decode_fixed_hex(&utxo.script_public_key.script, "locking UTXO script")?;
+            let entry = UtxoEntry::new(
+                utxo.amount_sompi,
+                ScriptPublicKey::from_vec(utxo.script_public_key.version, script),
+                0,
+                false,
+            );
+            Ok(UtxoCell::from(&entry))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let output_cells = tx.outputs.iter().map(UtxoCell::from).collect::<Vec<_>>();
+    calc_storage_mass(
+        tx.is_coinbase(),
+        input_cells.into_iter(),
+        output_cells.into_iter(),
+        params.storage_mass_parameter,
+    )
+    .ok_or_else(|| eyre!("failed to calculate Kaspa storage mass"))
+}
+
+fn apply_kaspawallet_signature_placeholders(
+    tx: &mut KaspaTransaction,
+    input: &BuildExitInput,
+) -> Result<()> {
+    let sig_op_count = u8::try_from(input.multisig.extended_public_keys.len())
+        .wrap_err("multisig key count exceeds Kaspa sigOpCount range")?;
+
+    for (tx_input, utxo) in tx.inputs.iter_mut().zip(&input.locking_utxos) {
+        tx_input.sig_op_count = sig_op_count;
+        tx_input.signature_script =
+            signature_script_placeholder_for_mass(&input.multisig, &utxo.derivation_path)?;
+    }
+    tx.finalize();
+    Ok(())
+}
+
+fn signature_script_placeholder_for_mass(
+    multisig: &MultisigSpec,
+    derivation_path: &str,
+) -> Result<Vec<u8>> {
+    let mut script_builder = ScriptBuilder::new();
+    let signature = vec![0_u8; KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE];
+    let signature_count = multisig.minimum_signatures.max(1) as usize;
+
+    if multisig.extended_public_keys.len() > 1 {
+        for _ in 0..signature_count {
+            script_builder.add_data(&signature)?;
+        }
+        let redeem_script = multisig_redeem_script_for_path(multisig, derivation_path)?;
+        script_builder.add_data(&redeem_script)?;
+    } else {
+        script_builder.add_data(&signature)?;
+    }
+
+    Ok(script_builder.drain())
+}
+
+fn multisig_redeem_script_for_path(
+    multisig: &MultisigSpec,
+    derivation_path: &str,
+) -> Result<Vec<u8>> {
+    let path = derivation_path
+        .parse::<KaspaDerivationPath>()
+        .wrap_err_with(|| format!("invalid Kaspa derivation path `{derivation_path}`"))?;
+    let derived = multisig
+        .extended_public_keys
+        .iter()
+        .map(|key| {
+            let xpub = key
+                .parse::<KaspaExtendedPublicKey<KaspaSecpPublicKey>>()
+                .wrap_err_with(|| format!("invalid Kaspa extended public key `{key}`"))?;
+            Ok(xpub.derive_path(&path)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if multisig.ecdsa {
+        let public_keys = derived.iter().map(|xpub| xpub.public_key().to_bytes());
+        multisig_redeem_script_ecdsa(public_keys, multisig.minimum_signatures as usize)
+            .wrap_err("failed to build ECDSA multisig redeem script")
+    } else {
+        let public_keys =
+            derived.iter().map(|xpub| xpub.public_key().x_only_public_key().0.serialize());
+        multisig_redeem_script(public_keys, multisig.minimum_signatures as usize)
+            .wrap_err("failed to build multisig redeem script")
+    }
+}
+
+fn validate_mass_preflight(
+    mass: &KaspaMassManifest,
+    input: &BuildExitInput,
+    network_prefix: KaspaAddressPrefix,
+    network: &str,
+    allow_mass_limit_override_for_testing: bool,
+) -> Result<()> {
+    if allow_mass_limit_override_for_testing {
+        return Ok(());
+    }
+
+    let mut failures = Vec::new();
+    if mass.estimated_signed_compute_mass > mass.standard_transaction_mass_limit {
+        failures.push(format!(
+            "estimated signed compute mass {} exceeds standard limit {}",
+            mass.estimated_signed_compute_mass, mass.standard_transaction_mass_limit
+        ));
+    }
+    if mass.transient_mass > mass.standard_transaction_mass_limit {
+        failures.push(format!(
+            "transient mass {} exceeds standard limit {}",
+            mass.transient_mass, mass.standard_transaction_mass_limit
+        ));
+    }
+    if mass.storage_mass > mass.standard_transaction_mass_limit {
+        failures.push(format!(
+            "storage mass {} exceeds standard limit {}",
+            mass.storage_mass, mass.standard_transaction_mass_limit
+        ));
+    }
+    if mass.effective_mass > mass.block_mass_limit {
+        failures.push(format!(
+            "effective mass {} exceeds block mass limit {}",
+            mass.effective_mass, mass.block_mass_limit
+        ));
+    }
+    if mass.fee_below_minimum_relay {
+        failures.push(format!(
+            "fee {} sompi is below minimum relay fee {} sompi for effective mass {}",
+            mass.fee_sompi, mass.minimum_relay_fee_sompi, mass.effective_mass
+        ));
+    }
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let suggestion = mass_rejection_suggestion(input, network_prefix, network)
+        .map(|suggestion| format!(" {suggestion}"))
+        .unwrap_or_else(|err| format!(" Unable to estimate a smaller batch suggestion: {err}"));
+
+    bail!(
+        "Kaspa mass preflight failed: {}.{} This transaction is expected to be rejected by standard kaspad/kaspawallet broadcast; reduce the number of small outputs, increase output amounts, add more aggregate input value, or raise the fee as applicable. Pass --allow-mass-limit-override-for-testing only for non-broadcast signing rehearsals",
+        failures.join("; "),
+        suggestion
+    )
+}
+
+fn mass_rejection_suggestion(
+    input: &BuildExitInput,
+    network_prefix: KaspaAddressPrefix,
+    network: &str,
+) -> Result<String> {
+    let total_input_sompi = input
+        .locking_utxos
+        .iter()
+        .try_fold(0_u64, |sum, utxo| sum.checked_add(utxo.amount_sompi))
+        .ok_or_else(|| eyre!("input total overflows u64"))?;
+
+    let mut best: Option<(usize, u64, KaspaMassManifest)> = None;
+    let mut first_candidate: Option<KaspaMassManifest> = None;
+
+    for exit_count in 1..=input.exits.len() {
+        let selected_exit_sompi = input.exits[..exit_count]
+            .iter()
+            .try_fold(0_u64, |sum, exit| sum.checked_add(exit.amount_sompi))
+            .ok_or_else(|| eyre!("exit total overflows u64"))?;
+        let required_without_change = selected_exit_sompi
+            .checked_add(input.fee_sompi)
+            .ok_or_else(|| eyre!("exit total plus fee overflows u64"))?;
+        if required_without_change > total_input_sompi {
+            break;
+        }
+
+        let change_sompi = total_input_sompi - required_without_change;
+        let Some(candidate_input) =
+            input_with_exit_prefix_and_recalculated_change(input, exit_count, change_sompi)
+        else {
+            continue;
+        };
+        let mass = calculate_input_mass_for_suggestion(&candidate_input, network_prefix, network)?;
+        if exit_count == 1 {
+            first_candidate = Some(mass.clone());
+        }
+        if mass_preflight_passes(&mass) {
+            best = Some((exit_count, change_sompi, mass));
+        }
+    }
+
+    if let Some((exit_count, change_sompi, mass)) = best {
+        return Ok(format!(
+            "Estimated smaller-batch suggestion: at most {exit_count} exit(s) from this input set should fit standard policy if change is recalculated to {} sompi ({} KAS); estimated effective mass {}, storage mass {}, minimum relay fee {} sompi ({} KAS). Re-run build and verify before signing.",
+            change_sompi,
+            sompi_to_kas_string(change_sompi),
+            mass.effective_mass,
+            mass.storage_mass,
+            mass.minimum_relay_fee_sompi,
+            mass.minimum_relay_fee_kas,
+        ));
+    }
+
+    if let Some(mass) = first_candidate {
+        return Ok(format!(
+            "Estimated smaller-batch suggestion: 0 positive exits from this input set appear to fit standard policy; even 1 exit estimates effective mass {}, storage mass {}, minimum relay fee {} sompi ({} KAS).",
+            mass.effective_mass,
+            mass.storage_mass,
+            mass.minimum_relay_fee_sompi,
+            mass.minimum_relay_fee_kas,
+        ));
+    }
+
+    Ok("Estimated smaller-batch suggestion: no valid smaller exit batch could be estimated from this input; provide a change output path or reduce requested spend.".to_string())
+}
+
+fn input_with_exit_prefix_and_recalculated_change(
+    input: &BuildExitInput,
+    exit_count: usize,
+    change_sompi: u64,
+) -> Option<BuildExitInput> {
+    let mut candidate = input.clone();
+    candidate.exits.truncate(exit_count);
+    candidate.change = if change_sompi == 0 {
+        None
+    } else {
+        let mut change = input.change.clone()?;
+        change.amount_sompi = change_sompi;
+        change.amount_kas = Some(sompi_to_kas_string(change_sompi));
+        Some(change)
+    };
+    Some(candidate)
+}
+
+fn calculate_input_mass_for_suggestion(
+    input: &BuildExitInput,
+    network_prefix: KaspaAddressPrefix,
+    network: &str,
+) -> Result<KaspaMassManifest> {
+    let inputs = input
+        .locking_utxos
+        .iter()
+        .map(|utxo| {
+            let txid = parse_transaction_id(&utxo.transaction_id)?;
+            Ok(KaspaTransactionInput::new(
+                TransactionOutpoint::new(txid, utxo.index),
+                Vec::new(),
+                0,
+                0,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let outputs =
+        transaction_outputs(&input.exits, input.change.as_ref(), &input.multisig, network_prefix)?;
+    let payload =
+        build_payload_with_nonce(IGRA_EXIT_PAYLOAD_HEADER, &exit_l2data(&input.exits)?, 0);
+    let tx = KaspaTransaction::new(0, inputs, outputs, 0, SubnetworkId::default(), 0, payload);
+    calculate_mass_preflight(&tx, input, network)
+}
+
+fn mass_preflight_passes(mass: &KaspaMassManifest) -> bool {
+    !mass.standard_limit_exceeded && !mass.block_limit_exceeded && !mass.fee_below_minimum_relay
+}
+
+fn minimum_required_transaction_relay_fee(mass: u64) -> u64 {
+    let fee = mass.saturating_mul(KASPA_MINIMUM_RELAY_TRANSACTION_FEE) / 1_000;
+    fee.max(KASPA_MINIMUM_RELAY_TRANSACTION_FEE)
 }
 
 fn verify_payload(payload: &[u8], exits: &[ExitRequest]) -> Result<u32> {
@@ -876,6 +1443,16 @@ fn multisig_change_output(
     change: &ChangeOutput,
     multisig: &MultisigSpec,
 ) -> Result<KaspaTransactionOutput> {
+    Ok(KaspaTransactionOutput::new(
+        change.amount_sompi,
+        multisig_change_script_public_key(change, multisig)?,
+    ))
+}
+
+fn multisig_change_script_public_key(
+    change: &ChangeOutput,
+    multisig: &MultisigSpec,
+) -> Result<ScriptPublicKey> {
     validate_canonical_multisig_receive_derivation_path(
         &change.derivation_path,
         "change.derivation_path",
@@ -904,7 +1481,18 @@ fn multisig_change_output(
         multisig_redeem_script(public_keys, multisig.minimum_signatures as usize)?
     };
 
-    Ok(KaspaTransactionOutput::new(change.amount_sompi, pay_to_script_hash_script(&redeem_script)))
+    Ok(pay_to_script_hash_script(&redeem_script))
+}
+
+fn multisig_change_address(
+    change: &ChangeOutput,
+    multisig: &MultisigSpec,
+    network_prefix: KaspaAddressPrefix,
+) -> Result<String> {
+    let script_public_key = multisig_change_script_public_key(change, multisig)?;
+    Ok(extract_script_pub_key_address(&script_public_key, network_prefix)
+        .wrap_err("failed to derive multisig change address from derivation_path")?
+        .to_string())
 }
 
 fn derived_extended_public_keys(
@@ -949,6 +1537,18 @@ fn parse_network_prefix(network: &str) -> Result<KaspaAddressPrefix> {
     }
 }
 
+fn parse_kaspa_network_type(network: &str) -> Result<KaspaNetworkType> {
+    match network {
+        "mainnet" => Ok(KaspaNetworkType::Mainnet),
+        "testnet-10" | "testnet" => Ok(KaspaNetworkType::Testnet),
+        "devnet" => Ok(KaspaNetworkType::Devnet),
+        "simnet" => Ok(KaspaNetworkType::Simnet),
+        _ => bail!(
+            "unsupported Kaspa network `{network}`; use mainnet, testnet-10, devnet, or simnet"
+        ),
+    }
+}
+
 fn parse_transaction_id(value: &str) -> Result<TransactionId> {
     let normalized = value.trim().strip_prefix("0x").unwrap_or(value.trim());
     if normalized.len() != 64 {
@@ -973,6 +1573,106 @@ fn decode_fixed_hex(value: &str, field: &str) -> Result<Vec<u8>> {
         bail!("{field} must have an even number of hex characters");
     }
     hex::decode(normalized).wrap_err_with(|| format!("failed to decode {field} hex"))
+}
+
+fn deserialize_optional_kas_amount<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(serde_json::Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err(serde::de::Error::custom("KAS amount must be a string or number")),
+    }
+}
+
+fn serialize_u32_hex<S>(value: &u32, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&format!("0x{value:08x}"))
+}
+
+fn deserialize_u32_hex_or_decimal<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Number(number) => {
+            let value = number
+                .as_u64()
+                .ok_or_else(|| serde::de::Error::custom("nonce must be an unsigned integer"))?;
+            u32::try_from(value).map_err(|_| serde::de::Error::custom("nonce exceeds u32 range"))
+        }
+        serde_json::Value::String(value) => parse_u32_hex_or_decimal(&value)
+            .map_err(|err| serde::de::Error::custom(format!("invalid nonce: {err}"))),
+        _ => Err(serde::de::Error::custom("nonce must be a hex string or unsigned integer")),
+    }
+}
+
+fn parse_u32_hex_or_decimal(value: &str) -> Result<u32> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("nonce cannot be empty");
+    }
+    if let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        if hex.is_empty() {
+            bail!("hex nonce cannot be empty");
+        }
+        if hex.len() > 8 {
+            bail!("hex nonce exceeds 4 bytes");
+        }
+        return u32::from_str_radix(hex, 16).wrap_err("failed to parse hex nonce");
+    }
+    value.parse::<u32>().wrap_err("failed to parse decimal nonce")
+}
+
+fn sompi_to_kas_string(sompi: u64) -> String {
+    format!("{}.{:08}", sompi / SOMPI_PER_KAS, sompi % SOMPI_PER_KAS)
+}
+
+fn kas_string_to_sompi(amount_kas: &str) -> Result<u64> {
+    let value = amount_kas.trim();
+    if value.is_empty() {
+        bail!("KAS amount cannot be empty");
+    }
+    if value.starts_with('-') {
+        bail!("KAS amount cannot be negative");
+    }
+
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fractional = parts.next();
+    if parts.next().is_some() {
+        bail!("KAS amount has more than one decimal point");
+    }
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("KAS amount whole part must contain only digits");
+    }
+
+    let whole_sompi = whole
+        .parse::<u64>()?
+        .checked_mul(SOMPI_PER_KAS)
+        .ok_or_else(|| eyre!("KAS amount overflows u64 sompi"))?;
+    let fractional_sompi = if let Some(fractional) = fractional {
+        if fractional.len() > 8 {
+            bail!("KAS amount cannot have more than 8 decimal places");
+        }
+        if !fractional.bytes().all(|byte| byte.is_ascii_digit()) {
+            bail!("KAS amount fractional part must contain only digits");
+        }
+        let padded = format!("{fractional:0<8}");
+        padded.parse::<u64>()?
+    } else {
+        0
+    };
+
+    whole_sompi.checked_add(fractional_sompi).ok_or_else(|| eyre!("KAS amount overflows u64 sompi"))
 }
 
 fn build_payload_with_nonce(header: u8, l2data: &[u8], nonce: u32) -> Vec<u8> {
@@ -1015,6 +1715,8 @@ mod tests {
                     .to_string(),
                 index: 0,
                 amount_sompi: 300_010_000,
+                amount_kas: None,
+                address: None,
                 script_public_key: ScriptPublicKeyJson {
                     version: 0,
                     script: KAS_LOCKING_SCRIPT_HEX.to_string(),
@@ -1027,9 +1729,11 @@ mod tests {
                 recipient: "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e"
                     .to_string(),
                 amount_sompi: 300_000_000,
+                amount_kas: None,
             }],
             change: None,
             fee_sompi: 10_000,
+            fee_kas: None,
             multisig: MultisigSpec {
                 minimum_signatures: 2,
                 extended_public_keys: vec![
@@ -1051,22 +1755,65 @@ mod tests {
                 tx_id_prefix: "00".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
             },
         )
         .expect("build unsigned exit");
 
         assert_eq!(output.manifest.protocol.payload_header, "0x93");
         assert!(output.manifest.protocol.kaspa_tx_id.starts_with("00"));
+        assert_eq!(
+            serde_json::to_value(&output.manifest).unwrap()["protocol"]["nonce"],
+            serde_json::Value::String(format!("0x{:08x}", output.manifest.protocol.nonce))
+        );
+        assert_eq!(output.manifest.locking_utxos[0].amount_kas.as_deref(), Some("3.00010000"));
+        assert_eq!(output.manifest.exits[0].amount_kas.as_deref(), Some("3.00000000"));
+        assert_eq!(output.manifest.fee_kas.as_deref(), Some("0.00010000"));
+        assert_eq!(output.manifest.total_input_kas.as_deref(), Some("3.00010000"));
+        assert_eq!(output.manifest.total_output_kas.as_deref(), Some("3.00000000"));
+        let mass = output.manifest.mass.as_ref().expect("mass preflight manifest");
+        assert!(!mass.standard_limit_exceeded);
+        assert!(!mass.block_limit_exceeded);
+        assert!(!mass.fee_below_minimum_relay);
+        assert!(mass.storage_mass <= mass.standard_transaction_mass_limit);
+        assert!(
+            output.manifest.locking_utxos[0]
+                .address
+                .as_deref()
+                .is_some_and(|addr| addr.starts_with("kaspa:p"))
+        );
 
         let report = verify_unsigned_exit(
             &output.manifest,
             &output.wallet_hex,
-            VerifyExitOptions { allow_signatures: false, require_fully_signed: false },
+            VerifyExitOptions {
+                allow_signatures: false,
+                require_fully_signed: false,
+                allow_non_igra_lock_script_for_testing: false,
+            },
         )
         .expect("verify unsigned exit");
         assert_eq!(report.input_count, 1);
         assert_eq!(report.output_count, 1);
         assert!(!report.fully_signed);
+
+        let mut tampered = output.manifest.clone();
+        tampered.mass.as_mut().unwrap().storage_mass += 1;
+        assert!(
+            verify_unsigned_exit(
+                &tampered,
+                &output.wallet_hex,
+                VerifyExitOptions {
+                    allow_signatures: false,
+                    require_fully_signed: false,
+                    allow_non_igra_lock_script_for_testing: false,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("manifest mass preflight does not match transaction data")
+        );
     }
 
     #[test]
@@ -1078,6 +1825,8 @@ mod tests {
                 tx_id_prefix: "00".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
             },
         )
         .expect("build unsigned exit");
@@ -1094,7 +1843,11 @@ mod tests {
             verify_unsigned_exit(
                 &output.manifest,
                 &signed_hex,
-                VerifyExitOptions { allow_signatures: false, require_fully_signed: false },
+                VerifyExitOptions {
+                    allow_signatures: false,
+                    require_fully_signed: false,
+                    allow_non_igra_lock_script_for_testing: false
+                },
             )
             .is_err()
         );
@@ -1102,7 +1855,11 @@ mod tests {
         let report = verify_unsigned_exit(
             &output.manifest,
             &signed_hex,
-            VerifyExitOptions { allow_signatures: true, require_fully_signed: false },
+            VerifyExitOptions {
+                allow_signatures: true,
+                require_fully_signed: false,
+                allow_non_igra_lock_script_for_testing: false,
+            },
         )
         .expect("verify signed exit");
         assert_eq!(report.signed_inputs, 1);
@@ -1121,6 +1878,8 @@ mod tests {
                 tx_id_prefix: "00".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
             },
         )
         .expect("build unsigned exit");
@@ -1132,7 +1891,11 @@ mod tests {
         verify_unsigned_exit(
             &output.manifest,
             &output.wallet_hex,
-            VerifyExitOptions { allow_signatures: false, require_fully_signed: false },
+            VerifyExitOptions {
+                allow_signatures: false,
+                require_fully_signed: false,
+                allow_non_igra_lock_script_for_testing: false,
+            },
         )
         .expect("verify unsigned exit");
     }
@@ -1140,10 +1903,12 @@ mod tests {
     #[test]
     fn build_and_verify_exit_with_change_back_to_canonical_multisig() {
         let mut input = sample_input();
-        input.locking_utxos[0].amount_sompi = 301_010_000;
+        input.locking_utxos[0].amount_sompi = 600_010_000;
         input.change = Some(ChangeOutput {
             derivation_path: canonical_multisig_receive_derivation_path(2),
-            amount_sompi: 1_000_000,
+            amount_sompi: 300_000_000,
+            amount_kas: None,
+            address: None,
         });
 
         let output = build_unsigned_exit(
@@ -1153,14 +1918,30 @@ mod tests {
                 tx_id_prefix: "00".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
             },
         )
         .expect("build unsigned exit");
 
         assert_eq!(output.manifest.wallet.outputs, 2);
-        assert_eq!(output.manifest.total_output_sompi, 301_000_000);
-        assert_eq!(output.manifest.change.as_ref().unwrap().amount_sompi, 1_000_000);
+        assert_eq!(output.manifest.total_output_sompi, 600_000_000);
+        assert_eq!(output.manifest.change.as_ref().unwrap().amount_sompi, 300_000_000);
         assert_eq!(output.manifest.change.as_ref().unwrap().derivation_path, "m/0/0/2");
+        assert_eq!(
+            output.manifest.change.as_ref().unwrap().amount_kas.as_deref(),
+            Some("3.00000000")
+        );
+        assert!(
+            output
+                .manifest
+                .change
+                .as_ref()
+                .unwrap()
+                .address
+                .as_deref()
+                .is_some_and(|addr| addr.starts_with("kaspa:p"))
+        );
 
         let pst = PartiallySignedTransactionProto::decode(
             decode_fixed_hex(&output.wallet_hex, "wallet hex").unwrap().as_slice(),
@@ -1175,10 +1956,99 @@ mod tests {
         let report = verify_unsigned_exit(
             &output.manifest,
             &output.wallet_hex,
-            VerifyExitOptions { allow_signatures: false, require_fully_signed: false },
+            VerifyExitOptions {
+                allow_signatures: false,
+                require_fully_signed: false,
+                allow_non_igra_lock_script_for_testing: false,
+            },
         )
         .expect("verify unsigned exit");
         assert_eq!(report.output_count, 2);
+    }
+
+    #[test]
+    fn rejects_non_standard_kaspa_mass_without_testing_override() {
+        let mut input = sample_input();
+        input.locking_utxos = (0..3)
+            .map(|index| {
+                let mut utxo = sample_input().locking_utxos[0].clone();
+                utxo.transaction_id = format!("{:064x}", index + 1);
+                utxo.amount_sompi = 100_000_000;
+                utxo
+            })
+            .collect();
+        input.exits = (0..20)
+            .map(|index| ExitRequest {
+                message_id: format!("0x{:064x}", index + 1),
+                recipient: input.exits[0].recipient.clone(),
+                amount_sompi: 5_000_000,
+                amount_kas: None,
+            })
+            .collect();
+        input.change = Some(ChangeOutput {
+            derivation_path: canonical_multisig_receive_derivation_path(1),
+            amount_sompi: 199_000_000,
+            amount_kas: None,
+            address: None,
+        });
+        input.fee_sompi = 1_000_000;
+
+        let err = build_unsigned_exit(
+            input.clone(),
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(1),
+                max_nonce: Some(1),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
+            },
+        )
+        .unwrap_err();
+        let err = err.to_string();
+        assert!(err.contains("Kaspa mass preflight failed"));
+        assert!(err.contains("storage mass 3975025 exceeds standard limit 100000"));
+        assert!(err.contains("0 positive exits from this input set appear to fit"));
+
+        let mut input_with_larger_exits = input.clone();
+        for exit in &mut input_with_larger_exits.exits {
+            exit.amount_sompi = 10_000_000;
+            exit.amount_kas = None;
+        }
+        input_with_larger_exits.change.as_mut().unwrap().amount_sompi = 99_000_000;
+        input_with_larger_exits.change.as_mut().unwrap().amount_kas = None;
+        let err = build_unsigned_exit(
+            input_with_larger_exits,
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(1),
+                max_nonce: Some(1),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at most 1 exit(s) from this input set should fit"));
+        assert!(err.contains("change is recalculated to 289000000 sompi"));
+
+        let output = build_unsigned_exit(
+            input,
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(30),
+                max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: true,
+            },
+        )
+        .expect("testing override should emit rehearsal artifact");
+        let mass = output.manifest.mass.as_ref().expect("mass preflight manifest");
+        assert_eq!(mass.storage_mass, 3_975_025);
+        assert!(mass.standard_limit_exceeded);
+        assert!(mass.block_limit_exceeded);
     }
 
     #[test]
@@ -1194,6 +2064,8 @@ mod tests {
                 tx_id_prefix: "00".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
             },
         )
         .expect("build unsigned exit");
@@ -1239,6 +2111,8 @@ mod tests {
                     tx_id_prefix: "00".to_string(),
                     mining_timeout: Duration::from_secs(1),
                     max_nonce: Some(1),
+                    allow_non_igra_lock_script_for_testing: false,
+                    allow_mass_limit_override_for_testing: false,
                 },
             )
             .unwrap_err();
@@ -1260,9 +2134,93 @@ mod tests {
                 tx_id_prefix: "00".to_string(),
                 mining_timeout: Duration::from_secs(1),
                 max_nonce: Some(1),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
             },
         )
         .unwrap_err();
         assert!(err.to_string().contains("not the IGRA KAS locking script"));
+    }
+
+    #[test]
+    fn testing_override_allows_non_igra_locking_script() {
+        let mut input = sample_input();
+        input.locking_utxos[0].script_public_key.script =
+            "aa201f3dfb8e24afa4cee432d456b4b6dd8a16b9e3149aa8949cdd8bf8ba5edb736687".to_string();
+
+        let output = build_unsigned_exit(
+            input,
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(1),
+                max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: true,
+                allow_mass_limit_override_for_testing: false,
+            },
+        )
+        .expect("build test non-IGRA lock script");
+
+        assert!(
+            verify_unsigned_exit(
+                &output.manifest,
+                &output.wallet_hex,
+                VerifyExitOptions {
+                    allow_signatures: false,
+                    require_fully_signed: false,
+                    allow_non_igra_lock_script_for_testing: false,
+                },
+            )
+            .is_err()
+        );
+
+        verify_unsigned_exit(
+            &output.manifest,
+            &output.wallet_hex,
+            VerifyExitOptions {
+                allow_signatures: false,
+                require_fully_signed: false,
+                allow_non_igra_lock_script_for_testing: true,
+            },
+        )
+        .expect("verify test non-IGRA lock script");
+    }
+
+    #[test]
+    fn rejects_mismatched_human_readable_amounts_and_addresses() {
+        let mut input = sample_input();
+        input.exits[0].amount_kas = Some("2.99999999".to_string());
+        let err = build_unsigned_exit(
+            input,
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(1),
+                max_nonce: Some(1),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exits[0].amount_kas does not match amount_sompi"));
+
+        let mut input = sample_input();
+        input.locking_utxos[0].address =
+            Some("kaspa:pq0nm7uwyjh6fnhyxt29dd9kmk9pdw0rzjd239yumk9l3wj7mdekvwzglcu9r".to_string());
+        let err = build_unsigned_exit(
+            input,
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(1),
+                max_nonce: Some(1),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("locking_utxos[0].address does not match script_public_key")
+        );
     }
 }

@@ -40,7 +40,9 @@ Create an input file, for example `exit-input.json`:
     {
       "transaction_id": "PUT_REAL_KASPA_UTXO_TXID_HERE",
       "index": 0,
-      "amount_sompi": 100000000,
+      "amount_sompi": 200000000,
+      "amount_kas": "2.00000000",
+      "address": "kaspa:PUT_CANONICAL_MULTISIG_ADDRESS_HERE",
       "script_public_key": {
         "version": 0,
         "script": "aa205933185b78c71f0833770ca4aa6b62423af00d0efc2832025a23999543f220f787"
@@ -52,14 +54,18 @@ Create an input file, for example `exit-input.json`:
     {
       "message_id": "PUT_32_BYTE_EXIT_MESSAGE_ID_HEX_HERE",
       "recipient": "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e",
-      "amount_sompi": 99000000
+      "amount_sompi": 99000000,
+      "amount_kas": "0.99000000"
     }
   ],
   "change": {
     "derivation_path": "m/0/0/2",
-    "amount_sompi": 500000
+    "amount_sompi": 100000000,
+    "amount_kas": "1.00000000",
+    "address": "kaspa:PUT_CHANGE_MULTISIG_ADDRESS_HERE"
   },
   "fee_sompi": 1000000,
+  "fee_kas": "0.01000000",
   "multisig": {
     "minimum_signatures": 2,
     "extended_public_keys": [
@@ -81,6 +87,12 @@ Rules:
 - `sum(locking_utxos.amount_sompi)` must equal `sum(exits.amount_sompi) + fee_sompi`.
 - If `change` is present, the arithmetic becomes
   `sum(locking_utxos.amount_sompi) = sum(exits.amount_sompi) + change.amount_sompi + fee_sompi`.
+- Kaspa storage mass is value-sensitive. Many small outputs, or very small change outputs, can be
+  non-standard even when the transaction byte size looks small.
+- `amount_kas`, `fee_kas`, and address fields are optional in the input JSON, but recommended for
+  operator review. `amount_sompi` remains authoritative. If a readable KAS amount is present, the
+  CLI verifies it is exactly equal to the sompi value. If `locking_utxos[*].address` or
+  `change.address` is present, the CLI verifies it matches the script or derived multisig path.
 - `extended_public_keys` must be official kaspawallet multisig master public keys, not single-sig
   wallet public keys.
 - `derivation_path` must be the exact official kaspawallet path for the UTXO being spent. For IGRA
@@ -105,7 +117,9 @@ Example:
     {
       "transaction_id": "PUT_REAL_KASPA_UTXO_TXID_HERE",
       "index": 0,
-      "amount_sompi": 100500000,
+      "amount_sompi": 200000000,
+      "amount_kas": "2.00000000",
+      "address": "kaspa:PUT_CANONICAL_MULTISIG_ADDRESS_HERE",
       "script_public_key": {
         "version": 0,
         "script": "aa205933185b78c71f0833770ca4aa6b62423af00d0efc2832025a23999543f220f787"
@@ -117,14 +131,18 @@ Example:
     {
       "message_id": "PUT_32_BYTE_EXIT_MESSAGE_ID_HEX_HERE",
       "recipient": "kaspa:qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqkx9awp4e",
-      "amount_sompi": 99000000
+      "amount_sompi": 99000000,
+      "amount_kas": "0.99000000"
     }
   ],
   "change": {
     "derivation_path": "m/0/0/1",
-    "amount_sompi": 500000
+    "amount_sompi": 100000000,
+    "amount_kas": "1.00000000",
+    "address": "kaspa:PUT_CANONICAL_MULTISIG_ADDRESS_HERE"
   },
   "fee_sompi": 1000000,
+  "fee_kas": "0.01000000",
   "multisig": {
     "minimum_signatures": 2,
     "extended_public_keys": [
@@ -160,10 +178,46 @@ Useful optional flags:
 
 - `--mining-timeout-secs 0`: disable timeout while mining the payload nonce.
 - `--max-nonce <N>`: bound the nonce search for tests.
+- `--allow-non-igra-lock-script-for-testing`: permit non-official multisig UTXOs for signing
+  rehearsals only. Do not use this for real bridge exits from the official IGRA lock script.
+- `--allow-mass-limit-override-for-testing`: emit artifacts even when Kaspa mass preflight says the
+  transaction is non-standard. Use only for non-broadcast signing rehearsals.
 - `--force`: overwrite existing output files.
 
 The command mines the 4-byte payload nonce until the Kaspa transaction ID starts with the requested
 hex prefix.
+
+Before mining, the builder performs Kaspa mass preflight using the same KIP-0009 storage-mass
+formula used by kaspad and a kaspawallet-style signed-compute estimate. By default, build fails if:
+
+- estimated signed compute mass exceeds `100000`
+- transient mass exceeds `100000`
+- storage mass exceeds `100000`
+- effective mass exceeds the network block mass limit
+- `fee_sompi` is below the minimum relay fee for the effective mass
+
+For example, 20 outputs of `0.05 KAS` each can produce storage mass around `3975025`, which standard
+mainnet nodes reject with `transaction storage mass ... is larger than max allowed size of 100000`.
+Do not bypass this check for a transaction intended for broadcast. When mass preflight rejects a
+batch, the error also estimates how many exits from the same input set may fit if the batch is split
+and change is recalculated.
+
+The output manifest echoes the normalized readable fields even if they were omitted from the input:
+
+- `protocol.nonce` as a fixed-width 4-byte hex string, for example `0x0000b1b0`
+- `locking_utxos[*].amount_kas` and `locking_utxos[*].address`
+- `exits[*].amount_kas`
+- `change.amount_kas` and `change.address`, when change is present
+- `fee_kas`
+- `total_input_kas`
+- `total_output_kas`
+- `mass.estimated_signed_compute_mass`
+- `mass.transient_mass`
+- `mass.storage_mass`
+- `mass.effective_mass`
+- `mass.minimum_relay_fee_sompi` and `mass.minimum_relay_fee_kas`
+- `mass.standard_limit_exceeded`, `mass.block_limit_exceeded`, and
+  `mass.fee_below_minimum_relay`
 
 The exit payload format is:
 
@@ -224,15 +278,20 @@ For partially signed files:
   --allow-signatures
 ```
 
+If the artifact was intentionally built from a non-official test multisig UTXO, signers must add
+`--allow-non-igra-lock-script-for-testing` to their verification command. Official bridge exits
+must not use that flag.
+
 Each signer should inspect:
 
 - `kaspa_tx_id`
-- `payload_nonce`
+- `payload_nonce`; in the manifest, `protocol.nonce` is the same value encoded as 4-byte hex
 - `payload_header` in the manifest, which must be `0x93`
 - input UTXO txid, index, amount, locking script, and derivation path
 - exit recipient addresses and amounts
 - optional change amount and derivation path
 - `fee_sompi`
+- `mass`; all failure booleans must be `false` for a broadcast-intended transaction
 - `tx_id_prefix`
 - multisig xpubs and `minimum_signatures`
 
@@ -366,8 +425,10 @@ Before signing or broadcasting:
 6. Every input derivation path is known and correct for that UTXO.
 7. Input total equals exit outputs plus optional change output plus fee.
 8. Recipient addresses are correct mainnet `kaspa:` addresses.
-9. Multisig xpubs are official kaspawallet multisig master xpubs.
-10. The final signed file passes `verify-exit --allow-signatures --require-fully-signed`.
+9. Manifest `mass.standard_limit_exceeded`, `mass.block_limit_exceeded`, and
+   `mass.fee_below_minimum_relay` are all `false`.
+10. Multisig xpubs are official kaspawallet multisig master xpubs.
+11. The final signed file passes `verify-exit --allow-signatures --require-fully-signed`.
 
 ## Official Kaspawallet Derivation Path Alignment
 
