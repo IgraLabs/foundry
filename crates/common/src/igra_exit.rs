@@ -222,6 +222,45 @@ pub struct VerifyExitReport {
     pub fully_signed: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct MultisigAddressInput {
+    pub network: String,
+    pub derivation_path: String,
+    pub minimum_signatures: u32,
+    pub extended_public_keys: Vec<String>,
+    pub ecdsa: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MultisigDerivationPathReport {
+    pub path: String,
+    pub canonical: bool,
+    pub cosigner_index: u32,
+    pub keychain: u32,
+    pub address_index: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MultisigAddressReport {
+    pub network: String,
+    pub derivation_path: MultisigDerivationPathReport,
+    pub minimum_signatures: u32,
+    pub ecdsa: bool,
+    pub address: String,
+    pub script_public_key: ScriptPublicKeyJson,
+    pub redeem_script_hex: String,
+    pub sorted_extended_public_keys: Vec<String>,
+    pub derived_extended_public_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MultisigAddressVerificationReport {
+    pub expected_address: String,
+    pub actual_address: String,
+    pub matches: bool,
+    pub derivation: MultisigAddressReport,
+}
+
 #[derive(Clone, PartialEq, Message)]
 struct PartiallySignedTransactionProto {
     #[prost(message, optional, tag = "1")]
@@ -547,6 +586,103 @@ pub fn verify_unsigned_exit(
         signed_inputs,
         fully_signed,
     })
+}
+
+pub fn check_multisig_derivation_path(path: &str) -> Result<MultisigDerivationPathReport> {
+    validate_canonical_multisig_receive_derivation_path(path, "derivation_path")?;
+    let parsed = path
+        .parse::<KaspaDerivationPath>()
+        .wrap_err("derivation_path is not a valid Kaspa derivation path")?;
+    let children = parsed.as_ref();
+    Ok(MultisigDerivationPathReport {
+        path: path.to_string(),
+        canonical: true,
+        cosigner_index: children[0].index(),
+        keychain: children[1].index(),
+        address_index: children[2].index(),
+    })
+}
+
+pub fn derive_multisig_address(input: MultisigAddressInput) -> Result<MultisigAddressReport> {
+    validate_multisig_address_input(&input)?;
+    let network_prefix = parse_network_prefix(&input.network)?;
+    let derivation_path = check_multisig_derivation_path(&input.derivation_path)?;
+    let mut sorted_extended_public_keys = input.extended_public_keys;
+    sorted_extended_public_keys.sort();
+
+    let multisig = MultisigSpec {
+        minimum_signatures: input.minimum_signatures,
+        extended_public_keys: sorted_extended_public_keys.clone(),
+        ecdsa: input.ecdsa,
+    };
+    let redeem_script = multisig_redeem_script_for_path(&multisig, &input.derivation_path)?;
+    let script_public_key = pay_to_script_hash_script(&redeem_script);
+    let address = extract_script_pub_key_address(&script_public_key, network_prefix)
+        .wrap_err("failed to derive multisig address from script_public_key")?
+        .to_string();
+    let derived_extended_public_keys = derived_extended_public_keys(
+        &sorted_extended_public_keys,
+        &input.derivation_path,
+        network_prefix,
+    )?;
+
+    Ok(MultisigAddressReport {
+        network: input.network,
+        derivation_path,
+        minimum_signatures: input.minimum_signatures,
+        ecdsa: input.ecdsa,
+        address,
+        script_public_key: ScriptPublicKeyJson {
+            version: script_public_key.version(),
+            script: hex::encode(script_public_key.script()),
+        },
+        redeem_script_hex: prefixed_hex(&redeem_script),
+        sorted_extended_public_keys,
+        derived_extended_public_keys,
+    })
+}
+
+pub fn verify_multisig_address(
+    input: MultisigAddressInput,
+    expected_address: &str,
+) -> Result<MultisigAddressVerificationReport> {
+    let derivation = derive_multisig_address(input)?;
+    let expected = KaspaAddress::try_from(expected_address)
+        .wrap_err("failed to parse expected multisig address")?;
+    if expected.prefix != parse_network_prefix(&derivation.network)? {
+        bail!(
+            "expected address prefix {} does not match network {}",
+            expected.prefix,
+            derivation.network
+        );
+    }
+
+    Ok(MultisigAddressVerificationReport {
+        expected_address: expected_address.to_string(),
+        actual_address: derivation.address.clone(),
+        matches: derivation.address == expected_address,
+        derivation,
+    })
+}
+
+fn validate_multisig_address_input(input: &MultisigAddressInput) -> Result<()> {
+    if input.minimum_signatures == 0 {
+        bail!("minimum_signatures must be greater than zero");
+    }
+    if input.extended_public_keys.is_empty() {
+        bail!("at least one extended public key is required");
+    }
+    if input.minimum_signatures as usize > input.extended_public_keys.len() {
+        bail!("minimum_signatures cannot exceed extended_public_keys length");
+    }
+    if has_duplicates(&input.extended_public_keys) {
+        bail!("extended_public_keys contains duplicates");
+    }
+    for key in &input.extended_public_keys {
+        key.parse::<KaspaExtendedPublicKey<KaspaSecpPublicKey>>()
+            .wrap_err_with(|| format!("invalid Kaspa extended public key `{key}`"))?;
+    }
+    Ok(())
 }
 
 fn validate_build_input(
@@ -2090,6 +2226,48 @@ mod tests {
                 "kpub2NHxXk4U63VdJZtmiUHxowkG9m7EGA4ERTsHY4Pt51sERVHfVcRr8hWCh76kHnAkUUsNgFyqhbJuFKEsu5yQd9BJkMPzHTY2J1TmteQxWxu",
             ]
         );
+    }
+
+    #[test]
+    fn derives_and_verifies_canonical_multisig_address_helpers() {
+        let input = sample_input();
+        let report = derive_multisig_address(MultisigAddressInput {
+            network: "mainnet".to_string(),
+            derivation_path: canonical_multisig_receive_derivation_path(1),
+            minimum_signatures: input.multisig.minimum_signatures,
+            extended_public_keys: input.multisig.extended_public_keys.clone(),
+            ecdsa: false,
+        })
+        .expect("derive multisig address");
+
+        assert_eq!(report.derivation_path.path, "m/0/0/1");
+        assert!(report.derivation_path.canonical);
+        assert_eq!(report.derivation_path.cosigner_index, 0);
+        assert_eq!(report.derivation_path.keychain, 0);
+        assert_eq!(report.derivation_path.address_index, 1);
+        assert_eq!(report.derived_extended_public_keys.len(), 3);
+        assert_eq!(report.script_public_key.version, 0);
+        assert!(report.script_public_key.script.starts_with("aa20"));
+        assert!(report.address.starts_with("kaspa:p"));
+
+        let verification = verify_multisig_address(
+            MultisigAddressInput {
+                network: "mainnet".to_string(),
+                derivation_path: canonical_multisig_receive_derivation_path(1),
+                minimum_signatures: input.multisig.minimum_signatures,
+                extended_public_keys: input.multisig.extended_public_keys,
+                ecdsa: false,
+            },
+            &report.address,
+        )
+        .expect("verify multisig address");
+        assert!(verification.matches);
+
+        let path_report =
+            check_multisig_derivation_path(&canonical_multisig_receive_derivation_path(1))
+                .expect("check canonical path");
+        assert_eq!(path_report.address_index, 1);
+        assert!(check_multisig_derivation_path("m/1/0/1").is_err());
     }
 
     #[test]

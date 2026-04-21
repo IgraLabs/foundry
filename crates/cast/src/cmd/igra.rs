@@ -1,8 +1,11 @@
 use clap::{Args, Subcommand};
 use eyre::{Result, bail};
 use foundry_common::igra_exit::{
-    BuildExitInput, BuildExitOptions, VerifyExitOptions, build_unsigned_exit, verify_unsigned_exit,
+    BuildExitInput, BuildExitOptions, MultisigAddressInput, VerifyExitOptions, build_unsigned_exit,
+    check_multisig_derivation_path, derive_multisig_address, verify_multisig_address,
+    verify_unsigned_exit,
 };
+use serde::Deserialize;
 use std::{fs, path::PathBuf, time::Duration};
 
 #[derive(Debug, Args)]
@@ -19,6 +22,15 @@ pub enum IgraSubcommand {
     /// Verify an unsigned or partially signed IGRA exit transaction.
     #[command(name = "verify-exit")]
     VerifyExit(VerifyExitArgs),
+    /// Derive an official kaspawallet multisig address from kpubs and a path.
+    #[command(name = "derive-msig-address")]
+    DeriveMsigAddress(DeriveMsigAddressArgs),
+    /// Verify that an address matches kpubs and a kaspawallet multisig path.
+    #[command(name = "verify-msig-address")]
+    VerifyMsigAddress(VerifyMsigAddressArgs),
+    /// Check that a derivation path is the canonical IGRA receive shape.
+    #[command(name = "check-msig-path")]
+    CheckMsigPath(CheckMsigPathArgs),
 }
 
 #[derive(Debug, Args)]
@@ -87,11 +99,68 @@ pub struct VerifyExitArgs {
     pub allow_non_igra_lock_script_for_testing: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct DeriveMsigAddressArgs {
+    /// Kaspa network. Use `mainnet` for real mainnet addresses.
+    #[arg(long)]
+    pub network: String,
+
+    /// Official kaspawallet multisig receive path, usually m/0/0/<index>.
+    #[arg(long)]
+    pub path: String,
+
+    /// Required signatures. Optional when --keys-file contains minimumSignatures.
+    #[arg(long)]
+    pub minimum_signatures: Option<u32>,
+
+    /// Multisig master public key. Repeat once per signer.
+    #[arg(long = "kpub")]
+    pub kpubs: Vec<String>,
+
+    /// Optional official-style keys JSON with publicKeys, minimumSignatures, and ecdsa.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub keys_file: Option<PathBuf>,
+
+    /// Use ECDSA multisig derivation.
+    #[arg(long)]
+    pub ecdsa: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifyMsigAddressArgs {
+    /// Expected Kaspa multisig address.
+    #[arg(long)]
+    pub address: String,
+
+    #[command(flatten)]
+    pub derive: DeriveMsigAddressArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct CheckMsigPathArgs {
+    /// Official kaspawallet multisig receive path to validate.
+    #[arg(long)]
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct KaspawalletPublicKeysFile {
+    #[serde(rename = "publicKeys")]
+    public_keys: Option<Vec<String>>,
+    #[serde(rename = "minimumSignatures")]
+    minimum_signatures: Option<u32>,
+    #[serde(default)]
+    ecdsa: bool,
+}
+
 impl IgraArgs {
     pub async fn run(self) -> Result<()> {
         match self.command {
             IgraSubcommand::BuildExit(args) => args.run(),
             IgraSubcommand::VerifyExit(args) => args.run(),
+            IgraSubcommand::DeriveMsigAddress(args) => args.run(),
+            IgraSubcommand::VerifyMsigAddress(args) => args.run(),
+            IgraSubcommand::CheckMsigPath(args) => args.run(),
         }
     }
 }
@@ -173,6 +242,70 @@ impl VerifyExitArgs {
                 "fully_signed": report.fully_signed,
             }))?
         )?;
+        Ok(())
+    }
+}
+
+impl DeriveMsigAddressArgs {
+    fn run(self) -> Result<()> {
+        let input = self.into_multisig_address_input()?;
+        let report = derive_multisig_address(input)?;
+        foundry_common::sh_println!("{}", serde_json::to_string_pretty(&report)?)?;
+        Ok(())
+    }
+
+    fn into_multisig_address_input(self) -> Result<MultisigAddressInput> {
+        let mut public_keys = self.kpubs;
+        let mut minimum_signatures = self.minimum_signatures;
+        let mut ecdsa = self.ecdsa;
+
+        if let Some(keys_file) = self.keys_file {
+            if !public_keys.is_empty() {
+                bail!("use either --keys-file or repeated --kpub arguments, not both");
+            }
+            let keys_json = fs::read_to_string(&keys_file)?;
+            let keys: KaspawalletPublicKeysFile = serde_json::from_str(&keys_json)?;
+            public_keys = keys.public_keys.ok_or_else(|| {
+                eyre::eyre!("keys file {} is missing publicKeys", keys_file.display())
+            })?;
+            if minimum_signatures.is_none() {
+                minimum_signatures = keys.minimum_signatures;
+            }
+            ecdsa = ecdsa || keys.ecdsa;
+        }
+
+        Ok(MultisigAddressInput {
+            network: self.network,
+            derivation_path: self.path,
+            minimum_signatures: minimum_signatures
+                .ok_or_else(|| eyre::eyre!("--minimum-signatures is required"))?,
+            extended_public_keys: public_keys,
+            ecdsa,
+        })
+    }
+}
+
+impl VerifyMsigAddressArgs {
+    fn run(self) -> Result<()> {
+        let expected_address = self.address;
+        let input = self.derive.into_multisig_address_input()?;
+        let report = verify_multisig_address(input, &expected_address)?;
+        foundry_common::sh_println!("{}", serde_json::to_string_pretty(&report)?)?;
+        if !report.matches {
+            bail!(
+                "multisig address mismatch: expected {}, actual {}",
+                report.expected_address,
+                report.actual_address
+            );
+        }
+        Ok(())
+    }
+}
+
+impl CheckMsigPathArgs {
+    fn run(self) -> Result<()> {
+        let report = check_multisig_derivation_path(&self.path)?;
+        foundry_common::sh_println!("{}", serde_json::to_string_pretty(&report)?)?;
         Ok(())
     }
 }

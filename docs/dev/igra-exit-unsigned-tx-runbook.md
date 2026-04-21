@@ -30,6 +30,114 @@ Use the local binary:
 ./target/debug/cast igra --help
 ```
 
+## Multisig Address Helpers
+
+Before building an exit transaction, operators can independently check the path and derive or verify
+the canonical multisig address from the same kpubs used by the unsigned builder.
+
+The helper public-keys file should contain only public multisig fields copied from the official
+kaspawallet keys JSON:
+
+```json
+{
+  "publicKeys": [
+    "kpub_SIGNER_1_MULTISIG_MASTER_XPUB",
+    "kpub_SIGNER_2_MULTISIG_MASTER_XPUB",
+    "kpub_SIGNER_3_MULTISIG_MASTER_XPUB"
+  ],
+  "minimumSignatures": 2,
+  "ecdsa": false
+}
+```
+
+Do not include encrypted mnemonics, private keys, passwords, or other wallet-secret fields in this
+helper file. The `publicKeys` values must be the multisig master kpubs from kaspawallet, not
+already-derived child kpubs.
+
+Check that a path is the canonical IGRA receive shape:
+
+```bash
+./target/debug/cast igra check-msig-path \
+  --path m/0/0/1
+```
+
+Expected output:
+
+```json
+{
+  "path": "m/0/0/1",
+  "canonical": true,
+  "cosigner_index": 0,
+  "keychain": 0,
+  "address_index": 1
+}
+```
+
+The path format is:
+
+```text
+m/<cosignerIndex>/<keychain>/<addressIndex>
+```
+
+For canonical IGRA receive addresses, `cosignerIndex` must be `0`, `keychain` must be `0`, and all
+indexes must be non-hardened. `cosignerIndex = 0` means the first signer after sorting the bridge
+kpubs. `keychain = 0` means the external receive keychain used by kaspawallet.
+
+Derive the canonical address from an official-style public keys file:
+
+```bash
+./target/debug/cast igra derive-msig-address \
+  --network mainnet \
+  --path m/0/0/1 \
+  --keys-file msig-public-keys.json
+```
+
+For example, with the current mainnet test multisig public keys:
+
+```json
+{
+  "publicKeys": [
+    "kpub2J6iiGuzPiZMkr275HtuRX7Z5MdPaWj5piY4iZNYJhwMtDY4AEJ4bv6hXXms39kcsg1byFPCb8LeP6S7aMABFQEBWevyLxN9a4Q7wsbxqVB",
+    "kpub2JWDD3DcwxNQPQ4sTRdVuPWoK3ZjmohQi1ZQ6kjAW7sYVRbidWFC1taYm6BUg9oySMEhP8Pte7A19zxG86NRqVnuX1jZYp6bZXBRhLwTdRX",
+    "kpub2KU4xudChpxnqvDBMUSx3g6mGYNjeDnzy12xJ5LF4Z3aFQe9ZAo8wJoFUvHqRThLNs6MkTU4sXpaiYmxH8jYSFw3n6KuynAQXqBJeNMNRvx"
+  ],
+  "minimumSignatures": 2,
+  "ecdsa": false
+}
+```
+
+the helper derives:
+
+```text
+kaspa:pq0nm7uwyjh6fnhyxt29dd9kmk9pdw0rzjd239yumk9l3wj7mdekvwzglcu9r
+```
+
+The same command also supports repeated `--kpub` arguments instead of `--keys-file`:
+
+```bash
+./target/debug/cast igra derive-msig-address \
+  --network mainnet \
+  --path m/0/0/1 \
+  --minimum-signatures 2 \
+  --kpub kpub_SIGNER_1_MULTISIG_MASTER_XPUB \
+  --kpub kpub_SIGNER_2_MULTISIG_MASTER_XPUB \
+  --kpub kpub_SIGNER_3_MULTISIG_MASTER_XPUB
+```
+
+Verify an expected address:
+
+```bash
+./target/debug/cast igra verify-msig-address \
+  --address kaspa:EXPECTED_MULTISIG_ADDRESS \
+  --network mainnet \
+  --path m/0/0/1 \
+  --keys-file msig-public-keys.json
+```
+
+These helpers sort the master kpubs, derive per-path xpubs, build the multisig redeem script, derive
+the P2SH script/address, and report the derived keys and script data as JSON. `verify-msig-address`
+exits with an error if the derived address does not match `--address`.
+
 ## Input JSON
 
 Create an input file, for example `exit-input.json`:
