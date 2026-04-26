@@ -18,16 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "aead"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
-dependencies = [
- "crypto-common",
- "generic-array",
-]
-
-[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1262,18 +1252,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "argon2"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
-dependencies = [
- "base64ct",
- "blake2",
- "cpufeatures",
- "password-hash",
-]
-
-[[package]]
 name = "ark-bls12-381"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2437,15 +2415,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blake2"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
-dependencies = [
- "digest 0.10.7",
-]
-
-[[package]]
 name = "blake2b_simd"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2921,30 +2890,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
-name = "chacha20"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
-dependencies = [
- "cfg-if",
- "cipher",
- "cpufeatures",
-]
-
-[[package]]
-name = "chacha20poly1305"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
-dependencies = [
- "aead",
- "chacha20",
- "cipher",
- "poly1305",
- "zeroize",
-]
-
-[[package]]
 name = "chisel"
 version = "1.6.0"
 dependencies = [
@@ -3028,7 +2973,6 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
- "zeroize",
 ]
 
 [[package]]
@@ -3592,7 +3536,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array",
- "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -5027,13 +4970,12 @@ dependencies = [
  "foundry-config",
  "itertools 0.14.0",
  "jiff",
- "kaspa-addresses 1.1.0-rc.3",
- "kaspa-bip32 1.1.0-rc.3",
- "kaspa-consensus-core 1.1.0-rc.3",
+ "kaspa-addresses",
+ "kaspa-bip32",
+ "kaspa-consensus-core",
  "kaspa-grpc-client",
- "kaspa-rpc-core 1.1.0-rc.3",
- "kaspa-txscript 1.1.0-rc.3",
- "kaswallet-common",
+ "kaspa-rpc-core",
+ "kaspa-txscript",
  "num-format",
  "path-slash",
  "prost 0.13.5",
@@ -6382,10 +6324,10 @@ version = "1.6.0"
 dependencies = [
  "clap",
  "eyre",
- "kaspa-addresses 1.1.0-rc.3",
- "kaspa-bip32 1.1.0-rc.3",
+ "kaspa-addresses",
+ "kaspa-bip32",
  "kaspa-grpc-client",
- "kaspa-rpc-core 1.1.0-rc.3",
+ "kaspa-rpc-core",
  "serde",
  "serde_json",
  "tokio",
@@ -6792,22 +6734,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-addresses"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "borsh",
- "js-sys",
- "serde",
- "smallvec",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "workflow-log",
- "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-addresses"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "borsh",
  "js-sys",
@@ -6821,42 +6749,16 @@ dependencies = [
 
 [[package]]
 name = "kaspa-bip32"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "borsh",
- "bs58",
- "getrandom 0.2.17",
- "hmac",
- "js-sys",
- "kaspa-consensus-core 1.0.1",
- "kaspa-utils 1.0.1",
- "once_cell",
- "pbkdf2 0.12.2",
- "rand 0.8.5",
- "rand_core 0.6.4",
- "ripemd",
- "secp256k1 0.29.1",
- "serde",
- "sha2",
- "subtle",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "workflow-wasm",
- "zeroize",
-]
-
-[[package]]
-name = "kaspa-bip32"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "borsh",
  "bs58",
  "getrandom 0.2.17",
  "hmac",
  "js-sys",
- "kaspa-consensus-core 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-consensus-core",
+ "kaspa-utils",
  "once_cell",
  "pbkdf2 0.12.2",
  "rand 0.8.5",
@@ -6874,36 +6776,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-consensus-client"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "ahash",
- "cfg-if",
- "faster-hex",
- "hex",
- "itertools 0.13.0",
- "js-sys",
- "kaspa-addresses 1.0.1",
- "kaspa-consensus-core 1.0.1",
- "kaspa-hashes 1.0.1",
- "kaspa-math 1.0.1",
- "kaspa-txscript 1.0.1",
- "kaspa-utils 1.0.1",
- "kaspa-wasm-core 1.0.1",
- "rand 0.8.5",
- "secp256k1 0.29.1",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "workflow-log",
- "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-consensus-client"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "ahash",
  "cfg-if",
@@ -6911,13 +6785,13 @@ dependencies = [
  "hex",
  "itertools 0.13.0",
  "js-sys",
- "kaspa-addresses 1.1.0-rc.3",
- "kaspa-consensus-core 1.1.0-rc.3",
- "kaspa-hashes 1.1.0-rc.3",
- "kaspa-math 1.1.0-rc.3",
- "kaspa-txscript 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
- "kaspa-wasm-core 1.1.0-rc.3",
+ "kaspa-addresses",
+ "kaspa-consensus-core",
+ "kaspa-hashes",
+ "kaspa-math",
+ "kaspa-txscript",
+ "kaspa-utils",
+ "kaspa-wasm-core",
  "rand 0.8.5",
  "secp256k1 0.29.1",
  "serde",
@@ -6931,44 +6805,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-consensus-core"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "arc-swap",
- "async-trait",
- "bitflags 2.10.0",
- "borsh",
- "cfg-if",
- "faster-hex",
- "futures-util",
- "getrandom 0.2.17",
- "itertools 0.13.0",
- "js-sys",
- "kaspa-addresses 1.0.1",
- "kaspa-core 1.0.1",
- "kaspa-hashes 1.0.1",
- "kaspa-math 1.0.1",
- "kaspa-merkle 1.0.1",
- "kaspa-muhash 1.0.1",
- "kaspa-txscript-errors 1.0.1",
- "kaspa-utils 1.0.1",
- "rand 0.8.5",
- "secp256k1 0.29.1",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "smallvec",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "workflow-core",
- "workflow-log",
- "workflow-serializer",
- "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-consensus-core"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -6980,14 +6818,14 @@ dependencies = [
  "getrandom 0.2.17",
  "itertools 0.13.0",
  "js-sys",
- "kaspa-addresses 1.1.0-rc.3",
- "kaspa-core 1.1.0-rc.3",
- "kaspa-hashes 1.1.0-rc.3",
- "kaspa-math 1.1.0-rc.3",
- "kaspa-merkle 1.1.0-rc.3",
- "kaspa-muhash 1.1.0-rc.3",
- "kaspa-txscript-errors 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-addresses",
+ "kaspa-core",
+ "kaspa-hashes",
+ "kaspa-math",
+ "kaspa-merkle",
+ "kaspa-muhash",
+ "kaspa-txscript-errors",
+ "kaspa-utils",
  "rand 0.8.5",
  "secp256k1 0.29.1",
  "serde",
@@ -7004,37 +6842,18 @@ dependencies = [
 
 [[package]]
 name = "kaspa-consensus-notify"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "async-channel 2.5.0",
- "cfg-if",
- "derive_more 0.99.20",
- "futures",
- "kaspa-consensus-core 1.0.1",
- "kaspa-core 1.0.1",
- "kaspa-hashes 1.0.1",
- "kaspa-notify 1.0.1",
- "kaspa-utils 1.0.1",
- "log",
- "paste",
- "thiserror 1.0.69",
- "triggered",
-]
-
-[[package]]
-name = "kaspa-consensus-notify"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "async-channel 2.5.0",
  "cfg-if",
  "derive_more 0.99.20",
  "futures",
- "kaspa-consensus-core 1.1.0-rc.3",
- "kaspa-core 1.1.0-rc.3",
- "kaspa-hashes 1.1.0-rc.3",
- "kaspa-notify 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-consensus-core",
+ "kaspa-core",
+ "kaspa-hashes",
+ "kaspa-notify",
+ "kaspa-utils",
  "log",
  "paste",
  "thiserror 1.0.69",
@@ -7043,42 +6862,18 @@ dependencies = [
 
 [[package]]
 name = "kaspa-consensus-wasm"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "cfg-if",
- "faster-hex",
- "js-sys",
- "kaspa-addresses 1.0.1",
- "kaspa-consensus-client 1.0.1",
- "kaspa-consensus-core 1.0.1",
- "kaspa-hashes 1.0.1",
- "kaspa-txscript 1.0.1",
- "kaspa-utils 1.0.1",
- "rand 0.8.5",
- "secp256k1 0.29.1",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "workflow-log",
- "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-consensus-wasm"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "cfg-if",
  "faster-hex",
  "js-sys",
- "kaspa-addresses 1.1.0-rc.3",
- "kaspa-consensus-client 1.1.0-rc.3",
- "kaspa-consensus-core 1.1.0-rc.3",
- "kaspa-hashes 1.1.0-rc.3",
- "kaspa-txscript 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-addresses",
+ "kaspa-consensus-client",
+ "kaspa-consensus-core",
+ "kaspa-hashes",
+ "kaspa-txscript",
+ "kaspa-utils",
  "rand 0.8.5",
  "secp256k1 0.29.1",
  "serde",
@@ -7092,27 +6887,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-core"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "anyhow",
- "cfg-if",
- "ctrlc",
- "futures-util",
- "intertrait",
- "log",
- "log4rs",
- "num_cpus",
- "thiserror 1.0.69",
- "tokio",
- "triggered",
- "wasm-bindgen",
- "workflow-log",
-]
-
-[[package]]
-name = "kaspa-core"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -7132,6 +6908,7 @@ dependencies = [
 [[package]]
 name = "kaspa-grpc-client"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "async-channel 2.5.0",
  "async-stream",
@@ -7141,11 +6918,11 @@ dependencies = [
  "futures-util",
  "h2",
  "itertools 0.13.0",
- "kaspa-core 1.1.0-rc.3",
+ "kaspa-core",
  "kaspa-grpc-core",
- "kaspa-notify 1.1.0-rc.3",
- "kaspa-rpc-core 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-notify",
+ "kaspa-rpc-core",
+ "kaspa-utils",
  "kaspa-utils-tower",
  "log",
  "parking_lot",
@@ -7164,6 +6941,7 @@ dependencies = [
 [[package]]
 name = "kaspa-grpc-core"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "async-channel 2.5.0",
  "async-stream",
@@ -7171,12 +6949,12 @@ dependencies = [
  "faster-hex",
  "futures",
  "h2",
- "kaspa-addresses 1.1.0-rc.3",
- "kaspa-consensus-core 1.1.0-rc.3",
- "kaspa-core 1.1.0-rc.3",
- "kaspa-notify 1.1.0-rc.3",
- "kaspa-rpc-core 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-addresses",
+ "kaspa-consensus-core",
+ "kaspa-core",
+ "kaspa-notify",
+ "kaspa-rpc-core",
+ "kaspa-utils",
  "log",
  "paste",
  "prost 0.13.5",
@@ -7193,33 +6971,15 @@ dependencies = [
 
 [[package]]
 name = "kaspa-hashes"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "blake2b_simd",
- "borsh",
- "cc",
- "faster-hex",
- "js-sys",
- "kaspa-utils 1.0.1",
- "keccak",
- "once_cell",
- "serde",
- "sha2",
- "wasm-bindgen",
- "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-hashes"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "blake2b_simd",
  "borsh",
  "cc",
  "faster-hex",
  "js-sys",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-utils",
  "keccak",
  "once_cell",
  "serde",
@@ -7230,36 +6990,17 @@ dependencies = [
 
 [[package]]
 name = "kaspa-index-core"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "async-channel 2.5.0",
- "async-trait",
- "derive_more 0.99.20",
- "futures",
- "kaspa-consensus-core 1.0.1",
- "kaspa-hashes 1.0.1",
- "kaspa-notify 1.0.1",
- "kaspa-utils 1.0.1",
- "log",
- "paste",
- "serde",
- "thiserror 1.0.69",
- "triggered",
-]
-
-[[package]]
-name = "kaspa-index-core"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "async-channel 2.5.0",
  "async-trait",
  "derive_more 0.99.20",
  "futures",
- "kaspa-consensus-core 1.1.0-rc.3",
- "kaspa-hashes 1.1.0-rc.3",
- "kaspa-notify 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-consensus-core",
+ "kaspa-hashes",
+ "kaspa-notify",
+ "kaspa-utils",
  "log",
  "paste",
  "serde",
@@ -7269,32 +7010,13 @@ dependencies = [
 
 [[package]]
 name = "kaspa-math"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "borsh",
- "faster-hex",
- "js-sys",
- "kaspa-utils 1.0.1",
- "malachite-base",
- "malachite-nz",
- "serde",
- "serde-wasm-bindgen",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "workflow-core",
- "workflow-log",
- "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-math"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "borsh",
  "faster-hex",
  "js-sys",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-utils",
  "malachite-base",
  "malachite-nz",
  "serde",
@@ -7308,61 +7030,36 @@ dependencies = [
 
 [[package]]
 name = "kaspa-merkle"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "kaspa-hashes 1.0.1",
-]
-
-[[package]]
-name = "kaspa-merkle"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
- "kaspa-hashes 1.1.0-rc.3",
-]
-
-[[package]]
-name = "kaspa-mining-errors"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "kaspa-consensus-core 1.0.1",
- "thiserror 1.0.69",
+ "kaspa-hashes",
 ]
 
 [[package]]
 name = "kaspa-mining-errors"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
- "kaspa-consensus-core 1.1.0-rc.3",
+ "kaspa-consensus-core",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "kaspa-muhash"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "kaspa-hashes 1.0.1",
- "kaspa-math 1.0.1",
- "rand_chacha 0.3.1",
- "serde",
-]
-
-[[package]]
-name = "kaspa-muhash"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
- "kaspa-hashes 1.1.0-rc.3",
- "kaspa-math 1.1.0-rc.3",
+ "kaspa-hashes",
+ "kaspa-math",
  "rand_chacha 0.3.1",
  "serde",
 ]
 
 [[package]]
 name = "kaspa-notify"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
+version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "async-channel 2.5.0",
  "async-trait",
@@ -7372,44 +7069,13 @@ dependencies = [
  "futures-util",
  "indexmap 2.13.0",
  "itertools 0.13.0",
- "kaspa-addresses 1.0.1",
- "kaspa-consensus-core 1.0.1",
- "kaspa-core 1.0.1",
- "kaspa-hashes 1.0.1",
- "kaspa-txscript 1.0.1",
- "kaspa-txscript-errors 1.0.1",
- "kaspa-utils 1.0.1",
- "log",
- "parking_lot",
- "paste",
- "rand 0.8.5",
- "serde",
- "thiserror 1.0.69",
- "triggered",
- "workflow-core",
- "workflow-log",
- "workflow-serializer",
-]
-
-[[package]]
-name = "kaspa-notify"
-version = "1.1.0-rc.3"
-dependencies = [
- "async-channel 2.5.0",
- "async-trait",
- "borsh",
- "derive_more 0.99.20",
- "futures",
- "futures-util",
- "indexmap 2.13.0",
- "itertools 0.13.0",
- "kaspa-addresses 1.1.0-rc.3",
- "kaspa-consensus-core 1.1.0-rc.3",
- "kaspa-core 1.1.0-rc.3",
- "kaspa-hashes 1.1.0-rc.3",
- "kaspa-txscript 1.1.0-rc.3",
- "kaspa-txscript-errors 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-addresses",
+ "kaspa-consensus-core",
+ "kaspa-core",
+ "kaspa-hashes",
+ "kaspa-txscript",
+ "kaspa-txscript-errors",
+ "kaspa-utils",
  "log",
  "parking_lot",
  "paste",
@@ -7424,49 +7090,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-rpc-core"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "async-channel 2.5.0",
- "async-trait",
- "borsh",
- "cfg-if",
- "derive_more 0.99.20",
- "downcast",
- "faster-hex",
- "hex",
- "js-sys",
- "kaspa-addresses 1.0.1",
- "kaspa-consensus-client 1.0.1",
- "kaspa-consensus-core 1.0.1",
- "kaspa-consensus-notify 1.0.1",
- "kaspa-consensus-wasm 1.0.1",
- "kaspa-core 1.0.1",
- "kaspa-hashes 1.0.1",
- "kaspa-index-core 1.0.1",
- "kaspa-math 1.0.1",
- "kaspa-mining-errors 1.0.1",
- "kaspa-notify 1.0.1",
- "kaspa-rpc-macros 1.0.1",
- "kaspa-txscript 1.0.1",
- "kaspa-utils 1.0.1",
- "log",
- "paste",
- "rand 0.8.5",
- "serde",
- "serde-wasm-bindgen",
- "smallvec",
- "thiserror 1.0.69",
- "uuid 1.20.0",
- "wasm-bindgen",
- "workflow-core",
- "workflow-serializer",
- "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-rpc-core"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "async-channel 2.5.0",
  "async-trait",
@@ -7477,20 +7102,20 @@ dependencies = [
  "faster-hex",
  "hex",
  "js-sys",
- "kaspa-addresses 1.1.0-rc.3",
- "kaspa-consensus-client 1.1.0-rc.3",
- "kaspa-consensus-core 1.1.0-rc.3",
- "kaspa-consensus-notify 1.1.0-rc.3",
- "kaspa-consensus-wasm 1.1.0-rc.3",
- "kaspa-core 1.1.0-rc.3",
- "kaspa-hashes 1.1.0-rc.3",
- "kaspa-index-core 1.1.0-rc.3",
- "kaspa-math 1.1.0-rc.3",
- "kaspa-mining-errors 1.1.0-rc.3",
- "kaspa-notify 1.1.0-rc.3",
- "kaspa-rpc-macros 1.1.0-rc.3",
- "kaspa-txscript 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
+ "kaspa-addresses",
+ "kaspa-consensus-client",
+ "kaspa-consensus-core",
+ "kaspa-consensus-notify",
+ "kaspa-consensus-wasm",
+ "kaspa-core",
+ "kaspa-hashes",
+ "kaspa-index-core",
+ "kaspa-math",
+ "kaspa-mining-errors",
+ "kaspa-notify",
+ "kaspa-rpc-macros",
+ "kaspa-txscript",
+ "kaspa-utils",
  "log",
  "paste",
  "rand 0.8.5",
@@ -7508,20 +7133,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-rpc-macros"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "convert_case 0.6.0",
- "proc-macro-error",
- "proc-macro2",
- "quote",
- "regex",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "kaspa-rpc-macros"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "convert_case 0.6.0",
  "proc-macro-error",
@@ -7533,38 +7146,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-txscript"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "blake2b_simd",
- "borsh",
- "cfg-if",
- "hexplay",
- "indexmap 2.13.0",
- "itertools 0.13.0",
- "kaspa-addresses 1.0.1",
- "kaspa-consensus-core 1.0.1",
- "kaspa-hashes 1.0.1",
- "kaspa-txscript-errors 1.0.1",
- "kaspa-utils 1.0.1",
- "kaspa-wasm-core 1.0.1",
- "log",
- "parking_lot",
- "rand 0.8.5",
- "secp256k1 0.29.1",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "sha2",
- "smallvec",
- "thiserror 1.0.69",
- "wasm-bindgen",
- "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-txscript"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "blake2b_simd",
  "borsh",
@@ -7572,12 +7155,12 @@ dependencies = [
  "hexplay",
  "indexmap 2.13.0",
  "itertools 0.13.0",
- "kaspa-addresses 1.1.0-rc.3",
- "kaspa-consensus-core 1.1.0-rc.3",
- "kaspa-hashes 1.1.0-rc.3",
- "kaspa-txscript-errors 1.1.0-rc.3",
- "kaspa-utils 1.1.0-rc.3",
- "kaspa-wasm-core 1.1.0-rc.3",
+ "kaspa-addresses",
+ "kaspa-consensus-core",
+ "kaspa-hashes",
+ "kaspa-txscript-errors",
+ "kaspa-utils",
+ "kaspa-wasm-core",
  "log",
  "parking_lot",
  "rand 0.8.5",
@@ -7594,16 +7177,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-txscript-errors"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "secp256k1 0.29.1",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "kaspa-txscript-errors"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "secp256k1 0.29.1",
  "thiserror 1.0.69",
@@ -7611,37 +7186,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-utils"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "arc-swap",
- "async-channel 2.5.0",
- "borsh",
- "cfg-if",
- "duct",
- "event-listener 2.5.3",
- "faster-hex",
- "ipnet",
- "itertools 0.13.0",
- "log",
- "mac_address",
- "num_cpus",
- "once_cell",
- "parking_lot",
- "rlimit",
- "serde",
- "sha2",
- "smallvec",
- "sysinfo",
- "thiserror 1.0.69",
- "triggered",
- "uuid 1.20.0",
- "wasm-bindgen",
-]
-
-[[package]]
-name = "kaspa-utils"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "arc-swap",
  "async-channel 2.5.0",
@@ -7671,6 +7217,7 @@ dependencies = [
 [[package]]
 name = "kaspa-utils-tower"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "bytes",
  "cfg-if",
@@ -7686,19 +7233,8 @@ dependencies = [
 
 [[package]]
 name = "kaspa-wasm-core"
-version = "1.0.1"
-source = "git+https://github.com/IgraLabs/rusty-kaspa.git#7d303eb026934cdad8a47eb3c604d82027ca202b"
-dependencies = [
- "faster-hex",
- "hexplay",
- "js-sys",
- "wasm-bindgen",
- "workflow-wasm",
-]
-
-[[package]]
-name = "kaspa-wasm-core"
 version = "1.1.0-rc.3"
+source = "git+https://github.com/reshmem/rusty-kaspa.git?rev=ceca5287491bfd32dc1aa48769a51914fd6daef5#ceca5287491bfd32dc1aa48769a51914fd6daef5"
 dependencies = [
  "faster-hex",
  "hexplay",
@@ -7716,40 +7252,6 @@ dependencies = [
  "hashbrown 0.16.1",
  "portable-atomic",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "kaswallet-common"
-version = "0.1.1"
-dependencies = [
- "argon2",
- "borsh",
- "chacha20poly1305",
- "hex",
- "kaspa-addresses 1.0.1",
- "kaspa-bip32 1.0.1",
- "kaspa-consensus-core 1.0.1",
- "kaspa-hashes 1.0.1",
- "kaspa-rpc-core 1.0.1",
- "kaspa-txscript 1.0.1",
- "kaswallet-proto",
- "log",
- "rand_core 0.9.5",
- "regex",
- "serde",
- "serde_json",
- "shellexpand",
- "thiserror 2.0.18",
- "tonic 0.12.3",
-]
-
-[[package]]
-name = "kaswallet-proto"
-version = "0.1.1"
-dependencies = [
- "prost 0.13.5",
- "tonic 0.12.3",
- "tonic-build",
 ]
 
 [[package]]
@@ -8879,12 +8381,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opaque-debug"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
-
-[[package]]
 name = "opener"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9026,17 +8522,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
-]
-
-[[package]]
-name = "password-hash"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
-dependencies = [
- "base64ct",
- "rand_core 0.6.4",
- "subtle",
 ]
 
 [[package]]
@@ -9354,17 +8839,6 @@ dependencies = [
  "pin-project-lite",
  "rustix",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "poly1305"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
-dependencies = [
- "cpufeatures",
- "opaque-debug",
- "universal-hash",
 ]
 
 [[package]]
@@ -11350,15 +10824,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
-name = "shellexpand"
-version = "3.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b1fdf65dd6331831494dd616b30351c38e96e45921a27745cf98490458b90bb"
-dependencies = [
- "dirs 6.0.0",
-]
-
-[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13066,16 +12531,6 @@ name = "unit-prefix"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
-
-[[package]]
-name = "universal-hash"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
-dependencies = [
- "crypto-common",
- "subtle",
-]
 
 [[package]]
 name = "unsafe-any-ors"

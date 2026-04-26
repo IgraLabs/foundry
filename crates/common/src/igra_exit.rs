@@ -17,6 +17,8 @@ use kaspa_consensus_core::{
         TransactionOutput as KaspaTransactionOutput, UtxoEntry,
     },
 };
+use kaspa_grpc_client::GrpcClient;
+use kaspa_rpc_core::{RpcTransaction, api::rpc::RpcApi};
 use kaspa_txscript::{
     extract_script_pub_key_address, multisig_redeem_script, multisig_redeem_script_ecdsa,
     pay_to_address_script, pay_to_script_hash_script, script_builder::ScriptBuilder,
@@ -586,6 +588,103 @@ pub fn verify_unsigned_exit(
         signed_inputs,
         fully_signed,
     })
+}
+
+pub fn decode_wallet_transaction(wallet_hex: &str) -> Result<KaspaTransaction> {
+    let wallet_bytes = decode_wallet_hex(wallet_hex)?;
+    let pst = PartiallySignedTransactionProto::decode(wallet_bytes.as_slice())
+        .wrap_err("failed to decode kaspawallet PartiallySignedTransaction protobuf")?;
+    let proto_tx = pst.tx.as_ref().ok_or_else(|| eyre!("wallet protobuf is missing tx"))?;
+    transaction_from_proto(proto_tx)
+}
+
+pub fn materialize_signed_wallet_transaction(
+    manifest: &UnsignedExitManifest,
+    wallet_hex: &str,
+) -> Result<KaspaTransaction> {
+    let wallet_bytes = decode_wallet_hex(wallet_hex)?;
+    let pst = PartiallySignedTransactionProto::decode(wallet_bytes.as_slice())
+        .wrap_err("failed to decode kaspawallet PartiallySignedTransaction protobuf")?;
+    let proto_tx = pst.tx.as_ref().ok_or_else(|| eyre!("wallet protobuf is missing tx"))?;
+    let mut tx = transaction_from_proto(proto_tx)?;
+
+    if tx.inputs.len() != pst.partially_signed_inputs.len() {
+        bail!("partially signed input count must match transaction input count");
+    }
+    if tx.inputs.len() != manifest.locking_utxos.len() {
+        bail!("manifest locking_utxos count must match transaction input count");
+    }
+
+    let sig_op_count = u8::try_from(manifest.multisig.extended_public_keys.len())
+        .wrap_err("multisig key count exceeds Kaspa sigOpCount range")?;
+
+    for (index, ((tx_input, partial_input), manifest_utxo)) in tx
+        .inputs
+        .iter_mut()
+        .zip(&pst.partially_signed_inputs)
+        .zip(&manifest.locking_utxos)
+        .enumerate()
+    {
+        let signatures = partial_input
+            .pub_key_signature_pairs
+            .iter()
+            .filter_map(|pair| (!pair.signature.is_empty()).then_some(pair.signature.as_slice()))
+            .collect::<Vec<_>>();
+        if signatures.len() < partial_input.minimum_signatures as usize {
+            bail!(
+                "input {index} has only {} signatures, below minimum_signatures {}",
+                signatures.len(),
+                partial_input.minimum_signatures
+            );
+        }
+
+        let mut script_builder = ScriptBuilder::new();
+        if manifest.multisig.extended_public_keys.len() > 1 {
+            for signature in signatures {
+                script_builder.add_data(signature)?;
+            }
+            let redeem_script = multisig_redeem_script_for_path(
+                &manifest.multisig,
+                &manifest_utxo.derivation_path,
+            )?;
+            script_builder.add_data(&redeem_script)?;
+        } else {
+            let signature = signatures
+                .first()
+                .copied()
+                .ok_or_else(|| eyre!("input {index} missing single-sig signature"))?;
+            script_builder.add_data(signature)?;
+        }
+
+        tx_input.sig_op_count = sig_op_count;
+        tx_input.signature_script = script_builder.drain();
+    }
+
+    tx.finalize();
+    Ok(tx)
+}
+
+pub async fn broadcast_wallet_transaction(
+    manifest: &UnsignedExitManifest,
+    wallet_hex: &str,
+    kaspa_rpc_url: &str,
+) -> Result<String> {
+    let tx = materialize_signed_wallet_transaction(manifest, wallet_hex)?;
+    let expected_tx_id = tx.id().to_string();
+    let client = GrpcClient::connect(kaspa_rpc_url.to_string())
+        .await
+        .wrap_err_with(|| format!("failed to connect to Kaspa RPC `{kaspa_rpc_url}`"))?;
+    let submitted_tx_id = client
+        .submit_transaction(RpcTransaction::from(&tx), false)
+        .await
+        .wrap_err_with(|| format!("failed to submit transaction to Kaspa RPC `{kaspa_rpc_url}`"))?
+        .to_string();
+    if submitted_tx_id != expected_tx_id {
+        bail!(
+            "Kaspa RPC returned unexpected txid: expected {expected_tx_id}, actual {submitted_tx_id}"
+        );
+    }
+    Ok(submitted_tx_id)
 }
 
 pub fn check_multisig_derivation_path(path: &str) -> Result<MultisigDerivationPathReport> {
@@ -2226,6 +2325,67 @@ mod tests {
                 "kpub2NHxXk4U63VdJZtmiUHxowkG9m7EGA4ERTsHY4Pt51sERVHfVcRr8hWCh76kHnAkUUsNgFyqhbJuFKEsu5yQd9BJkMPzHTY2J1TmteQxWxu",
             ]
         );
+    }
+
+    #[test]
+    fn decodes_kaspawallet_wallet_hex_into_expected_transaction() {
+        let output = build_unsigned_exit(
+            sample_input(),
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(30),
+                max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
+            },
+        )
+        .expect("build unsigned exit");
+
+        let tx = decode_wallet_transaction(&output.wallet_hex).expect("decode wallet tx");
+
+        assert_eq!(tx.id().to_string(), output.manifest.protocol.kaspa_tx_id);
+        assert_eq!(tx.inputs.len(), output.manifest.locking_utxos.len());
+        assert_eq!(
+            tx.outputs.len(),
+            output.manifest.exits.len() + usize::from(output.manifest.change.is_some())
+        );
+        assert_eq!(prefixed_hex(&tx.payload), output.manifest.protocol.payload_hex);
+    }
+
+    #[test]
+    fn materializes_signature_scripts_from_partial_signatures() {
+        let output = build_unsigned_exit(
+            sample_input(),
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                mining_timeout: Duration::from_secs(30),
+                max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
+            },
+        )
+        .expect("build unsigned exit");
+
+        let mut pst = PartiallySignedTransactionProto::decode(
+            decode_fixed_hex(&output.wallet_hex, "wallet hex").unwrap().as_slice(),
+        )
+        .expect("decode pst");
+        for partial_input in &mut pst.partially_signed_inputs {
+            partial_input.pub_key_signature_pairs[0].signature =
+                vec![1_u8; KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE];
+            partial_input.pub_key_signature_pairs[1].signature =
+                vec![2_u8; KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE];
+        }
+        let wallet_hex = hex::encode(pst.encode_to_vec());
+
+        let tx = materialize_signed_wallet_transaction(&output.manifest, &wallet_hex)
+            .expect("materialize signed tx");
+
+        assert_eq!(tx.id().to_string(), output.manifest.protocol.kaspa_tx_id);
+        assert!(tx.inputs.iter().all(|input| !input.signature_script.is_empty()));
+        assert!(tx.inputs.iter().all(|input| input.sig_op_count == 3));
     }
 
     #[test]

@@ -433,15 +433,14 @@ vergen = { package = "vergen-gitcl", version = "10.0.0-beta.5", default-features
 ] }
 
 # Kaspa / IGRA in-process submission stack
-kaswallet-common = { path = "../kaswallet/common", package = "kaswallet-common" }
-kaspa-addresses = { path = "../rusty-kaspa/crypto/addresses" }
-kaspa-bip32 = { path = "../rusty-kaspa/wallet/bip32" }
+kaspa-addresses = { git = "https://github.com/reshmem/rusty-kaspa.git", rev = "ceca5287491bfd32dc1aa48769a51914fd6daef5" }
+kaspa-bip32 = { git = "https://github.com/reshmem/rusty-kaspa.git", rev = "ceca5287491bfd32dc1aa48769a51914fd6daef5" }
 # Compatibility: some environments still derive Kaspa addresses using older kaspa-bip32 semantics.
 # We keep this pinned so IGRA can interop with wallets created by those versions.
-kaspa-consensus-core = { path = "../rusty-kaspa/consensus/core" }
-kaspa-grpc-client = { path = "../rusty-kaspa/rpc/grpc/client" }
-kaspa-rpc-core = { path = "../rusty-kaspa/rpc/core" }
-kaspa-txscript = { path = "../rusty-kaspa/crypto/txscript" }
+kaspa-consensus-core = { git = "https://github.com/reshmem/rusty-kaspa.git", rev = "ceca5287491bfd32dc1aa48769a51914fd6daef5" }
+kaspa-grpc-client = { git = "https://github.com/reshmem/rusty-kaspa.git", rev = "ceca5287491bfd32dc1aa48769a51914fd6daef5" }
+kaspa-rpc-core = { git = "https://github.com/reshmem/rusty-kaspa.git", rev = "ceca5287491bfd32dc1aa48769a51914fd6daef5" }
+kaspa-txscript = { git = "https://github.com/reshmem/rusty-kaspa.git", rev = "ceca5287491bfd32dc1aa48769a51914fd6daef5" }
 yansi = { version = "1.0", features = ["detect-tty", "detect-env"] }
 path-slash = "0.2"
 jiff = { version = "0.2", default-features = false, features = [

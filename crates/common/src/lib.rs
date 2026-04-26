@@ -7,7 +7,6 @@
 
 #[expect(unused_extern_crates)] // Used by `ConsoleFmt`.
 extern crate self as foundry_common;
-use kaswallet_common as _;
 
 #[macro_use]
 extern crate tracing;
@@ -26,6 +25,7 @@ pub mod contracts;
 pub mod errors;
 pub mod fs;
 pub mod igra;
+pub mod igra_bundle;
 pub mod igra_exit;
 pub mod igra_store;
 pub mod iter;

@@ -1,8 +1,10 @@
 use clap::{Args, Subcommand};
-use eyre::{Result, bail};
+use eyre::{Result, bail, eyre};
+use foundry_common::igra_bundle::verify_bundle_integral;
 use foundry_common::igra_exit::{
-    BuildExitInput, BuildExitOptions, MultisigAddressInput, VerifyExitOptions, build_unsigned_exit,
-    check_multisig_derivation_path, derive_multisig_address, verify_multisig_address,
+    BuildExitInput, BuildExitOptions, MultisigAddressInput, VerifyExitOptions,
+    broadcast_wallet_transaction, build_unsigned_exit, check_multisig_derivation_path,
+    decode_wallet_transaction, derive_multisig_address, verify_multisig_address,
     verify_unsigned_exit,
 };
 use serde::Deserialize;
@@ -31,6 +33,9 @@ pub enum IgraSubcommand {
     /// Check that a derivation path is the canonical IGRA receive shape.
     #[command(name = "check-msig-path")]
     CheckMsigPath(CheckMsigPathArgs),
+    /// Recompute and verify manifest.bundleIntegral.value from a bundle manifest.
+    #[command(name = "verify-bundle-integral")]
+    VerifyBundleIntegral(VerifyBundleIntegralArgs),
 }
 
 #[derive(Debug, Args)]
@@ -94,6 +99,14 @@ pub struct VerifyExitArgs {
     #[arg(long)]
     pub require_fully_signed: bool,
 
+    /// Submit the verified Kaspa transaction to a Kaspa RPC endpoint.
+    #[arg(long)]
+    pub broadcast: bool,
+
+    /// Kaspa RPC URL used for --broadcast, for example grpc://127.0.0.1:16110.
+    #[arg(long, env = "KASPA_RPC_URL")]
+    pub kaspa_rpc_url: Option<String>,
+
     /// Allow non-official IGRA locking scripts. Testing only; never use for bridge exits.
     #[arg(long)]
     pub allow_non_igra_lock_script_for_testing: bool,
@@ -143,6 +156,13 @@ pub struct CheckMsigPathArgs {
     pub path: String,
 }
 
+#[derive(Debug, Args)]
+pub struct VerifyBundleIntegralArgs {
+    /// Bundle manifest.json path.
+    #[arg(long = "manifest", value_hint = clap::ValueHint::FilePath)]
+    pub manifest_json: PathBuf,
+}
+
 #[derive(Debug, Deserialize)]
 struct KaspawalletPublicKeysFile {
     #[serde(rename = "publicKeys")]
@@ -157,10 +177,11 @@ impl IgraArgs {
     pub async fn run(self) -> Result<()> {
         match self.command {
             IgraSubcommand::BuildExit(args) => args.run(),
-            IgraSubcommand::VerifyExit(args) => args.run(),
+            IgraSubcommand::VerifyExit(args) => args.run().await,
             IgraSubcommand::DeriveMsigAddress(args) => args.run(),
             IgraSubcommand::VerifyMsigAddress(args) => args.run(),
             IgraSubcommand::CheckMsigPath(args) => args.run(),
+            IgraSubcommand::VerifyBundleIntegral(args) => args.run(),
         }
     }
 }
@@ -216,32 +237,58 @@ impl BuildExitArgs {
 }
 
 impl VerifyExitArgs {
-    fn run(self) -> Result<()> {
+    async fn run(self) -> Result<()> {
         let manifest_json = fs::read_to_string(&self.manifest_json)?;
         let manifest = serde_json::from_str(&manifest_json)?;
         let wallet_hex = fs::read_to_string(&self.hex)?;
+        let allow_signatures = self.allow_signatures || self.broadcast;
+        let require_fully_signed = self.require_fully_signed || self.broadcast;
         let report = verify_unsigned_exit(
             &manifest,
             &wallet_hex,
             VerifyExitOptions {
-                allow_signatures: self.allow_signatures,
-                require_fully_signed: self.require_fully_signed,
+                allow_signatures,
+                require_fully_signed,
                 allow_non_igra_lock_script_for_testing: self.allow_non_igra_lock_script_for_testing,
             },
         )?;
 
-        foundry_common::sh_println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "ok": true,
-                "kaspa_tx_id": report.kaspa_tx_id,
-                "payload_nonce": report.payload_nonce,
-                "inputs": report.input_count,
-                "outputs": report.output_count,
-                "signed_inputs": report.signed_inputs,
-                "fully_signed": report.fully_signed,
-            }))?
-        )?;
+        let mut output = serde_json::json!({
+            "ok": true,
+            "kaspa_tx_id": report.kaspa_tx_id,
+            "payload_nonce": report.payload_nonce,
+            "inputs": report.input_count,
+            "outputs": report.output_count,
+            "signed_inputs": report.signed_inputs,
+            "fully_signed": report.fully_signed,
+        });
+
+        if self.broadcast {
+            let kaspa_rpc_url = self
+                .kaspa_rpc_url
+                .as_deref()
+                .ok_or_else(|| eyre!("--kaspa-rpc-url is required with --broadcast"))?;
+            let decoded_tx = decode_wallet_transaction(&wallet_hex)?;
+            let local_tx_id = decoded_tx.id().to_string();
+            if local_tx_id != report.kaspa_tx_id {
+                bail!(
+                    "decoded wallet txid mismatch before broadcast: expected {}, actual {local_tx_id}",
+                    report.kaspa_tx_id
+                );
+            }
+            let submitted_tx_id =
+                broadcast_wallet_transaction(&manifest, &wallet_hex, kaspa_rpc_url).await?;
+            output.as_object_mut().expect("verify-exit output is an object").insert(
+                "broadcast".to_string(),
+                serde_json::json!({
+                    "submitted": true,
+                    "kaspa_rpc_url": kaspa_rpc_url,
+                    "kaspa_tx_id": submitted_tx_id,
+                }),
+            );
+        }
+
+        foundry_common::sh_println!("{}", serde_json::to_string_pretty(&output)?)?;
         Ok(())
     }
 }
@@ -306,6 +353,23 @@ impl CheckMsigPathArgs {
     fn run(self) -> Result<()> {
         let report = check_multisig_derivation_path(&self.path)?;
         foundry_common::sh_println!("{}", serde_json::to_string_pretty(&report)?)?;
+        Ok(())
+    }
+}
+
+impl VerifyBundleIntegralArgs {
+    fn run(self) -> Result<()> {
+        let manifest_json = fs::read_to_string(&self.manifest_json)?;
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_json)?;
+        let report = verify_bundle_integral(&manifest)?;
+        foundry_common::sh_println!("{}", serde_json::to_string_pretty(&report)?)?;
+        if !report.matches {
+            bail!(
+                "bundle integral mismatch: expected {}, computed {}",
+                report.expected_value,
+                report.computed_value
+            );
+        }
         Ok(())
     }
 }
