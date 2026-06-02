@@ -1,9 +1,12 @@
 use clap::Parser;
-use kaspa_addresses::{Address as KaspaAddress, Prefix as KaspaAddressPrefix, Version as KaspaAddressVersion};
+use kaspa_addresses::{
+    Address as KaspaAddress, Prefix as KaspaAddressPrefix, Version as KaspaAddressVersion,
+};
 use kaspa_bip32::secp256k1::SecretKey as KaspaSecretKey;
 use kaspa_bip32::{
     ChildNumber as KaspaChildNumber, DerivationPath as KaspaDerivationPath,
-    ExtendedPrivateKey as KaspaExtendedPrivateKey, Language as KaspaLanguage, Mnemonic as KaspaMnemonic,
+    ExtendedPrivateKey as KaspaExtendedPrivateKey, Language as KaspaLanguage,
+    Mnemonic as KaspaMnemonic,
 };
 
 #[derive(Debug, Parser)]
@@ -105,4 +108,3 @@ fn kaspa_address_from_private_key(
     let payload = public_key.x_only_public_key().0.serialize();
     Ok(KaspaAddress::new(prefix, KaspaAddressVersion::PubKey, &payload))
 }
-

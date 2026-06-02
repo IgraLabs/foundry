@@ -158,8 +158,8 @@ forgetest!(can_list_resolved_multiple_compiler_versions, |prj, cmd| {
     prj.add_raw_source("Counter.vy", VYPER_CONTRACT);
 
     let assert = cmd.args(["compiler", "resolve"]).assert();
-    if !assert.get_output().status.success() &&
-        should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
+    if !assert.get_output().status.success()
+        && should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
     {
         eprintln!("skipping test: {MISSING_VYPER_COMPILERS_ERR}");
         return;
@@ -186,14 +186,13 @@ forgetest!(can_list_resolved_multiple_compiler_versions_skipped, |prj, cmd| {
     prj.add_raw_source("Counter.vy", VYPER_CONTRACT);
 
     let assert = cmd.args(["compiler", "resolve", "--skip", ".sol", "-v"]).assert();
-    if !assert.get_output().status.success() &&
-        should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
+    if !assert.get_output().status.success()
+        && should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
     {
         eprintln!("skipping test: {MISSING_VYPER_COMPILERS_ERR}");
         return;
     }
-    assert.success().stdout_eq(str![[
-        r#"
+    assert.success().stdout_eq(str![[r#"
 Vyper:
 
 0.4.3:
@@ -201,8 +200,7 @@ Vyper:
 └── src/ICounter.vyi
 
 
-"#
-    ]]);
+"#]]);
 });
 
 forgetest!(can_list_resolved_multiple_compiler_versions_skipped_json, |prj, cmd| {
@@ -213,16 +211,16 @@ forgetest!(can_list_resolved_multiple_compiler_versions_skipped_json, |prj, cmd|
     prj.add_raw_source("ICounter.vyi", VYPER_INTERFACE);
     prj.add_raw_source("Counter.vy", VYPER_CONTRACT);
 
-    let assert = cmd.args(["compiler", "resolve", "--skip", "Contract(A|B|C)", "--json", "-v"])
-        .assert();
-    if !assert.get_output().status.success() &&
-        should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
+    let assert =
+        cmd.args(["compiler", "resolve", "--skip", "Contract(A|B|C)", "--json", "-v"]).assert();
+    if !assert.get_output().status.success()
+        && should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
     {
         eprintln!("skipping test: {MISSING_VYPER_COMPILERS_ERR}");
         return;
     }
     assert.success().stdout_eq(
-            str![[r#"
+        str![[r#"
 {
   "Solidity": [
     {
@@ -243,8 +241,8 @@ forgetest!(can_list_resolved_multiple_compiler_versions_skipped_json, |prj, cmd|
   ]
 }
 "#]]
-            .is_json(),
-        );
+        .is_json(),
+    );
 });
 
 forgetest!(can_list_resolved_multiple_compiler_versions_verbose, |prj, cmd| {
@@ -256,8 +254,8 @@ forgetest!(can_list_resolved_multiple_compiler_versions_verbose, |prj, cmd| {
     prj.add_raw_source("Counter.vy", VYPER_CONTRACT);
 
     let assert = cmd.args(["compiler", "resolve", "-vv"]).assert();
-    if !assert.get_output().status.success() &&
-        should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
+    if !assert.get_output().status.success()
+        && should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
     {
         eprintln!("skipping test: {MISSING_VYPER_COMPILERS_ERR}");
         return;
@@ -294,8 +292,8 @@ forgetest!(can_list_resolved_multiple_compiler_versions_verbose_json, |prj, cmd|
     prj.add_raw_source("Counter.vy", VYPER_CONTRACT);
 
     let assert = cmd.args(["compiler", "resolve", "--json", "-vv"]).assert();
-    if !assert.get_output().status.success() &&
-        should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
+    if !assert.get_output().status.success()
+        && should_skip_missing_vyper_compilers(&assert.get_output().stderr_lossy())
     {
         eprintln!("skipping test: {MISSING_VYPER_COMPILERS_ERR}");
         return;

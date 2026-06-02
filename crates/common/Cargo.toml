@@ -52,7 +52,6 @@ solar.workspace = true
 
 tower.workspace = true
 async-trait.workspace = true
-kaswallet-common.workspace = true
 kaspa-addresses.workspace = true
 kaspa-bip32.workspace = true
 kaspa-consensus-core.workspace = true
@@ -86,6 +85,8 @@ anstyle.workspace = true
 ciborium.workspace = true
 
 flate2.workspace = true
+prost.workspace = true
+sha2.workspace = true
 
 [build-dependencies]
 chrono.workspace = true

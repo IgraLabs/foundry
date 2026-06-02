@@ -623,7 +623,8 @@ impl<P: Provider<AnyNetwork>> CastTxBuilder<P, InputState> {
             // `maxPriorityFeePerGas`. On IGRA networks, `eth_gasPrice` reflects this minimum
             // better than `eth_feeHistory` percentiles, so when IGRA mode is enabled we use it as
             // a floor for default fee filling.
-            let floor = if self.igra_enabled { Some(self.provider.get_gas_price().await?) } else { None };
+            let floor =
+                if self.igra_enabled { Some(self.provider.get_gas_price().await?) } else { None };
 
             if let Some(existing) = self.tx.max_fee_per_gas {
                 if let Some(floor) = floor {

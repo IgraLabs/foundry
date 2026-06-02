@@ -28,14 +28,14 @@ pub struct IgraKaspaWalletConfig {
 impl IgraKaspaWalletConfig {
     /// Returns true when no explicit Kaspa signer source was configured.
     pub fn is_empty(&self) -> bool {
-        self.private_key.is_none() &&
-            self.mnemonic.is_none() &&
-            self.mnemonic_passphrase.is_none() &&
-            self.mnemonic_derivation_path.is_none() &&
-            self.mnemonic_index.is_none() &&
-            self.keystore.is_none() &&
-            self.keystore_account.is_none() &&
-            self.password.is_none()
+        self.private_key.is_none()
+            && self.mnemonic.is_none()
+            && self.mnemonic_passphrase.is_none()
+            && self.mnemonic_derivation_path.is_none()
+            && self.mnemonic_index.is_none()
+            && self.keystore.is_none()
+            && self.keystore_account.is_none()
+            && self.password.is_none()
     }
 }
 

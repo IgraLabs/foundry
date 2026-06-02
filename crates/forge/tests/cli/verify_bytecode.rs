@@ -44,8 +44,8 @@ async fn test_verify_bytecode(
                     break;
                 }
                 Err(err)
-                    if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS &&
-                        is_etherscan_rate_limited(&err.to_string()) =>
+                    if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS
+                        && is_etherscan_rate_limited(&err.to_string()) =>
                 {
                     sleep(Duration::from_secs(ETHERSCAN_RETRY_DELAY_SECS)).await;
                 }
@@ -87,8 +87,8 @@ async fn test_verify_bytecode(
                 maybe_output = Some(assert.get_output().stdout_lossy());
                 break;
             }
-            if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS &&
-                is_etherscan_rate_limited(&assert.get_output().stderr_lossy())
+            if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS
+                && is_etherscan_rate_limited(&assert.get_output().stderr_lossy())
             {
                 sleep(Duration::from_secs(ETHERSCAN_RETRY_DELAY_SECS)).await;
                 continue;
@@ -134,8 +134,8 @@ async fn test_verify_bytecode_with_ignore(
                     break;
                 }
                 Err(err)
-                    if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS &&
-                        is_etherscan_rate_limited(&err.to_string()) =>
+                    if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS
+                        && is_etherscan_rate_limited(&err.to_string()) =>
                 {
                     sleep(Duration::from_secs(ETHERSCAN_RETRY_DELAY_SECS)).await;
                 }
@@ -175,8 +175,8 @@ async fn test_verify_bytecode_with_ignore(
                 maybe_output = Some(assert.get_output().stdout_lossy());
                 break;
             }
-            if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS &&
-                is_etherscan_rate_limited(&assert.get_output().stderr_lossy())
+            if attempt + 1 < ETHERSCAN_RETRY_ATTEMPTS
+                && is_etherscan_rate_limited(&assert.get_output().stderr_lossy())
             {
                 sleep(Duration::from_secs(ETHERSCAN_RETRY_DELAY_SECS)).await;
                 continue;

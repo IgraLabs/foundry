@@ -186,8 +186,8 @@ impl ExtTester {
         test_cmd.env("FOUNDRY_ALLOW_INTERNAL_EXPECT_REVERT", "true");
 
         let assert = test_cmd.assert();
-        if !assert.get_output().status.success() &&
-            assert.get_output().stderr_lossy().contains(MISSING_VYPER_COMPILERS_ERR)
+        if !assert.get_output().status.success()
+            && assert.get_output().stderr_lossy().contains(MISSING_VYPER_COMPILERS_ERR)
         {
             test_debug!("skipping external test {}: {MISSING_VYPER_COMPILERS_ERR}", self.name);
             return;

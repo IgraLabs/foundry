@@ -289,9 +289,7 @@ impl MultiWalletOpts {
 
     fn evm_fallback_kaspa_config(&self) -> Option<foundry_config::IgraKaspaWalletConfig> {
         if let Some(private_key) = self.private_key.clone().or_else(|| {
-            self.private_keys
-                .as_ref()
-                .and_then(|private_keys| private_keys.first().cloned())
+            self.private_keys.as_ref().and_then(|private_keys| private_keys.first().cloned())
         }) {
             return Some(foundry_config::IgraKaspaWalletConfig {
                 private_key: Some(private_key),
@@ -302,10 +300,8 @@ impl MultiWalletOpts {
         if let Some(mnemonic) =
             self.mnemonics.as_ref().and_then(|mnemonics| mnemonics.first().cloned())
         {
-            let mnemonic_passphrase = self
-                .mnemonic_passphrases
-                .as_ref()
-                .and_then(|phrases| phrases.first().cloned());
+            let mnemonic_passphrase =
+                self.mnemonic_passphrases.as_ref().and_then(|phrases| phrases.first().cloned());
             let mnemonic_derivation_path =
                 self.hd_paths.as_ref().and_then(|paths| paths.first().cloned());
             let mnemonic_index = self
@@ -323,19 +319,12 @@ impl MultiWalletOpts {
             });
         }
 
-        let keystore = self
-            .keystore_paths
-            .as_ref()
-            .and_then(|paths| paths.first().cloned());
-        let keystore_account = self
-            .keystore_account_names
-            .as_ref()
-            .and_then(|names| names.first().cloned());
+        let keystore = self.keystore_paths.as_ref().and_then(|paths| paths.first().cloned());
+        let keystore_account =
+            self.keystore_account_names.as_ref().and_then(|names| names.first().cloned());
         if keystore.is_some() || keystore_account.is_some() {
-            let password = self
-                .keystore_passwords
-                .as_ref()
-                .and_then(|passwords| passwords.first().cloned());
+            let password =
+                self.keystore_passwords.as_ref().and_then(|passwords| passwords.first().cloned());
             return Some(foundry_config::IgraKaspaWalletConfig {
                 keystore,
                 keystore_account,
