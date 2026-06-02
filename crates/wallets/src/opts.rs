@@ -207,14 +207,14 @@ pub struct KaspaWalletOpts {
 impl KaspaWalletOpts {
     /// Returns true when explicit Kaspa signer source was provided.
     pub fn is_set(&self) -> bool {
-        self.private_key_kaspa.is_some() ||
-            self.mnemonic_kaspa.is_some() ||
-            self.mnemonic_passphrase_kaspa.is_some() ||
-            self.mnemonic_derivation_path_kaspa.is_some() ||
-            self.mnemonic_index_kaspa.is_some() ||
-            self.keystore_kaspa.is_some() ||
-            self.keystore_account_kaspa.is_some() ||
-            self.password_kaspa.is_some()
+        self.private_key_kaspa.is_some()
+            || self.mnemonic_kaspa.is_some()
+            || self.mnemonic_passphrase_kaspa.is_some()
+            || self.mnemonic_derivation_path_kaspa.is_some()
+            || self.mnemonic_index_kaspa.is_some()
+            || self.keystore_kaspa.is_some()
+            || self.keystore_account_kaspa.is_some()
+            || self.password_kaspa.is_some()
     }
 
     /// Converts CLI/env Kaspa options to config shape.
@@ -490,8 +490,11 @@ mod tests {
 
     #[test]
     fn falls_back_to_evm_private_key_when_kaspa_key_missing() {
-        let wallet: WalletOpts =
-            WalletOpts::parse_from(["foundry-cli", "--private-key", "0x1111111111111111111111111111111111111111111111111111111111111111"]);
+        let wallet: WalletOpts = WalletOpts::parse_from([
+            "foundry-cli",
+            "--private-key",
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        ]);
 
         let mut config = Config::default();
         wallet.apply_igra_kaspa_wallet_overrides(&mut config);

@@ -1024,8 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_resume_without_broadcast()
-    {
+    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_resume_without_broadcast() {
         let unlocked_args = ScriptArgs::parse_from([
             "foundry-cli",
             "Contract.sol",
@@ -1054,8 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_verify_without_broadcast()
-    {
+    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_verify_without_broadcast() {
         let mut unlocked_args = ScriptArgs::parse_from([
             "foundry-cli",
             "Contract.sol",

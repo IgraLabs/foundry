@@ -28,9 +28,9 @@ mod erc20;
 mod selectors;
 
 fn is_etherscan_rate_limited(stderr: &str) -> bool {
-    stderr.contains("Max calls per sec rate limit reached") ||
-        (stderr.contains("status=0,message=NOTOK") &&
-            (stderr.contains("rate limit") || stderr.contains("Rate limit")))
+    stderr.contains("Max calls per sec rate limit reached")
+        || (stderr.contains("status=0,message=NOTOK")
+            && (stderr.contains("rate limit") || stderr.contains("Rate limit")))
 }
 
 casttest!(print_short_version, |_prj, cmd| {
@@ -2163,15 +2163,15 @@ casttest!(storage, |_prj, cmd| {
 casttest!(flaky_storage_with_valid_solc_version_1, |_prj, cmd| {
     let assert = cmd
         .args([
-        "storage",
-        "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
-        "--solc-version",
-        "0.8.10",
-        "--rpc-url",
-        next_http_archive_rpc_url().as_str(),
-        "--etherscan-api-key",
-        next_etherscan_api_key().as_str(),
-    ])
+            "storage",
+            "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+            "--solc-version",
+            "0.8.10",
+            "--rpc-url",
+            next_http_archive_rpc_url().as_str(),
+            "--etherscan-api-key",
+            next_etherscan_api_key().as_str(),
+        ])
         .assert();
     if !assert.get_output().status.success() {
         let stderr = assert.get_output().stderr_lossy();
@@ -2186,15 +2186,15 @@ casttest!(flaky_storage_with_valid_solc_version_1, |_prj, cmd| {
 casttest!(flaky_storage_with_valid_solc_version_2, |_prj, cmd| {
     let assert = cmd
         .args([
-        "storage",
-        "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
-        "--solc-version",
-        "0.8.23",
-        "--rpc-url",
-        next_http_archive_rpc_url().as_str(),
-        "--etherscan-api-key",
-        next_etherscan_api_key().as_str(),
-    ])
+            "storage",
+            "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+            "--solc-version",
+            "0.8.23",
+            "--rpc-url",
+            next_http_archive_rpc_url().as_str(),
+            "--etherscan-api-key",
+            next_etherscan_api_key().as_str(),
+        ])
         .assert();
     if !assert.get_output().status.success() {
         let stderr = assert.get_output().stderr_lossy();
@@ -2226,11 +2226,7 @@ casttest!(flaky_storage_with_invalid_solc_version_1, |_prj, cmd| {
             return;
         }
     }
-    let output = assert
-        .failure()
-        .get_output()
-        .stderr
-        .clone();
+    let output = assert.failure().get_output().stderr.clone();
     let stderr = String::from_utf8_lossy(&output);
     assert!(
         stderr.contains(
@@ -2243,15 +2239,15 @@ casttest!(flaky_storage_with_invalid_solc_version_1, |_prj, cmd| {
 casttest!(flaky_storage_with_invalid_solc_version_2, |_prj, cmd| {
     let assert = cmd
         .args([
-        "storage",
-        "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
-        "--solc-version",
-        "0.8.2",
-        "--rpc-url",
-        next_http_archive_rpc_url().as_str(),
-        "--etherscan-api-key",
-        next_etherscan_api_key().as_str(),
-    ])
+            "storage",
+            "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+            "--solc-version",
+            "0.8.2",
+            "--rpc-url",
+            next_http_archive_rpc_url().as_str(),
+            "--etherscan-api-key",
+            next_etherscan_api_key().as_str(),
+        ])
         .assert();
     if !assert.get_output().status.success() {
         let stderr = assert.get_output().stderr_lossy();
@@ -2270,15 +2266,15 @@ Error: Encountered invalid solc version in contracts/Create2Deployer.sol: No sol
 casttest!(flaky_storage_layout_simple, |_prj, cmd| {
     let assert = cmd
         .args([
-        "storage",
-        "--rpc-url",
-        next_http_archive_rpc_url().as_str(),
-        "--block",
-        "21034138",
-        "--etherscan-api-key",
-        next_etherscan_api_key().as_str(),
-        "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
-    ])
+            "storage",
+            "--rpc-url",
+            next_http_archive_rpc_url().as_str(),
+            "--block",
+            "21034138",
+            "--etherscan-api-key",
+            next_etherscan_api_key().as_str(),
+            "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+        ])
         .assert();
     if !assert.get_output().status.success() {
         let stderr = assert.get_output().stderr_lossy();
@@ -2305,16 +2301,16 @@ casttest!(flaky_storage_layout_simple, |_prj, cmd| {
 casttest!(flaky_storage_layout_simple_json, |_prj, cmd| {
     let assert = cmd
         .args([
-        "storage",
-        "--rpc-url",
-        next_http_archive_rpc_url().as_str(),
-        "--block",
-        "21034138",
-        "--etherscan-api-key",
-        next_etherscan_api_key().as_str(),
-        "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
-        "--json",
-    ])
+            "storage",
+            "--rpc-url",
+            next_http_archive_rpc_url().as_str(),
+            "--block",
+            "21034138",
+            "--etherscan-api-key",
+            next_etherscan_api_key().as_str(),
+            "0x13b0D85CcB8bf860b6b79AF3029fCA081AE9beF2",
+            "--json",
+        ])
         .assert();
     if !assert.get_output().status.success() {
         let stderr = assert.get_output().stderr_lossy();
@@ -2413,17 +2409,17 @@ casttest!(flaky_storage_layout_complex_md, |_prj, cmd| {
 casttest!(flaky_storage_layout_complex_proxy, |_prj, cmd| {
     let assert = cmd
         .args([
-        "storage",
-        "--rpc-url",
-        next_rpc_endpoint(NamedChain::Sepolia).as_str(),
-        "--block",
-        "7857852",
-        "--etherscan-api-key",
-        next_etherscan_api_key().as_str(),
-        "0xE2588A9CAb7Ea877206E35f615a39f84a64A7A3b",
-        "--proxy",
-        "0x29fcb43b46531bca003ddc8fcb67ffe91900c762"
-    ])
+            "storage",
+            "--rpc-url",
+            next_rpc_endpoint(NamedChain::Sepolia).as_str(),
+            "--block",
+            "7857852",
+            "--etherscan-api-key",
+            next_etherscan_api_key().as_str(),
+            "0xE2588A9CAb7Ea877206E35f615a39f84a64A7A3b",
+            "--proxy",
+            "0x29fcb43b46531bca003ddc8fcb67ffe91900c762",
+        ])
         .assert();
     if !assert.get_output().status.success() {
         let stderr = assert.get_output().stderr_lossy();
@@ -2463,16 +2459,16 @@ casttest!(flaky_storage_layout_complex_proxy, |_prj, cmd| {
 casttest!(flaky_storage_layout_complex_json, |_prj, cmd| {
     let assert = cmd
         .args([
-        "storage",
-        "--rpc-url",
-        next_http_archive_rpc_url().as_str(),
-        "--block",
-        "21034138",
-        "--etherscan-api-key",
-        next_etherscan_api_key().as_str(),
-        "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
-        "--json",
-    ])
+            "storage",
+            "--rpc-url",
+            next_http_archive_rpc_url().as_str(),
+            "--block",
+            "21034138",
+            "--etherscan-api-key",
+            next_etherscan_api_key().as_str(),
+            "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
+            "--json",
+        ])
         .assert();
     if !assert.get_output().status.success() {
         let stderr = assert.get_output().stderr_lossy();
@@ -3013,14 +3009,14 @@ casttest!(flaky_fetch_creation_code_only_args_from_etherscan, |_prj, cmd| {
     let eth_rpc_url = next_http_rpc_endpoint();
     let assert = cmd
         .args([
-        "creation-code",
-        "--etherscan-api-key",
-        &next_etherscan_api_key(),
-        "0x6982508145454ce325ddbe47a25d4ec3d2311933",
-        "--rpc-url",
-        eth_rpc_url.as_str(),
-        "--only-args",
-    ])
+            "creation-code",
+            "--etherscan-api-key",
+            &next_etherscan_api_key(),
+            "0x6982508145454ce325ddbe47a25d4ec3d2311933",
+            "--rpc-url",
+            eth_rpc_url.as_str(),
+            "--only-args",
+        ])
         .assert();
     if !assert.get_output().status.success() {
         let stderr = assert.get_output().stderr_lossy();
@@ -3085,13 +3081,13 @@ casttest!(flaky_fetch_artifact_from_etherscan, |_prj, cmd| {
     let eth_rpc_url = next_http_rpc_endpoint();
     let assert = cmd
         .args([
-        "artifact",
-        "--etherscan-api-key",
-        &next_etherscan_api_key(),
-        "0x0923cad07f06b2d0e5e49e63b8b35738d4156b95",
-        "--rpc-url",
-        eth_rpc_url.as_str(),
-    ])
+            "artifact",
+            "--etherscan-api-key",
+            &next_etherscan_api_key(),
+            "0x0923cad07f06b2d0e5e49e63b8b35738d4156b95",
+            "--rpc-url",
+            eth_rpc_url.as_str(),
+        ])
         .assert();
     if !assert.get_output().status.success() {
         let stderr = assert.get_output().stderr_lossy();

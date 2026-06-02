@@ -4,7 +4,9 @@ use crate::igra_store::{
     IGRA_NONCE_GAP_ERROR_CODE, IGRA_NONCE_REPLACEMENT_CANDIDATE_ERROR_CODE, IgraStore,
     IgraStoreConfig, IgraStoreError, NonceOrdering, TxLifecycleState, TxLifecycleUpdate,
 };
-use alloy_consensus::{Transaction as AlloyTransaction, TxEnvelope, transaction::SignerRecoverable};
+use alloy_consensus::{
+    Transaction as AlloyTransaction, TxEnvelope, transaction::SignerRecoverable,
+};
 use alloy_json_rpc::{
     Id, Request, RequestPacket, Response, ResponsePacket, ResponsePayload, SerializedRequest,
 };
@@ -14,11 +16,14 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
 use async_trait::async_trait;
 use foundry_config::{Config, IgraKaspaWalletConfig};
-use kaspa_addresses::{Address as KaspaAddress, Prefix as KaspaAddressPrefix, Version as KaspaAddressVersion};
+use kaspa_addresses::{
+    Address as KaspaAddress, Prefix as KaspaAddressPrefix, Version as KaspaAddressVersion,
+};
 use kaspa_bip32::secp256k1::SecretKey as KaspaSecretKey;
 use kaspa_bip32::{
     ChildNumber as KaspaChildNumber, DerivationPath as KaspaDerivationPath,
-    ExtendedPrivateKey as KaspaExtendedPrivateKey, Language as KaspaLanguage, Mnemonic as KaspaMnemonic,
+    ExtendedPrivateKey as KaspaExtendedPrivateKey, Language as KaspaLanguage,
+    Mnemonic as KaspaMnemonic,
 };
 use kaspa_consensus_core::{
     config::params::Params as KaspaParams,
@@ -111,7 +116,8 @@ pub struct IgraSubmitResult {
 /// Abstraction over Kaspa submission to keep IGRA transport testable.
 #[async_trait]
 pub trait IgraPayloadSubmitter: Send + Sync + std::fmt::Debug {
-    async fn submit_payload(&self, request: &IgraSubmitRequest) -> Result<IgraSubmitResult, String>;
+    async fn submit_payload(&self, request: &IgraSubmitRequest)
+    -> Result<IgraSubmitResult, String>;
 }
 
 #[derive(Clone)]
@@ -145,11 +151,12 @@ impl Default for InProcessKaspaPayloadSubmitter {
 
 #[async_trait]
 impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
-    async fn submit_payload(&self, request: &IgraSubmitRequest) -> Result<IgraSubmitResult, String> {
-        let (payload_header, l2data) = build_igra_l2data(
-            &request.raw_tx_bytes,
-            request.payload_compression.as_deref(),
-        )?;
+    async fn submit_payload(
+        &self,
+        request: &IgraSubmitRequest,
+    ) -> Result<IgraSubmitResult, String> {
+        let (payload_header, l2data) =
+            build_igra_l2data(&request.raw_tx_bytes, request.payload_compression.as_deref())?;
         if l2data.len() > IGRA_MAX_L2DATA_BYTES {
             return Err(format!(
                 "{IGRA_L2DATA_TOO_LARGE_ERROR_CODE}: L2Data size {} bytes exceeds max {} bytes",
@@ -171,10 +178,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
         let source_address = kaspa_address_from_private_key(&private_key, address_prefix)?;
         info!(
             "IGRA submit: kaspa_source_address={} kaspa_network={} kaspa_rpc_url={} l2_tx_hash={}",
-            source_address,
-            network,
-            rpc_url,
-            request.l2_tx_hash
+            source_address, network, rpc_url, request.l2_tx_hash
         );
         let mut client = GrpcClient::connect(rpc_url.to_string())
             .await
@@ -191,13 +195,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
         for attempt in 0..=1 {
             let force_refresh = attempt > 0;
             let utxos = self
-                .load_utxos(
-                    &mut client,
-                    rpc_url,
-                    network,
-                    &source_address,
-                    force_refresh,
-                )
+                .load_utxos(&mut client, rpc_url, network, &source_address, force_refresh)
                 .await?;
 
             // Allow one forced refresh pass in case the cache is stale or the node just finished syncing.
@@ -219,11 +217,18 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                 return Err(message);
             }
 
+            let current_daa_score = client
+                .get_block_dag_info()
+                .await
+                .map_err(|err| format!("IGRA submit error: failed to load Kaspa DAG info: {err}"))?
+                .virtual_daa_score;
+
             let private_key_for_build = private_key;
             let source_address_for_build = source_address.clone();
             let l2data_for_build = l2data.clone();
             let prefix_for_build = prefix_bytes.clone();
             let mining_timeout_for_build = mining_timeout;
+            let current_daa_score_for_build = current_daa_score;
             let (payload_nonce, transaction) = tokio::task::spawn_blocking(move || {
                 mine_and_build_signed_payload_transaction(
                     &private_key_for_build,
@@ -233,11 +238,14 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                     &l2data_for_build,
                     &prefix_for_build,
                     mining_timeout_for_build,
+                    current_daa_score_for_build,
                     &utxos,
                 )
             })
             .await
-            .map_err(|err| format!("IGRA submit error: failed to join Kaspa tx builder task: {err}"))??;
+            .map_err(|err| {
+                format!("IGRA submit error: failed to join Kaspa tx builder task: {err}")
+            })??;
             // Invalidate local UTXO cache before broadcast so concurrent reads cannot reuse
             // potentially spent entries from this submission attempt.
             self.invalidate_utxo_cache().await;
@@ -252,11 +260,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                         payload_nonce,
                         payload_header,
                         l2data.len(),
-                        request
-                            .payload_compression
-                            .as_deref()
-                            .unwrap_or("none")
-                            .trim(),
+                        request.payload_compression.as_deref().unwrap_or("none").trim(),
                         request.l2_tx_hash
                     );
                     return Ok(IgraSubmitResult { kaspa_tx_id, payload_nonce });
@@ -378,8 +382,9 @@ fn resolve_mnemonic_private_key(
     index: u32,
 ) -> Result<[u8; 32], String> {
     let phrase = if Path::new(mnemonic).is_file() {
-        fs::read_to_string(mnemonic)
-            .map_err(|err| format!("IGRA key resolution error: failed to read mnemonic file: {err}"))?
+        fs::read_to_string(mnemonic).map_err(|err| {
+            format!("IGRA key resolution error: failed to read mnemonic file: {err}")
+        })?
     } else {
         mnemonic.to_string()
     };
@@ -390,36 +395,42 @@ fn resolve_mnemonic_private_key(
     // - BIP39 seed from mnemonic (+ optional passphrase)
     // - BIP32 master key
     // - BIP44-ish path: m/44'/111111'/0'/0/<index> by default (single-sig receive chain)
-    let kaspa_mnemonic = KaspaMnemonic::new(phrase, KaspaLanguage::English).map_err(|err| {
-        format!("IGRA key resolution error: invalid Kaspa mnemonic: {err}")
-    })?;
+    let kaspa_mnemonic = KaspaMnemonic::new(phrase, KaspaLanguage::English)
+        .map_err(|err| format!("IGRA key resolution error: invalid Kaspa mnemonic: {err}"))?;
     let seed = kaspa_mnemonic.to_seed(passphrase.unwrap_or_default());
 
     let xprv = KaspaExtendedPrivateKey::<KaspaSecretKey>::new(seed).map_err(|err| {
-        format!("IGRA key resolution error: failed to derive Kaspa master key from mnemonic seed: {err}")
+        format!(
+            "IGRA key resolution error: failed to derive Kaspa master key from mnemonic seed: {err}"
+        )
     })?;
 
     let secret = if let Some(path) = derivation_path {
-        let path = path
-            .parse::<KaspaDerivationPath>()
-            .map_err(|err| format!("IGRA key resolution error: invalid Kaspa derivation path: {err}"))?;
+        let path = path.parse::<KaspaDerivationPath>().map_err(|err| {
+            format!("IGRA key resolution error: invalid Kaspa derivation path: {err}")
+        })?;
         *xprv
             .derive_path(&path)
-            .map_err(|err| format!("IGRA key resolution error: failed to derive Kaspa key by path: {err}"))?
+            .map_err(|err| {
+                format!("IGRA key resolution error: failed to derive Kaspa key by path: {err}")
+            })?
             .private_key()
     } else {
-        let base = "m/44'/111111'/0'/0"
-            .parse::<KaspaDerivationPath>()
-            .map_err(|err| format!("IGRA key resolution error: failed to parse default Kaspa derivation path: {err}"))?;
-        let base = xprv
-            .derive_path(&base)
-            .map_err(|err| format!("IGRA key resolution error: failed to derive default Kaspa base key: {err}"))?;
-        *base
-            .derive_child(
-                KaspaChildNumber::new(index, false)
-                    .map_err(|err| format!("IGRA key resolution error: invalid Kaspa mnemonic index: {err}"))?,
+        let base = "m/44'/111111'/0'/0".parse::<KaspaDerivationPath>().map_err(|err| {
+            format!(
+                "IGRA key resolution error: failed to parse default Kaspa derivation path: {err}"
             )
-            .map_err(|err| format!("IGRA key resolution error: failed to derive Kaspa key by index: {err}"))?
+        })?;
+        let base = xprv.derive_path(&base).map_err(|err| {
+            format!("IGRA key resolution error: failed to derive default Kaspa base key: {err}")
+        })?;
+        *base
+            .derive_child(KaspaChildNumber::new(index, false).map_err(|err| {
+                format!("IGRA key resolution error: invalid Kaspa mnemonic index: {err}")
+            })?)
+            .map_err(|err| {
+                format!("IGRA key resolution error: failed to derive Kaspa key by index: {err}")
+            })?
             .private_key()
     };
 
@@ -444,7 +455,8 @@ fn resolve_keystore_path(config: &IgraKaspaWalletConfig) -> Result<PathBuf, Stri
 
     if let Some(account) = config.keystore_account.as_ref() {
         let keystore_dir = Config::foundry_keystores_dir().ok_or_else(|| {
-            "IGRA key resolution error: could not resolve default foundry keystore directory".to_string()
+            "IGRA key resolution error: could not resolve default foundry keystore directory"
+                .to_string()
         })?;
         return Ok(keystore_dir.join(account));
     }
@@ -1014,7 +1026,9 @@ impl<T> IgraTransport<T> {
                         {
                             Ok(Ok(())) => {}
                             Ok(Err(err)) => warn!("failed to release IGRA sender lock: {err}"),
-                            Err(err) => warn!("failed to join IGRA sender lock release task: {err}"),
+                            Err(err) => {
+                                warn!("failed to join IGRA sender lock release task: {err}")
+                            }
                         }
                     }
                 }
@@ -1100,7 +1114,10 @@ fn build_payload_with_nonce(header: u8, l2data: &[u8], nonce: u32) -> Vec<u8> {
     payload
 }
 
-fn build_igra_l2data(raw_tx: &[u8], payload_compression: Option<&str>) -> Result<(u8, Vec<u8>), String> {
+fn build_igra_l2data(
+    raw_tx: &[u8],
+    payload_compression: Option<&str>,
+) -> Result<(u8, Vec<u8>), String> {
     const IGRA_VERSION: u8 = 0x9;
     const TX_TYPE_RAW_UNCOMPRESSED: u8 = 0x4;
 
@@ -1112,10 +1129,11 @@ fn build_igra_l2data(raw_tx: &[u8], payload_compression: Option<&str>) -> Result
         }
         // The IGRA protocol defines a zipped payload type, but it is not deployed/accepted on
         // galleon testnet at the moment. Keep v1 deterministic by only supporting uncompressed.
-        "zlib" => Err("IGRA config error: `payload_compression=zlib` is not implemented; use `none`".to_string()),
-        _ => Err(format!(
-            "IGRA config error: `payload_compression` is invalid (supported: none)"
-        )),
+        "zlib" => {
+            Err("IGRA config error: `payload_compression=zlib` is not implemented; use `none`"
+                .to_string())
+        }
+        _ => Err(format!("IGRA config error: `payload_compression` is invalid (supported: none)")),
     }
 }
 
@@ -1127,6 +1145,7 @@ fn mine_and_build_signed_payload_transaction(
     l2data: &[u8],
     tx_id_prefix: &[u8],
     timeout: Duration,
+    current_daa_score: u64,
     utxos: &[RpcUtxosByAddressesEntry],
 ) -> Result<(u64, KaspaTransaction), String> {
     if utxos.is_empty() {
@@ -1142,9 +1161,25 @@ fn mine_and_build_signed_payload_transaction(
     // Select inputs once; payload nonce changes do not change payload length.
     // IGRA payload: 1-byte header + L2Data + 4-byte nonce.
     let payload_len = 1usize.saturating_add(l2data.len()).saturating_add(4);
+    let coinbase_maturity_daa = KaspaParams::from(network_type).coinbase_maturity();
 
-    let mut sorted = utxos.to_vec();
-    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
+    let mut sorted = utxos
+        .iter()
+        .filter(|entry| is_mature_kaspa_utxo(entry, current_daa_score, coinbase_maturity_daa))
+        .cloned()
+        .collect::<Vec<_>>();
+    if sorted.is_empty() {
+        return Err(format!(
+            "IGRA submit error: no mature Kaspa UTXOs for fee payment (source address: {source_address}; current DAA: {current_daa_score}; coinbase maturity: {coinbase_maturity_daa} DAA)"
+        ));
+    }
+    sorted.sort_by_key(|entry| {
+        (
+            entry.utxo_entry.is_coinbase,
+            std::cmp::Reverse(entry.utxo_entry.amount),
+            entry.utxo_entry.block_daa_score,
+        )
+    });
     let mut selected = Vec::new();
     let mut total_input = 0u64;
     for entry in sorted {
@@ -1173,23 +1208,13 @@ fn mine_and_build_signed_payload_transaction(
     let script_public_key = pay_to_address_script(source_address);
     let inputs = selected
         .iter()
-        .map(|entry| {
-            KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1)
-        })
+        .map(|entry| KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1))
         .collect::<Vec<_>>();
     let outputs = vec![KaspaTransactionOutput::new(output_value, script_public_key)];
 
     let payload = build_payload_with_nonce(payload_header, l2data, 0);
     let nonce_offset = payload.len().saturating_sub(4);
-    let mut tx = KaspaTransaction::new(
-        0,
-        inputs,
-        outputs,
-        0,
-        SubnetworkId::default(),
-        0,
-        payload,
-    );
+    let mut tx = KaspaTransaction::new(0, inputs, outputs, 0, SubnetworkId::default(), 0, payload);
 
     let start = Instant::now();
     let mut nonce = 0_u32;
@@ -1241,11 +1266,13 @@ fn mine_and_build_signed_payload_transaction(
         return Err("IGRA submit error: mined Kaspa txid prefix changed after signing; refusing to broadcast".to_string());
     }
 
-    let mass_calculator = KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
+    let mass_calculator =
+        KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
     let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
-    let contextual = mass_calculator
-        .calc_contextual_masses(&signed.as_verifiable())
-        .ok_or_else(|| "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string())?;
+    let contextual =
+        mass_calculator.calc_contextual_masses(&signed.as_verifiable()).ok_or_else(|| {
+            "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string()
+        })?;
     let mass = contextual.max(non_contextual);
     if mass > MAX_STANDARD_KASPA_TX_MASS {
         return Err(format!(
@@ -1256,6 +1283,22 @@ fn mine_and_build_signed_payload_transaction(
     let tx = signed.tx;
     tx.set_mass(mass);
     Ok((nonce as u64, tx))
+}
+
+fn is_mature_kaspa_utxo(
+    entry: &RpcUtxosByAddressesEntry,
+    current_daa_score: u64,
+    coinbase_maturity_daa: u64,
+) -> bool {
+    if !entry.utxo_entry.is_coinbase {
+        return true;
+    }
+
+    current_daa_score
+        >= entry
+            .utxo_entry
+            .block_daa_score
+            .saturating_add(coinbase_maturity_daa)
 }
 
 fn now_ms() -> u64 {
@@ -1341,7 +1384,7 @@ mod tests {
         IGRA_EIP4844_UNSUPPORTED_ERROR, IGRA_EIP7702_UNSUPPORTED_ERROR,
         IGRA_SEND_TRANSACTION_UNSUPPORTED_ERROR, IgraPayloadSubmitter, IgraTransport,
         IgraTransportConfig, KaspaAddress, KaspaAddressPrefix, KaspaAddressVersion,
-        kaspa_address_from_private_key, resolve_mnemonic_private_key,
+        is_mature_kaspa_utxo, kaspa_address_from_private_key, resolve_mnemonic_private_key,
     };
     use crate::igra_store::{
         IGRA_NONCE_REPLACEMENT_CANDIDATE_ERROR_CODE, IgraStore, IgraStoreConfig, TxLifecycleState,
@@ -1351,6 +1394,8 @@ mod tests {
     use alloy_primitives::{hex, utils::keccak256};
     use alloy_transport::{TransportError, TransportFut};
     use foundry_config::IgraKaspaWalletConfig;
+    use kaspa_consensus_core::tx::{ScriptPublicKey, TransactionId};
+    use kaspa_rpc_core::{RpcTransactionOutpoint, RpcUtxoEntry, RpcUtxosByAddressesEntry};
     use serde_json::value::RawValue;
     use std::sync::{
         Arc,
@@ -1358,6 +1403,44 @@ mod tests {
     };
     use std::time::Duration;
     use tower::Service;
+
+    #[test]
+    fn kaspa_payload_submitter_filters_immature_coinbase_utxos() {
+        fn entry(is_coinbase: bool, block_daa_score: u64) -> RpcUtxosByAddressesEntry {
+            RpcUtxosByAddressesEntry {
+                address: None,
+                outpoint: RpcTransactionOutpoint {
+                    transaction_id: TransactionId::default(),
+                    index: 0,
+                },
+                utxo_entry: RpcUtxoEntry::new(
+                    100_000_000,
+                    ScriptPublicKey::default(),
+                    block_daa_score,
+                    is_coinbase,
+                ),
+            }
+        }
+
+        let current_daa = 2_000;
+        let coinbase_maturity_daa = 1_000;
+
+        assert!(is_mature_kaspa_utxo(
+            &entry(false, 1_999),
+            current_daa,
+            coinbase_maturity_daa
+        ));
+        assert!(!is_mature_kaspa_utxo(
+            &entry(true, current_daa - coinbase_maturity_daa + 1),
+            current_daa,
+            coinbase_maturity_daa
+        ));
+        assert!(is_mature_kaspa_utxo(
+            &entry(true, current_daa - coinbase_maturity_daa),
+            current_daa,
+            coinbase_maturity_daa
+        ));
+    }
 
     #[test]
     #[ignore = "development helper: prints derived Kaspa addresses for candidate derivation schemes"]
@@ -1391,11 +1474,15 @@ mod tests {
         // The sample CLI output shows `[1a1f47ce]`.
         let maybe_account_index = 0x1a1f_47ceu32;
         let maybe_path = format!("m/44'/111111'/{maybe_account_index}'/0/0");
-        let maybe_key = resolve_mnemonic_private_key(mnemonic, None, Some(&maybe_path), 0).expect("derive kaspa key");
+        let maybe_key = resolve_mnemonic_private_key(mnemonic, None, Some(&maybe_path), 0)
+            .expect("derive kaspa key");
         let maybe_addr = kaspa_address_from_private_key(&maybe_key, KaspaAddressPrefix::Testnet)
             .expect("derive kaspa address")
             .to_string();
-        println!("maybe_account_index_1a1f47ce: {maybe_addr}{}", if maybe_addr == expected { "  <== MATCH" } else { "" });
+        println!(
+            "maybe_account_index_1a1f47ce: {maybe_addr}{}",
+            if maybe_addr == expected { "  <== MATCH" } else { "" }
+        );
 
         // Some wallet implementations do not use account_index=0 for the first visible account.
         // Brute force a reasonable range for the canonical BIP44 receive address (index 0).
@@ -1403,10 +1490,9 @@ mod tests {
             let path = format!("m/44'/111111'/{account_index}'/0/0");
             let private_key = resolve_mnemonic_private_key(mnemonic, None, Some(&path), 0)
                 .expect("derive kaspa key");
-            let address =
-                kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
-                    .expect("derive kaspa address")
-                    .to_string();
+            let address = kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
+                .expect("derive kaspa address")
+                .to_string();
             if address == expected {
                 println!("ACCOUNT_INDEX_MATCH path={path} address={address}");
                 break;
@@ -1420,11 +1506,7 @@ mod tests {
         let coin_vals = [111111u32, 972u32, 60u32];
         let bools = [false, true];
         let seg = |n: u32, hardened: bool| -> String {
-            if hardened {
-                format!("{n}'")
-            } else {
-                n.to_string()
-            }
+            if hardened { format!("{n}'") } else { n.to_string() }
         };
         for purpose in purpose_vals {
             for purpose_h in bools {
@@ -1441,8 +1523,13 @@ mod tests {
                                         seg(0, change_h),
                                         seg(0, idx_h),
                                     );
-                                    let private_key = resolve_mnemonic_private_key(mnemonic, None, Some(&path), 0)
-                                        .expect("derive kaspa key");
+                                    let private_key = resolve_mnemonic_private_key(
+                                        mnemonic,
+                                        None,
+                                        Some(&path),
+                                        0,
+                                    )
+                                    .expect("derive kaspa key");
                                     let address = kaspa_address_from_private_key(
                                         &private_key,
                                         KaspaAddressPrefix::Testnet,
@@ -1479,10 +1566,10 @@ mod tests {
         //
         // If the passphrase is empty, the derived seed and thus the deposit address will differ.
         let mnemonic = "test test test test test test test test test test test junk";
-        let private_key =
-            resolve_mnemonic_private_key(mnemonic, Some(mnemonic), None, 0).expect("derive kaspa key");
-        let address =
-            kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet).expect("derive kaspa address");
+        let private_key = resolve_mnemonic_private_key(mnemonic, Some(mnemonic), None, 0)
+            .expect("derive kaspa key");
+        let address = kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
+            .expect("derive kaspa address");
 
         // Requirement: must match the deposit address shown by `kaspa-cli` for this mnemonic.
         let expected = "kaspatest:qzf364tlnl7ja0w65ydu0m5l70pur2hcm3l3ahkmhs660zcyf7cvuf6uznufr";
@@ -1493,9 +1580,10 @@ mod tests {
     fn kaspa_mnemonic_default_deposit_address_differs_with_empty_passphrase() {
         // Same mnemonic but empty passphrase.
         let mnemonic = "test test test test test test test test test test test junk";
-        let private_key = resolve_mnemonic_private_key(mnemonic, None, None, 0).expect("derive kaspa key");
-        let address =
-            kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet).expect("derive kaspa address");
+        let private_key =
+            resolve_mnemonic_private_key(mnemonic, None, None, 0).expect("derive kaspa key");
+        let address = kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
+            .expect("derive kaspa address");
 
         // Documented behavior: empty passphrase is a different seed, thus different address.
         assert_ne!(
@@ -1736,9 +1824,7 @@ mod tests {
             input: Bytes::default(),
             access_list: Default::default(),
         };
-        let sig = signer
-            .sign_transaction_sync(&mut tx)
-            .expect("sign eip2930");
+        let sig = signer.sign_transaction_sync(&mut tx).expect("sign eip2930");
         let signed = Signed::new_unhashed(tx, sig);
         let mut raw_tx = Vec::with_capacity(signed.eip2718_encoded_length());
         signed.eip2718_encode(&mut raw_tx);
@@ -1779,9 +1865,7 @@ mod tests {
             input: Bytes::default(),
             access_list: Default::default(),
         };
-        let sig = signer
-            .sign_transaction_sync(&mut tx)
-            .expect("sign eip1559");
+        let sig = signer.sign_transaction_sync(&mut tx).expect("sign eip1559");
         let signed = Signed::new_unhashed(tx, sig);
         let mut raw_tx = Vec::with_capacity(signed.eip2718_encoded_length());
         signed.eip2718_encode(&mut raw_tx);

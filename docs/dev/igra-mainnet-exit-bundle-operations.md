@@ -1,6 +1,6 @@
 # IGRA Mainnet Exit Bundle Operations
 
-Last updated: 2026-04-23, Asia/Jerusalem
+Last updated: 2026-04-27, Asia/Jerusalem
 
 This runbook records the production process used for real mainnet exit batches.
 The `exit-3` flow is the current daily candidate flow: it uses the improved
@@ -10,6 +10,41 @@ and kaspawallet-compatible multisig signing artifacts.
 
 Use this document as the prompt context for another Codex instance when asking it
 to process a new daily exit bundle.
+
+## Bundle Modes
+
+There are now two valid production entry points.
+
+### Mode A: unsigned-first
+
+The bundle arrives as an `igra-exits` bundle without signer-1 applied yet.
+
+Typical operator flow:
+
+1. verify the bundle
+2. build and verify the unsigned transaction
+3. signer 1 signs
+4. signer 2 signs
+5. broadcast
+
+This is the mode where you may sign first and signer 2 signs after you.
+
+### Mode B: signer-1-first
+
+The bundle arrives as a `signed-1` bundle because signer 1 already built and
+signed it before sending it to you.
+
+Typical operator flow:
+
+1. verify the current `signed-1` bundle
+2. verify the embedded parent `igra-exits` bundle
+3. rebuild the unsigned artifacts from `input.json`
+4. confirm the rebuild matches the provided unsigned JSON/hex exactly
+5. verify the signer-1 artifact against that exact unsigned base
+6. signer 2 signs
+7. broadcast
+
+Do not assume every batch starts unsigned. Check `manifest.kind` first.
 
 ## Known Endpoints
 
@@ -60,19 +95,22 @@ For each new `exit-N` directory:
 
 1. Copy the bundle to a readable working directory, usually `/tmp/exit-N`.
 2. Locate the `.bundle` directory, funding UTXO file, and `keb_manifest_signing_pub.pem`.
-3. Verify the official bridge multisig address derives from the known kpubs at `m/0/0/1`.
-4. Verify every `manifest.json.files[]` SHA-256 entry.
-5. Verify `manifest.signature.b64` with `keb_manifest_signing_pub.pem`.
-6. Verify `derived/checks.json`, `derived/verify.checks.json`, and `derived/contract.preverify.json`.
-7. Independently query `https://rpc.igralabs.com:8545` for all exit transaction receipts.
-8. Independently query `https://api.kaspa.org` for all proposed funding UTXOs.
-9. Build `exit-N-official-bridge.input.json` with all exit outputs and change back to the official bridge address/path.
-10. Build the unsigned transaction with `cast igra build-exit`.
-11. Verify unsigned JSON and kaspawallet hex with `cast igra verify-exit`.
-12. Check mass and fee guardrails.
-13. Produce `exit-N-official-bridge-report.md`.
-14. Verify signer 1 output, verify signer 2 output, then broadcast.
-15. After broadcast, verify explorer acceptance, spent funding UTXOs, and change UTXO.
+3. Read `manifest.kind` and decide whether the batch is `unsigned-first` or `signed-1-first`.
+4. Verify the official bridge multisig address derives from the known kpubs at `m/0/0/1`.
+5. Verify every `manifest.json.files[]` SHA-256 entry.
+6. Verify the manifest signature with `keb_manifest_signing_pub.pem`.
+7. If the bundle is `signed-1-first`, also verify the embedded parent `igra-exits` bundle manifest, integral, and signature.
+8. Verify `derived/checks.json`, `derived/verify.checks.json`, `derived/contract.preverify.json`, and `derived/kaspa-exit-tx-artifacts-verify.report.json` when present.
+9. Independently query `https://rpc.igralabs.com:8545` for all exit transaction receipts.
+10. Independently query `https://api.kaspa.org` for all proposed funding UTXOs.
+11. If needed, build `exit-N-official-bridge.input.json` with all exit outputs and change back to the official bridge address/path.
+12. If needed, build the unsigned transaction with `cast igra build-exit`.
+13. Verify unsigned JSON and kaspawallet hex with `cast igra verify-exit`.
+14. If signer 1 already built the unsigned transaction, rebuild it locally from `input.json` and require an exact JSON/hex match.
+15. Check mass and fee guardrails.
+16. Produce `exit-N-official-bridge-report.md`.
+17. Verify signer 1 output if present, verify signer 2 output, then broadcast.
+18. After broadcast, verify explorer acceptance, spent funding UTXOs, and change UTXO.
 
 Never skip the live UTXO re-check immediately before signing/broadcast. A valid
 bundle can still become unspendable if the selected Kaspa UTXO was already spent.
@@ -170,7 +208,9 @@ funding_utxos.json
 funding-utxos.json
 keb_manifest_signing_pub.pem
 keb-from-<from>-to-<to>-<timestamp>.bundle/
+keb-from-<from>-to-<to>-<timestamp>-signed-1.bundle/
 keb-from-<from>-to-<to>-<timestamp>.bundle.zip
+keb-from-<from>-to-<to>-<timestamp>-signed-1.bundle.zip
 ```
 
 The funding file has appeared with both spellings. Prefer the file that is
@@ -187,6 +227,8 @@ Bundle contents:
 ```text
 manifest.json
 manifest.signature.b64
+bundle-manifest.igra-exits.json
+bundle-signature.igra-exits.json
 derived/exit.data.json
 derived/checks.json
 derived/contract.preverify.json
@@ -194,6 +236,14 @@ derived/verify.checks.json
 derived/tree.data.json
 derived/tree.snapshot.json
 derived/checkpoint.end.json
+derived/funding-utxos.json
+derived/exit-N-official-bridge.input.json
+derived/exit-N-official-bridge.unsigned.json
+derived/exit-N-official-bridge.unsigned.hex
+derived/exit-N-official-bridge.signed-1.hex
+derived/Kaswallet-report.txt
+derived/Kaswallet-report.signed-1.txt
+derived/kaspa-exit-tx-artifacts-verify.report.json
 raw/checkpoints.json
 raw/keb_burn_logs.json
 raw/keb_exit_logs.json
@@ -201,7 +251,19 @@ raw/hook_inserted_logs.json
 raw/successful_exit_logs.json
 raw/tx/*.tx.json
 raw/tx/*.receipt.json
+refs/kas-exit-bridge-contract-authenticity.expected.json
+refs/kas-exit-bridge-exit-pipeline-annex.md
+refs/kas-exit-bridge-exit-verification-methodology.md
+refs/kaspaExitTransaction/kas-entry-multisig.expected.json
+refs/keb-signers.json
 ```
+
+Notes:
+
+- older bundles may use `refs/kas-exit-bridge-query-audit-methodology.md`
+- newer bundles use `refs/kas-exit-bridge-exit-verification-methodology.md`
+- newer `signed-1` bundles include both the current signed-1 manifest and the
+  embedded parent `igra-exits` manifest/signature
 
 Important operational note:
 
@@ -240,14 +302,29 @@ If the bundle is nested one level deeper after copying from Downloads, set
 
 ## Bundle Verification Checklist
 
-### Alignment With Query Methodology
+### Alignment With Verification Methodology
 
 The exit bundle checks are aligned with
-`kas-bridge-history-data-till-block-4492799/docs/kas-exit-bridge-query-audit-methodology.md`.
-That methodology proves the Igra L2 side: `KasExitBridge` exits, Hyperlane
-dispatch/message IDs, `MerkleTreeHook` insertion data, and bundle provenance.
-This runbook consumes those artifacts and adds the Kaspa L1 controls needed to
-build, sign, broadcast, and later audit the real payout transaction.
+the methodology file referenced by the bundle itself.
+
+Older bundles may point to:
+
+- `refs/kas-exit-bridge-query-audit-methodology.md`
+
+Newer bundles may point to:
+
+- `refs/kas-exit-bridge-exit-verification-methodology.md`
+
+The newer methodology extends the older query/audit model with:
+
+- contract pre-verification rules
+- parent-bundle chain checks
+- deterministic bundle-integrity validation order
+- Kaspa artifact checks `ARTF-*`
+- stage gates for `unsigned`, `signed-1`, and future `signed-2`
+
+This runbook consumes those artifacts and adds the remaining Kaspa L1 controls
+needed to build, sign, broadcast, and later audit the real payout transaction.
 
 Methodology provenance:
 
@@ -263,8 +340,12 @@ Methodology provenance:
   checks at the start and end of the bundle range.
 - `derived/exit.data.json`, `derived/checks.json`,
   `derived/verify.checks.json`, `derived/tree.data.json`,
-  `derived/tree.snapshot.json`, and `derived/checkpoint.end.json` are the
-  methodology output model used by this runbook.
+  `derived/tree.snapshot.json`, `derived/checkpoint.end.json`, and
+  `derived/contract.preverify.json` are the core methodology output model used
+  by this runbook.
+- newer `signed-1` bundles also include
+  `derived/kaspa-exit-tx-artifacts-verify.report.json`, which should be treated
+  as a first-class artifact-verification summary, not just a convenience file.
 
 Per-exit checks in `derived/checks.json` map to the methodology as follows:
 
@@ -321,6 +402,15 @@ existence and outpoint indices, output amounts, change path/address, transaction
 mass/fees, unsigned JSON/hex consistency, signer progress, broadcast, and public
 explorer acceptance.
 
+For newer `signed-1` bundles, also treat these as required:
+
+- current bundle `manifest.kind` matches the stage you received
+- embedded parent bundle integral/signature verifies
+- embedded parent bundle identity/integral matches the linkage recorded in the
+  current signed-1 manifest
+- unsigned rebuild from `input.json` matches the provided unsigned JSON/hex exactly
+- signer-1 artifact verifies against that exact unsigned base
+
 Set paths if they were not already set:
 
 ```bash
@@ -350,6 +440,25 @@ jq '{
   "$BUNDLE/manifest.json"
 ```
 
+Important:
+
+- `manifest.kind = "kas-exit-bridge-igra-exits-bundle"` means unsigned-first mode
+- `manifest.kind = "kas-exit-bridge-signed-1-bundle"` means signer-1-first mode
+
+If the current bundle is `signed-1-first`, also inspect the embedded parent manifest:
+
+```bash
+jq '{
+  kind,
+  schemaVersion,
+  createdAt,
+  bundleIntegral,
+  bundleIdentity,
+  methodology
+}' \
+  "$BUNDLE/bundle-manifest.igra-exits.json"
+```
+
 Verify all files listed in the manifest:
 
 ```bash
@@ -364,6 +473,19 @@ done
 ```
 
 Expected: no output.
+
+If present, verify the embedded parent `igra-exits` manifest files too:
+
+```bash
+cd "$BUNDLE"
+jq -r '.files[] | [.path, .sha256] | @tsv' bundle-manifest.igra-exits.json |
+while IFS=$'\t' read -r path expected; do
+  actual=$(/usr/bin/shasum -a 256 "$path" | /usr/bin/awk '{print $1}')
+  if [ "$actual" != "$expected" ]; then
+    printf 'PARENT_MISMATCH\t%s\texpected=%s\tactual=%s\n' "$path" "$expected" "$actual"
+  fi
+done
+```
 
 ### Bundle Integral Verification
 
@@ -438,6 +560,35 @@ Expected:
 ```text
 Signature Verified Successfully
 ```
+
+For `signed-1-first` mode, also verify the embedded parent `igra-exits` bundle
+signature. In the new structure, `bundle-signature.igra-exits.json` is raw
+base64 content, not a JSON object:
+
+```bash
+PARENT_SIG_B64="$BUNDLE/bundle-signature.igra-exits.json"
+PARENT_SIG_BIN="$BASE/parent-bundle.signature.bin"
+PARENT_DIGEST_BIN="$BASE/parent-bundle.bundleIntegral.digest.bin"
+
+openssl base64 -d -A -in "$PARENT_SIG_B64" -out "$PARENT_SIG_BIN"
+jq -r '.bundleIntegral.value' "$BUNDLE/bundle-manifest.igra-exits.json" | xxd -r -p > "$PARENT_DIGEST_BIN"
+
+openssl pkeyutl -verify \
+  -pubin \
+  -inkey "$MANIFEST_PUB_KEY" \
+  -sigfile "$PARENT_SIG_BIN" \
+  -in "$PARENT_DIGEST_BIN" \
+  -pkeyopt rsa_padding_mode:pkcs1 \
+  -pkeyopt digest:sha256
+```
+
+Required:
+
+- current bundle signature verifies
+- parent `igra-exits` bundle signature verifies
+- current bundle linkage fields match the parent manifest:
+  - `sourceBundle.bundleIdentity.value`
+  - `parentStageManifest.integral`
 
 Optional recovery check:
 
@@ -849,6 +1000,20 @@ Expected: `balanced: true`.
 
 ## Build And Verify Unsigned Transaction
 
+Branch here based on bundle mode.
+
+- In `unsigned-first` mode, build the unsigned transaction locally from the
+  verified input JSON and continue normally.
+- In `signed-1-first` mode, the bundle already includes:
+  - `derived/${BATCH_NAME}-official-bridge.input.json`
+  - `derived/${BATCH_NAME}-official-bridge.unsigned.json`
+  - `derived/${BATCH_NAME}-official-bridge.unsigned.hex`
+  - `derived/${BATCH_NAME}-official-bridge.signed-1.hex`
+
+In `signed-1-first` mode, do **not** trust those artifacts blindly. Rebuild the
+unsigned JSON/hex locally from the bundled input JSON and require an exact
+byte-for-byte match before accepting signer 1.
+
 Build:
 
 ```bash
@@ -879,6 +1044,23 @@ Expected:
 }
 ```
 
+For `signed-1-first` mode, compare the rebuilt outputs to the bundled outputs:
+
+```bash
+shasum -a 256 \
+  "$BUNDLE/derived/${BATCH_NAME}-official-bridge.unsigned.json" \
+  "$BASE/${BATCH_NAME}-official-bridge.unsigned.json" \
+  "$BUNDLE/derived/${BATCH_NAME}-official-bridge.unsigned.hex" \
+  "$BASE/${BATCH_NAME}-official-bridge.unsigned.hex"
+```
+
+Required:
+
+- bundled unsigned JSON hash equals rebuilt unsigned JSON hash
+- bundled unsigned hex hash equals rebuilt unsigned hex hash
+- rebuilt txid equals bundled txid
+- rebuilt nonce equals bundled nonce
+
 Review mass:
 
 ```bash
@@ -897,12 +1079,35 @@ Required:
 Official `kaspawallet sign` writes the signed transaction hex to stdout.
 Redirect stdout to the next artifact; do not assume a `-O` output flag exists.
 
+There are two signing starts:
+
+- `unsigned-first`: you start from `unsigned.hex`
+- `signed-1-first`: you start from an already provided `signed-1.hex`
+
 Signer 1 signs:
 
 ```bash
 ./kaspawallet sign \
   -F "$BASE/${BATCH_NAME}-official-bridge.unsigned.hex" \
   > "$BASE/${BATCH_NAME}-official-bridge.signed-1.hex"
+```
+
+Only run that command in `unsigned-first` mode.
+
+In `signed-1-first` mode, verify the provided signer-1 artifact instead:
+
+```bash
+./target/debug/cast igra verify-exit \
+  --manifest "$BASE/${BATCH_NAME}-official-bridge.unsigned.json" \
+  --hex "$BUNDLE/derived/${BATCH_NAME}-official-bridge.signed-1.hex" \
+  --allow-signatures
+```
+
+Then copy it into the working path you want to use for signer 2:
+
+```bash
+cp "$BUNDLE/derived/${BATCH_NAME}-official-bridge.signed-1.hex" \
+  "$BASE/${BATCH_NAME}-official-bridge.signed-1.hex"
 ```
 
 After signer 1:
@@ -925,6 +1130,14 @@ Expected:
 ```
 
 For exit-3, `<input_count>` is `2`. For older one-input batches it was `1`.
+
+For `signed-1-first` mode, require all of the following before moving to signer 2:
+
+- signer-1 txid equals the rebuilt unsigned txid
+- signer-1 nonce equals the rebuilt unsigned nonce
+- `signed_inputs == <input_count>`
+- `fully_signed == false`
+- the full-signature guard fails exactly as expected
 
 The full-signature check should fail after signer 1:
 
@@ -1113,27 +1326,32 @@ exit-N-official-bridge-report.md
 The report must include:
 
 1. Bundle path, block range, chain ID, contract addresses, and methodology hash.
-2. Bundle manifest hash check result.
-3. Manifest signature verification result, public key path, public key SHA-256,
+2. Bundle kind and whether the batch was `unsigned-first` or `signed-1-first`.
+3. Current bundle manifest hash check result.
+4. Current manifest signature verification result, public key path, public key SHA-256,
    signature SHA-256, and the signed `bundleIntegral.value`.
-4. Contract authenticity preverification result from `derived/contract.preverify.json`.
-5. Derived `checks.json` and `verify.checks.json` results.
-6. Raw-file cross-check result.
-7. Igra RPC receipt check result.
-8. Funding UTXO source file and whether bundle-local funding differs.
-9. Funding transaction API acceptance result.
-10. Funding UTXO unspent check before build/sign/broadcast.
-11. Official bridge kpubs, `minimumSignatures`, `ecdsa`, path, derived address, and script.
-12. Generated input JSON path and hash.
-13. Unsigned JSON/hex paths and hashes.
-14. `verify-exit` output for unsigned, signed-1, and signed-2.
-15. Mass and fee report.
-16. Broadcast command and output.
-17. Post-broadcast `is_accepted` result, accepting block hash/score/time, and transaction mass.
-18. Old funding UTXO spent confirmation.
-19. All accepted outputs with index, request ID, amount, address, and script type.
-20. Change UTXO confirmation.
-21. Final status line.
+5. If `signed-1-first`, embedded parent `igra-exits` manifest hash check,
+   integral verification, signature verification, and linkage match result.
+6. If `signed-1-first`, exact rebuild-match proof for bundled vs rebuilt
+   unsigned JSON/hex.
+7. Contract authenticity preverification result from `derived/contract.preverify.json`.
+8. Derived `checks.json`, `verify.checks.json`, and `kaspa-exit-tx-artifacts-verify.report.json` results when present.
+9. Raw-file cross-check result.
+10. Igra RPC receipt check result.
+11. Funding UTXO source file and whether bundle-local funding differs.
+12. Funding transaction API acceptance result.
+13. Funding UTXO unspent check before build/sign/broadcast.
+14. Official bridge kpubs, `minimumSignatures`, `ecdsa`, path, derived address, and script.
+15. Generated or bundled input JSON path and hash.
+16. Unsigned JSON/hex paths and hashes.
+17. `verify-exit` output for unsigned, signed-1, and signed-2.
+18. Mass and fee report.
+19. Broadcast command and output.
+20. Post-broadcast `is_accepted` result, accepting block hash/score/time, and transaction mass.
+21. Old funding UTXO spent confirmation.
+22. All accepted outputs with index, request ID, amount, address, and script type.
+23. Change UTXO confirmation.
+24. Final status line.
 
 ## Completed Production Batches
 
