@@ -17,6 +17,7 @@ pub mod da_estimate;
 pub mod erc20;
 pub mod estimate;
 pub mod find_block;
+pub mod igra_q;
 pub mod interface;
 pub mod logs;
 pub mod mktx;

@@ -28,14 +28,14 @@ pub struct IgraKaspaWalletConfig {
 impl IgraKaspaWalletConfig {
     /// Returns true when no explicit Kaspa signer source was configured.
     pub fn is_empty(&self) -> bool {
-        self.private_key.is_none() &&
-            self.mnemonic.is_none() &&
-            self.mnemonic_passphrase.is_none() &&
-            self.mnemonic_derivation_path.is_none() &&
-            self.mnemonic_index.is_none() &&
-            self.keystore.is_none() &&
-            self.keystore_account.is_none() &&
-            self.password.is_none()
+        self.private_key.is_none()
+            && self.mnemonic.is_none()
+            && self.mnemonic_passphrase.is_none()
+            && self.mnemonic_derivation_path.is_none()
+            && self.mnemonic_index.is_none()
+            && self.keystore.is_none()
+            && self.keystore_account.is_none()
+            && self.password.is_none()
     }
 }
 
@@ -65,6 +65,10 @@ pub struct IgraConfig {
     ///
     /// Supported: "none".
     pub payload_compression: Option<String>,
+    /// Target IGRA logic zone for raw transaction submission.
+    ///
+    /// Supported: "canonical" (default), "falcon-l5".
+    pub logic_zone: Option<String>,
     /// Sender lock timeout in seconds.
     pub sender_lock_timeout_secs: Option<u64>,
     /// Retention period for completed IGRA tx-map entries.
@@ -160,6 +164,16 @@ impl IgraConfig {
             }
         }
 
+        if let Some(logic_zone) = self.logic_zone.as_deref() {
+            let logic_zone = logic_zone.trim().to_ascii_lowercase();
+            if !matches!(logic_zone.as_str(), "" | "canonical" | "falcon-l5") {
+                return Err(IgraConfigError::Invalid {
+                    field: "logic_zone",
+                    reason: "supported values: canonical, falcon-l5".to_string(),
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -238,6 +252,7 @@ mod tests {
             el_receipt_timeout_secs: Some(300),
             mining_timeout_secs: Some(120),
             payload_compression: None,
+            logic_zone: None,
             sender_lock_timeout_secs: Some(60),
             completed_retention_hours: Some(168),
             failed_retention_hours: Some(720),
@@ -360,6 +375,25 @@ mod tests {
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("payload_compression"));
+        assert!(err.contains("supported values"));
+    }
+
+    #[test]
+    fn validate_accepts_supported_logic_zones() {
+        for logic_zone in [None, Some("canonical"), Some("falcon-l5")] {
+            let mut config = valid_config();
+            config.logic_zone = logic_zone.map(str::to_string);
+            assert!(config.validate().is_ok(), "logic_zone {logic_zone:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_logic_zone() {
+        let mut config = valid_config();
+        config.logic_zone = Some("ml-dsa".to_string());
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("logic_zone"));
         assert!(err.contains("supported values"));
     }
 }

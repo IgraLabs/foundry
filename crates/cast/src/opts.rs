@@ -1,10 +1,27 @@
 use crate::cmd::{
-    access_list::AccessListArgs, artifact::ArtifactArgs, b2e_payload::B2EPayloadArgs,
-    bind::BindArgs, call::CallArgs, constructor_args::ConstructorArgsArgs, create2::Create2Args,
-    creation_code::CreationCodeArgs, da_estimate::DAEstimateArgs, erc20::Erc20Subcommand,
-    estimate::EstimateArgs, find_block::FindBlockArgs, interface::InterfaceArgs, logs::LogsArgs,
-    mktx::MakeTxArgs, rpc::RpcArgs, run::RunArgs, send::SendTxArgs, storage::StorageArgs,
-    trace::TraceArgs, txpool::TxPoolSubcommands, wallet::WalletSubcommands,
+    access_list::AccessListArgs,
+    artifact::ArtifactArgs,
+    b2e_payload::B2EPayloadArgs,
+    bind::BindArgs,
+    call::CallArgs,
+    constructor_args::ConstructorArgsArgs,
+    create2::Create2Args,
+    creation_code::CreationCodeArgs,
+    da_estimate::DAEstimateArgs,
+    erc20::Erc20Subcommand,
+    estimate::EstimateArgs,
+    find_block::FindBlockArgs,
+    igra_q::{IgraQAddressArgs, IgraQEntryArgs, IgraQKeygenArgs, IgraQMakeTxArgs},
+    interface::InterfaceArgs,
+    logs::LogsArgs,
+    mktx::MakeTxArgs,
+    rpc::RpcArgs,
+    run::RunArgs,
+    send::SendTxArgs,
+    storage::StorageArgs,
+    trace::TraceArgs,
+    txpool::TxPoolSubcommands,
+    wallet::WalletSubcommands,
 };
 use alloy_ens::NameOrAddress;
 use alloy_primitives::{Address, B256, Selector, U256};
@@ -551,6 +568,22 @@ pub enum CastSubcommand {
         #[command(flatten)]
         rpc: RpcOpts,
     },
+
+    /// Derive an IGRA Falcon-L5 q-zone address from a q private key.
+    #[command(name = "igra-q-address")]
+    IgraQAddress(IgraQAddressArgs),
+
+    /// Generate an IGRA Falcon-L5 q-zone keypair.
+    #[command(name = "igra-q-keygen")]
+    IgraQKeygen(IgraQKeygenArgs),
+
+    /// Build and sign an IGRA Falcon-L5 q-zone raw transaction.
+    #[command(name = "igra-q-mktx")]
+    IgraQMakeTx(IgraQMakeTxArgs),
+
+    /// Submit an IGRA Falcon-L5 q-zone Entry through Kaspa.
+    #[command(name = "igra-q-entry")]
+    IgraQEntry(IgraQEntryArgs),
 
     /// Sign and publish a transaction.
     #[command(name = "send", visible_alias = "s")]

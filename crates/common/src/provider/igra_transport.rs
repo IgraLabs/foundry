@@ -4,7 +4,9 @@ use crate::igra_store::{
     IGRA_NONCE_GAP_ERROR_CODE, IGRA_NONCE_REPLACEMENT_CANDIDATE_ERROR_CODE, IgraStore,
     IgraStoreConfig, IgraStoreError, NonceOrdering, TxLifecycleState, TxLifecycleUpdate,
 };
-use alloy_consensus::{Transaction as AlloyTransaction, TxEnvelope, transaction::SignerRecoverable};
+use alloy_consensus::{
+    Transaction as AlloyTransaction, TxEnvelope, transaction::SignerRecoverable,
+};
 use alloy_json_rpc::{
     Id, Request, RequestPacket, Response, ResponsePacket, ResponsePayload, SerializedRequest,
 };
@@ -14,11 +16,14 @@ use alloy_signer_local::PrivateKeySigner;
 use alloy_transport::{TransportError, TransportErrorKind, TransportFut};
 use async_trait::async_trait;
 use foundry_config::{Config, IgraKaspaWalletConfig};
-use kaspa_addresses::{Address as KaspaAddress, Prefix as KaspaAddressPrefix, Version as KaspaAddressVersion};
+use kaspa_addresses::{
+    Address as KaspaAddress, Prefix as KaspaAddressPrefix, Version as KaspaAddressVersion,
+};
 use kaspa_bip32::secp256k1::SecretKey as KaspaSecretKey;
 use kaspa_bip32::{
     ChildNumber as KaspaChildNumber, DerivationPath as KaspaDerivationPath,
-    ExtendedPrivateKey as KaspaExtendedPrivateKey, Language as KaspaLanguage, Mnemonic as KaspaMnemonic,
+    ExtendedPrivateKey as KaspaExtendedPrivateKey, Language as KaspaLanguage,
+    Mnemonic as KaspaMnemonic,
 };
 use kaspa_consensus_core::{
     config::params::Params as KaspaParams,
@@ -63,11 +68,25 @@ pub const IGRA_MINING_TIMEOUT_ERROR_CODE: &str = "IGRA_MINING_001";
 pub const IGRA_L2DATA_TOO_LARGE_ERROR_CODE: &str = "IGRA_PAYLOAD_001";
 /// Error returned when no usable Kaspa key material is available for IGRA submission.
 pub const IGRA_KEY_RESOLUTION_ERROR: &str = "IGRA key resolution error: cannot derive Kaspa key from current EVM signer; provide --private-key-kaspa or --mnemonic-kaspa";
+/// Error returned when a raw transaction is not valid for the Falcon-L5 q-zone transport mode.
+pub const IGRA_Q_RAW_TRANSACTION_ERROR: &str = "IGRA q-zone raw transaction error";
 
 const DEFAULT_MINING_TIMEOUT_SECS: u64 = 120;
 const MAX_STANDARD_KASPA_TX_MASS: u64 = 100_000;
 // Per IGRA Transaction Protocol: L2Data (raw EVM tx bytes) must not exceed this.
 const IGRA_MAX_L2DATA_BYTES: usize = 24_800;
+const IGRA_VERSION: u8 = 0x9;
+const IGRA_CANONICAL_RAW_TX_TYPE: u8 = 0x4;
+const IGRA_LOGIC_ZONE_TX_TYPE: u8 = 0x0f;
+const IGRA_LOGIC_ZONE_HEADER_SIZE: usize = 4;
+const IGRA_Q_RAW_TX_MAX_BYTES: usize = IGRA_MAX_L2DATA_BYTES - IGRA_LOGIC_ZONE_HEADER_SIZE;
+const IGRA_Q_L2DATA_MAX_BYTES: usize = IGRA_MAX_L2DATA_BYTES;
+const IGRA_Q_ENVELOPE_VERSION: u8 = 0x01;
+const IGRA_FALCON_L5_Q_ZONE_ID: u16 = 0x0002;
+const IGRA_Q_ENTRY_TX_TYPE: u8 = 0x02;
+const IGRA_Q_RAW_TX_TYPE: u8 = 0x04;
+const IGRA_FALCON_L5_TX_TYPE: u8 = 0x7c;
+const IGRA_Q_ENTRY_BYTES: usize = 28;
 const CACHE_TTL_SECS: u64 = 20;
 const BASE_SUBMIT_FEE_SOMPI: u64 = 200_000;
 const FEE_PER_KIB_SOMPI: u64 = 20_000;
@@ -85,6 +104,8 @@ pub struct IgraTransportConfig {
     pub kaspa_network: Option<String>,
     /// Payload compression mode for L2Data inside the Kaspa payload.
     pub payload_compression: Option<String>,
+    /// Target IGRA logic zone for raw transaction submission.
+    pub logic_zone: Option<String>,
     pub kaspa_wallet: IgraKaspaWalletConfig,
 }
 
@@ -93,12 +114,51 @@ pub struct IgraTransportConfig {
 pub struct IgraSubmitRequest {
     pub l2_tx_hash: String,
     pub raw_tx_bytes: Vec<u8>,
+    pub payload_kind: IgraPayloadKind,
     pub tx_id_prefix: String,
     pub mining_timeout_secs: u64,
     pub kaspa_rpc_url: Option<String>,
     pub kaspa_network: Option<String>,
     pub payload_compression: Option<String>,
+    pub logic_zone: Option<String>,
     pub kaspa_wallet: IgraKaspaWalletConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IgraPayloadKind {
+    CanonicalRawTx,
+    FalconL5RawTx,
+    FalconL5Entry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IgraLogicZone {
+    Canonical,
+    FalconL5,
+}
+
+impl IgraLogicZone {
+    fn from_config(value: Option<&str>) -> Result<Self, String> {
+        let value = value.unwrap_or("canonical").trim().to_ascii_lowercase();
+        match value.as_str() {
+            "" | "canonical" => Ok(Self::Canonical),
+            "falcon-l5" => Ok(Self::FalconL5),
+            _ => Err(format!(
+                "IGRA config error: `logic_zone` is invalid (supported: canonical, falcon-l5)"
+            )),
+        }
+    }
+
+    const fn is_falcon_l5(self) -> bool {
+        matches!(self, Self::FalconL5)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IgraPayloadData {
+    header: u8,
+    l2data: Vec<u8>,
+    max_l2data_bytes: usize,
 }
 
 /// Result returned by a Kaspa submitter implementation.
@@ -111,7 +171,8 @@ pub struct IgraSubmitResult {
 /// Abstraction over Kaspa submission to keep IGRA transport testable.
 #[async_trait]
 pub trait IgraPayloadSubmitter: Send + Sync + std::fmt::Debug {
-    async fn submit_payload(&self, request: &IgraSubmitRequest) -> Result<IgraSubmitResult, String>;
+    async fn submit_payload(&self, request: &IgraSubmitRequest)
+    -> Result<IgraSubmitResult, String>;
 }
 
 #[derive(Clone)]
@@ -145,16 +206,21 @@ impl Default for InProcessKaspaPayloadSubmitter {
 
 #[async_trait]
 impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
-    async fn submit_payload(&self, request: &IgraSubmitRequest) -> Result<IgraSubmitResult, String> {
-        let (payload_header, l2data) = build_igra_l2data(
+    async fn submit_payload(
+        &self,
+        request: &IgraSubmitRequest,
+    ) -> Result<IgraSubmitResult, String> {
+        let payload_data = build_igra_l2data(
             &request.raw_tx_bytes,
             request.payload_compression.as_deref(),
+            request.logic_zone.as_deref(),
+            request.payload_kind,
         )?;
-        if l2data.len() > IGRA_MAX_L2DATA_BYTES {
+        if payload_data.l2data.len() > payload_data.max_l2data_bytes {
             return Err(format!(
                 "{IGRA_L2DATA_TOO_LARGE_ERROR_CODE}: L2Data size {} bytes exceeds max {} bytes",
-                l2data.len(),
-                IGRA_MAX_L2DATA_BYTES
+                payload_data.l2data.len(),
+                payload_data.max_l2data_bytes
             ));
         }
 
@@ -171,10 +237,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
         let source_address = kaspa_address_from_private_key(&private_key, address_prefix)?;
         info!(
             "IGRA submit: kaspa_source_address={} kaspa_network={} kaspa_rpc_url={} l2_tx_hash={}",
-            source_address,
-            network,
-            rpc_url,
-            request.l2_tx_hash
+            source_address, network, rpc_url, request.l2_tx_hash
         );
         let mut client = GrpcClient::connect(rpc_url.to_string())
             .await
@@ -191,13 +254,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
         for attempt in 0..=1 {
             let force_refresh = attempt > 0;
             let utxos = self
-                .load_utxos(
-                    &mut client,
-                    rpc_url,
-                    network,
-                    &source_address,
-                    force_refresh,
-                )
+                .load_utxos(&mut client, rpc_url, network, &source_address, force_refresh)
                 .await?;
 
             // Allow one forced refresh pass in case the cache is stale or the node just finished syncing.
@@ -221,9 +278,10 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
 
             let private_key_for_build = private_key;
             let source_address_for_build = source_address.clone();
-            let l2data_for_build = l2data.clone();
+            let l2data_for_build = payload_data.l2data.clone();
             let prefix_for_build = prefix_bytes.clone();
             let mining_timeout_for_build = mining_timeout;
+            let payload_header = payload_data.header;
             let (payload_nonce, transaction) = tokio::task::spawn_blocking(move || {
                 mine_and_build_signed_payload_transaction(
                     &private_key_for_build,
@@ -237,7 +295,9 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                 )
             })
             .await
-            .map_err(|err| format!("IGRA submit error: failed to join Kaspa tx builder task: {err}"))??;
+            .map_err(|err| {
+                format!("IGRA submit error: failed to join Kaspa tx builder task: {err}")
+            })??;
             // Invalidate local UTXO cache before broadcast so concurrent reads cannot reuse
             // potentially spent entries from this submission attempt.
             self.invalidate_utxo_cache().await;
@@ -250,13 +310,9 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                         "IGRA submit: kaspa_tx_id={} payload_nonce={} payload_header=0x{:02x} l2data_len={} payload_compression={} l2_tx_hash={}",
                         kaspa_tx_id,
                         payload_nonce,
-                        payload_header,
-                        l2data.len(),
-                        request
-                            .payload_compression
-                            .as_deref()
-                            .unwrap_or("none")
-                            .trim(),
+                        payload_data.header,
+                        payload_data.l2data.len(),
+                        request.payload_compression.as_deref().unwrap_or("none").trim(),
                         request.l2_tx_hash
                     );
                     return Ok(IgraSubmitResult { kaspa_tx_id, payload_nonce });
@@ -378,8 +434,9 @@ fn resolve_mnemonic_private_key(
     index: u32,
 ) -> Result<[u8; 32], String> {
     let phrase = if Path::new(mnemonic).is_file() {
-        fs::read_to_string(mnemonic)
-            .map_err(|err| format!("IGRA key resolution error: failed to read mnemonic file: {err}"))?
+        fs::read_to_string(mnemonic).map_err(|err| {
+            format!("IGRA key resolution error: failed to read mnemonic file: {err}")
+        })?
     } else {
         mnemonic.to_string()
     };
@@ -390,36 +447,42 @@ fn resolve_mnemonic_private_key(
     // - BIP39 seed from mnemonic (+ optional passphrase)
     // - BIP32 master key
     // - BIP44-ish path: m/44'/111111'/0'/0/<index> by default (single-sig receive chain)
-    let kaspa_mnemonic = KaspaMnemonic::new(phrase, KaspaLanguage::English).map_err(|err| {
-        format!("IGRA key resolution error: invalid Kaspa mnemonic: {err}")
-    })?;
+    let kaspa_mnemonic = KaspaMnemonic::new(phrase, KaspaLanguage::English)
+        .map_err(|err| format!("IGRA key resolution error: invalid Kaspa mnemonic: {err}"))?;
     let seed = kaspa_mnemonic.to_seed(passphrase.unwrap_or_default());
 
     let xprv = KaspaExtendedPrivateKey::<KaspaSecretKey>::new(seed).map_err(|err| {
-        format!("IGRA key resolution error: failed to derive Kaspa master key from mnemonic seed: {err}")
+        format!(
+            "IGRA key resolution error: failed to derive Kaspa master key from mnemonic seed: {err}"
+        )
     })?;
 
     let secret = if let Some(path) = derivation_path {
-        let path = path
-            .parse::<KaspaDerivationPath>()
-            .map_err(|err| format!("IGRA key resolution error: invalid Kaspa derivation path: {err}"))?;
+        let path = path.parse::<KaspaDerivationPath>().map_err(|err| {
+            format!("IGRA key resolution error: invalid Kaspa derivation path: {err}")
+        })?;
         *xprv
             .derive_path(&path)
-            .map_err(|err| format!("IGRA key resolution error: failed to derive Kaspa key by path: {err}"))?
+            .map_err(|err| {
+                format!("IGRA key resolution error: failed to derive Kaspa key by path: {err}")
+            })?
             .private_key()
     } else {
-        let base = "m/44'/111111'/0'/0"
-            .parse::<KaspaDerivationPath>()
-            .map_err(|err| format!("IGRA key resolution error: failed to parse default Kaspa derivation path: {err}"))?;
-        let base = xprv
-            .derive_path(&base)
-            .map_err(|err| format!("IGRA key resolution error: failed to derive default Kaspa base key: {err}"))?;
-        *base
-            .derive_child(
-                KaspaChildNumber::new(index, false)
-                    .map_err(|err| format!("IGRA key resolution error: invalid Kaspa mnemonic index: {err}"))?,
+        let base = "m/44'/111111'/0'/0".parse::<KaspaDerivationPath>().map_err(|err| {
+            format!(
+                "IGRA key resolution error: failed to parse default Kaspa derivation path: {err}"
             )
-            .map_err(|err| format!("IGRA key resolution error: failed to derive Kaspa key by index: {err}"))?
+        })?;
+        let base = xprv.derive_path(&base).map_err(|err| {
+            format!("IGRA key resolution error: failed to derive default Kaspa base key: {err}")
+        })?;
+        *base
+            .derive_child(KaspaChildNumber::new(index, false).map_err(|err| {
+                format!("IGRA key resolution error: invalid Kaspa mnemonic index: {err}")
+            })?)
+            .map_err(|err| {
+                format!("IGRA key resolution error: failed to derive Kaspa key by index: {err}")
+            })?
             .private_key()
     };
 
@@ -444,7 +507,8 @@ fn resolve_keystore_path(config: &IgraKaspaWalletConfig) -> Result<PathBuf, Stri
 
     if let Some(account) = config.keystore_account.as_ref() {
         let keystore_dir = Config::foundry_keystores_dir().ok_or_else(|| {
-            "IGRA key resolution error: could not resolve default foundry keystore directory".to_string()
+            "IGRA key resolution error: could not resolve default foundry keystore directory"
+                .to_string()
         })?;
         return Ok(keystore_dir.join(account));
     }
@@ -472,6 +536,7 @@ pub struct IgraTransport<T> {
     kaspa_rpc_url: Option<String>,
     kaspa_network: Option<String>,
     payload_compression: Option<String>,
+    logic_zone: IgraLogicZone,
     kaspa_wallet: IgraKaspaWalletConfig,
     submitter: Arc<dyn IgraPayloadSubmitter>,
 }
@@ -488,6 +553,7 @@ impl<T> IgraTransport<T> {
             kaspa_rpc_url: None,
             kaspa_network: None,
             payload_compression: None,
+            logic_zone: IgraLogicZone::Canonical,
             kaspa_wallet: IgraKaspaWalletConfig::default(),
             submitter: Arc::new(InProcessKaspaPayloadSubmitter::default()),
         }
@@ -501,6 +567,8 @@ impl<T> IgraTransport<T> {
         self.kaspa_rpc_url = config.kaspa_rpc_url;
         self.kaspa_network = config.kaspa_network;
         self.payload_compression = config.payload_compression;
+        self.logic_zone = IgraLogicZone::from_config(config.logic_zone.as_deref())
+            .unwrap_or(IgraLogicZone::Canonical);
         self.kaspa_wallet = config.kaspa_wallet;
         self
     }
@@ -568,16 +636,23 @@ impl<T> IgraTransport<T> {
             return None;
         }
 
-        request.requests().iter().find_map(Self::request_rejection_reason)
+        request.requests().iter().find_map(|request| self.request_rejection_reason(request))
     }
 
-    fn request_rejection_reason(request: &SerializedRequest) -> Option<String> {
+    fn request_rejection_reason(&self, request: &SerializedRequest) -> Option<String> {
         if Self::is_unsupported_method(request.method()) {
             return Some(IGRA_SEND_TRANSACTION_UNSUPPORTED_ERROR.to_string());
         }
 
         if request.method() != "eth_sendRawTransaction" {
             return None;
+        }
+
+        if self.logic_zone.is_falcon_l5() {
+            return match Self::q_raw_tx_bytes(request) {
+                Ok(_) => None,
+                Err(err) => Some(format!("{IGRA_Q_RAW_TRANSACTION_ERROR}: {err}")),
+            };
         }
 
         match Self::raw_tx_type(request) {
@@ -624,6 +699,12 @@ impl<T> IgraTransport<T> {
         hex::decode(encoded).map_err(|err| format!("invalid raw tx hex: {err}"))
     }
 
+    fn q_raw_tx_bytes(request: &SerializedRequest) -> Result<Vec<u8>, String> {
+        let raw_tx = Self::raw_tx_bytes(request)?;
+        validate_q_raw_tx(&raw_tx)?;
+        Ok(raw_tx)
+    }
+
     fn single_send_raw_request(request: &RequestPacket) -> Option<&SerializedRequest> {
         match request {
             RequestPacket::Single(req) if req.method() == "eth_sendRawTransaction" => Some(req),
@@ -637,12 +718,17 @@ impl<T> IgraTransport<T> {
             None => return Ok(None),
         };
         let raw_tx = Self::raw_tx_bytes(request)?;
-        // Validate tx type up-front so we can fail before doing any expensive Kaspa work.
-        // We no longer embed the tx type in the payload (kaswallet format is payload == raw_l2_tx || nonce_le_u64).
-        let _tx_type_nibble = Self::raw_tx_type(request)?
-            .tx_type_nibble()
-            .ok_or_else(|| "unsupported tx type for IGRA payload header".to_string())?;
-        let metadata = Self::raw_tx_metadata_from_raw_tx(&raw_tx)?;
+        let metadata = if self.logic_zone.is_falcon_l5() {
+            validate_q_raw_tx(&raw_tx)?;
+            Self::q_raw_tx_metadata_from_raw_tx(&raw_tx)
+        } else {
+            // Validate tx type up-front so we can fail before doing any expensive Kaspa work.
+            // We no longer embed the tx type in the payload; the canonical header remains 0x94.
+            let _tx_type_nibble = Self::raw_tx_type(request)?
+                .tx_type_nibble()
+                .ok_or_else(|| "unsupported tx type for IGRA payload header".to_string())?;
+            Self::raw_tx_metadata_from_raw_tx(&raw_tx)?
+        };
 
         Ok(Some(RawSendRequest { id: request.id().clone(), raw_tx, metadata }))
     }
@@ -682,6 +768,11 @@ impl<T> IgraTransport<T> {
         let nonce = decoded.nonce();
 
         Ok(RawTxMetadata { l2_tx_hash, sender: Some(format!("{sender:#x}")), nonce: Some(nonce) })
+    }
+
+    fn q_raw_tx_metadata_from_raw_tx(raw_tx: &[u8]) -> RawTxMetadata {
+        let l2_tx_hash = format!("0x{}", hex::encode(keccak256(raw_tx)));
+        RawTxMetadata { l2_tx_hash, sender: None, nonce: None }
     }
 
     fn persist_transition_safe(
@@ -794,6 +885,7 @@ impl<T> IgraTransport<T> {
             let kaspa_rpc_url = self.kaspa_rpc_url.clone();
             let kaspa_network = self.kaspa_network.clone();
             let payload_compression = self.payload_compression.clone();
+            let logic_zone = self.logic_zone;
             let kaspa_wallet = self.kaspa_wallet.clone();
             let submitter = self.submitter.clone();
 
@@ -915,11 +1007,22 @@ impl<T> IgraTransport<T> {
                     let submit_request = IgraSubmitRequest {
                         l2_tx_hash: raw_send.metadata.l2_tx_hash.clone(),
                         raw_tx_bytes: raw_send.raw_tx.clone(),
+                        payload_kind: match logic_zone {
+                            IgraLogicZone::Canonical => IgraPayloadKind::CanonicalRawTx,
+                            IgraLogicZone::FalconL5 => IgraPayloadKind::FalconL5RawTx,
+                        },
                         tx_id_prefix: tx_id_prefix.clone(),
                         mining_timeout_secs: mining_timeout.as_secs(),
                         kaspa_rpc_url,
                         kaspa_network,
                         payload_compression: payload_compression.clone(),
+                        logic_zone: Some(
+                            match logic_zone {
+                                IgraLogicZone::Canonical => "canonical",
+                                IgraLogicZone::FalconL5 => "falcon-l5",
+                            }
+                            .to_string(),
+                        ),
                         kaspa_wallet,
                     };
                     let submit_result = submitter
@@ -1014,7 +1117,9 @@ impl<T> IgraTransport<T> {
                         {
                             Ok(Ok(())) => {}
                             Ok(Err(err)) => warn!("failed to release IGRA sender lock: {err}"),
-                            Err(err) => warn!("failed to join IGRA sender lock release task: {err}"),
+                            Err(err) => {
+                                warn!("failed to join IGRA sender lock release task: {err}")
+                            }
                         }
                     }
                 }
@@ -1100,23 +1205,106 @@ fn build_payload_with_nonce(header: u8, l2data: &[u8], nonce: u32) -> Vec<u8> {
     payload
 }
 
-fn build_igra_l2data(raw_tx: &[u8], payload_compression: Option<&str>) -> Result<(u8, Vec<u8>), String> {
-    const IGRA_VERSION: u8 = 0x9;
-    const TX_TYPE_RAW_UNCOMPRESSED: u8 = 0x4;
-
+fn build_igra_l2data(
+    raw_tx: &[u8],
+    payload_compression: Option<&str>,
+    logic_zone: Option<&str>,
+    payload_kind: IgraPayloadKind,
+) -> Result<IgraPayloadData, String> {
+    let logic_zone = IgraLogicZone::from_config(logic_zone)?;
     let mode = payload_compression.unwrap_or("none").trim().to_ascii_lowercase();
-    match mode.as_str() {
-        "" | "none" => {
-            let header = (IGRA_VERSION << 4) | TX_TYPE_RAW_UNCOMPRESSED;
-            Ok((header, raw_tx.to_vec()))
+
+    match payload_kind {
+        IgraPayloadKind::CanonicalRawTx if logic_zone.is_falcon_l5() => {
+            return Err(
+                "IGRA config error: canonical raw transactions cannot target falcon-l5 q-zone"
+                    .to_string(),
+            );
         }
+        IgraPayloadKind::FalconL5RawTx | IgraPayloadKind::FalconL5Entry
+            if !logic_zone.is_falcon_l5() =>
+        {
+            return Err(
+                "IGRA config error: Falcon-L5 q payloads require logic_zone=falcon-l5".to_string()
+            );
+        }
+        _ => {}
+    }
+
+    if matches!(payload_kind, IgraPayloadKind::FalconL5RawTx | IgraPayloadKind::FalconL5Entry) {
+        if !matches!(mode.as_str(), "" | "none") {
+            return Err(
+                "IGRA config error: q-zone does not support `payload_compression`; use `none`"
+                    .to_string(),
+            );
+        }
+
+        let zone_tx_type = match payload_kind {
+            IgraPayloadKind::FalconL5RawTx => {
+                validate_q_raw_tx(raw_tx)?;
+                IGRA_Q_RAW_TX_TYPE
+            }
+            IgraPayloadKind::FalconL5Entry => {
+                validate_q_entry(raw_tx)?;
+                IGRA_Q_ENTRY_TX_TYPE
+            }
+            IgraPayloadKind::CanonicalRawTx => unreachable!(),
+        };
+
+        let mut l2data = Vec::with_capacity(IGRA_LOGIC_ZONE_HEADER_SIZE + raw_tx.len());
+        l2data.push(IGRA_Q_ENVELOPE_VERSION);
+        l2data.extend_from_slice(&IGRA_FALCON_L5_Q_ZONE_ID.to_be_bytes());
+        l2data.push(zone_tx_type);
+        l2data.extend_from_slice(raw_tx);
+
+        return Ok(IgraPayloadData {
+            header: (IGRA_VERSION << 4) | IGRA_LOGIC_ZONE_TX_TYPE,
+            l2data,
+            max_l2data_bytes: IGRA_Q_L2DATA_MAX_BYTES,
+        });
+    }
+
+    match mode.as_str() {
+        "" | "none" => Ok(IgraPayloadData {
+            header: (IGRA_VERSION << 4) | IGRA_CANONICAL_RAW_TX_TYPE,
+            l2data: raw_tx.to_vec(),
+            max_l2data_bytes: IGRA_MAX_L2DATA_BYTES,
+        }),
         // The IGRA protocol defines a zipped payload type, but it is not deployed/accepted on
         // galleon testnet at the moment. Keep v1 deterministic by only supporting uncompressed.
-        "zlib" => Err("IGRA config error: `payload_compression=zlib` is not implemented; use `none`".to_string()),
-        _ => Err(format!(
-            "IGRA config error: `payload_compression` is invalid (supported: none)"
-        )),
+        "zlib" => {
+            Err("IGRA config error: `payload_compression=zlib` is not implemented; use `none`"
+                .to_string())
+        }
+        _ => Err(format!("IGRA config error: `payload_compression` is invalid (supported: none)")),
     }
+}
+
+fn validate_q_raw_tx(raw_tx: &[u8]) -> Result<(), String> {
+    let first = raw_tx.first().ok_or("empty raw q transaction bytes")?;
+    if *first != IGRA_FALCON_L5_TX_TYPE {
+        return Err(format!(
+            "expected Falcon-L5 q transaction type 0x{IGRA_FALCON_L5_TX_TYPE:02x}, got 0x{first:02x}"
+        ));
+    }
+    if raw_tx.len() > IGRA_Q_RAW_TX_MAX_BYTES {
+        return Err(format!(
+            "raw q transaction size {} bytes exceeds max {} bytes",
+            raw_tx.len(),
+            IGRA_Q_RAW_TX_MAX_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_q_entry(entry: &[u8]) -> Result<(), String> {
+    if entry.len() != IGRA_Q_ENTRY_BYTES {
+        return Err(format!(
+            "q Entry payload size {} bytes must equal {IGRA_Q_ENTRY_BYTES} bytes",
+            entry.len()
+        ));
+    }
+    Ok(())
 }
 
 fn mine_and_build_signed_payload_transaction(
@@ -1173,23 +1361,13 @@ fn mine_and_build_signed_payload_transaction(
     let script_public_key = pay_to_address_script(source_address);
     let inputs = selected
         .iter()
-        .map(|entry| {
-            KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1)
-        })
+        .map(|entry| KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1))
         .collect::<Vec<_>>();
     let outputs = vec![KaspaTransactionOutput::new(output_value, script_public_key)];
 
     let payload = build_payload_with_nonce(payload_header, l2data, 0);
     let nonce_offset = payload.len().saturating_sub(4);
-    let mut tx = KaspaTransaction::new(
-        0,
-        inputs,
-        outputs,
-        0,
-        SubnetworkId::default(),
-        0,
-        payload,
-    );
+    let mut tx = KaspaTransaction::new(0, inputs, outputs, 0, SubnetworkId::default(), 0, payload);
 
     let start = Instant::now();
     let mut nonce = 0_u32;
@@ -1241,11 +1419,13 @@ fn mine_and_build_signed_payload_transaction(
         return Err("IGRA submit error: mined Kaspa txid prefix changed after signing; refusing to broadcast".to_string());
     }
 
-    let mass_calculator = KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
+    let mass_calculator =
+        KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
     let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
-    let contextual = mass_calculator
-        .calc_contextual_masses(&signed.as_verifiable())
-        .ok_or_else(|| "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string())?;
+    let contextual =
+        mass_calculator.calc_contextual_masses(&signed.as_verifiable()).ok_or_else(|| {
+            "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string()
+        })?;
     let mass = contextual.max(non_contextual);
     if mass > MAX_STANDARD_KASPA_TX_MASS {
         return Err(format!(
@@ -1391,11 +1571,15 @@ mod tests {
         // The sample CLI output shows `[1a1f47ce]`.
         let maybe_account_index = 0x1a1f_47ceu32;
         let maybe_path = format!("m/44'/111111'/{maybe_account_index}'/0/0");
-        let maybe_key = resolve_mnemonic_private_key(mnemonic, None, Some(&maybe_path), 0).expect("derive kaspa key");
+        let maybe_key = resolve_mnemonic_private_key(mnemonic, None, Some(&maybe_path), 0)
+            .expect("derive kaspa key");
         let maybe_addr = kaspa_address_from_private_key(&maybe_key, KaspaAddressPrefix::Testnet)
             .expect("derive kaspa address")
             .to_string();
-        println!("maybe_account_index_1a1f47ce: {maybe_addr}{}", if maybe_addr == expected { "  <== MATCH" } else { "" });
+        println!(
+            "maybe_account_index_1a1f47ce: {maybe_addr}{}",
+            if maybe_addr == expected { "  <== MATCH" } else { "" }
+        );
 
         // Some wallet implementations do not use account_index=0 for the first visible account.
         // Brute force a reasonable range for the canonical BIP44 receive address (index 0).
@@ -1403,10 +1587,9 @@ mod tests {
             let path = format!("m/44'/111111'/{account_index}'/0/0");
             let private_key = resolve_mnemonic_private_key(mnemonic, None, Some(&path), 0)
                 .expect("derive kaspa key");
-            let address =
-                kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
-                    .expect("derive kaspa address")
-                    .to_string();
+            let address = kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
+                .expect("derive kaspa address")
+                .to_string();
             if address == expected {
                 println!("ACCOUNT_INDEX_MATCH path={path} address={address}");
                 break;
@@ -1420,11 +1603,7 @@ mod tests {
         let coin_vals = [111111u32, 972u32, 60u32];
         let bools = [false, true];
         let seg = |n: u32, hardened: bool| -> String {
-            if hardened {
-                format!("{n}'")
-            } else {
-                n.to_string()
-            }
+            if hardened { format!("{n}'") } else { n.to_string() }
         };
         for purpose in purpose_vals {
             for purpose_h in bools {
@@ -1441,8 +1620,13 @@ mod tests {
                                         seg(0, change_h),
                                         seg(0, idx_h),
                                     );
-                                    let private_key = resolve_mnemonic_private_key(mnemonic, None, Some(&path), 0)
-                                        .expect("derive kaspa key");
+                                    let private_key = resolve_mnemonic_private_key(
+                                        mnemonic,
+                                        None,
+                                        Some(&path),
+                                        0,
+                                    )
+                                    .expect("derive kaspa key");
                                     let address = kaspa_address_from_private_key(
                                         &private_key,
                                         KaspaAddressPrefix::Testnet,
@@ -1479,10 +1663,10 @@ mod tests {
         //
         // If the passphrase is empty, the derived seed and thus the deposit address will differ.
         let mnemonic = "test test test test test test test test test test test junk";
-        let private_key =
-            resolve_mnemonic_private_key(mnemonic, Some(mnemonic), None, 0).expect("derive kaspa key");
-        let address =
-            kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet).expect("derive kaspa address");
+        let private_key = resolve_mnemonic_private_key(mnemonic, Some(mnemonic), None, 0)
+            .expect("derive kaspa key");
+        let address = kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
+            .expect("derive kaspa address");
 
         // Requirement: must match the deposit address shown by `kaspa-cli` for this mnemonic.
         let expected = "kaspatest:qzf364tlnl7ja0w65ydu0m5l70pur2hcm3l3ahkmhs660zcyf7cvuf6uznufr";
@@ -1493,9 +1677,10 @@ mod tests {
     fn kaspa_mnemonic_default_deposit_address_differs_with_empty_passphrase() {
         // Same mnemonic but empty passphrase.
         let mnemonic = "test test test test test test test test test test test junk";
-        let private_key = resolve_mnemonic_private_key(mnemonic, None, None, 0).expect("derive kaspa key");
-        let address =
-            kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet).expect("derive kaspa address");
+        let private_key =
+            resolve_mnemonic_private_key(mnemonic, None, None, 0).expect("derive kaspa key");
+        let address = kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
+            .expect("derive kaspa address");
 
         // Documented behavior: empty passphrase is a different seed, thus different address.
         assert_ne!(
@@ -1661,8 +1846,13 @@ mod tests {
             kaspa_rpc_url: Some("grpc://127.0.0.1:16110".to_string()),
             kaspa_network: Some("testnet-10".to_string()),
             payload_compression: None,
+            logic_zone: None,
             kaspa_wallet: IgraKaspaWalletConfig::default(),
         }
+    }
+
+    fn q_test_transport_config() -> IgraTransportConfig {
+        IgraTransportConfig { logic_zone: Some("falcon-l5".to_string()), ..test_transport_config() }
     }
 
     fn batch_request_packet(methods: &[&str]) -> RequestPacket {
@@ -1736,9 +1926,7 @@ mod tests {
             input: Bytes::default(),
             access_list: Default::default(),
         };
-        let sig = signer
-            .sign_transaction_sync(&mut tx)
-            .expect("sign eip2930");
+        let sig = signer.sign_transaction_sync(&mut tx).expect("sign eip2930");
         let signed = Signed::new_unhashed(tx, sig);
         let mut raw_tx = Vec::with_capacity(signed.eip2718_encoded_length());
         signed.eip2718_encode(&mut raw_tx);
@@ -1779,9 +1967,7 @@ mod tests {
             input: Bytes::default(),
             access_list: Default::default(),
         };
-        let sig = signer
-            .sign_transaction_sync(&mut tx)
-            .expect("sign eip1559");
+        let sig = signer.sign_transaction_sync(&mut tx).expect("sign eip1559");
         let signed = Signed::new_unhashed(tx, sig);
         let mut raw_tx = Vec::with_capacity(signed.eip2718_encoded_length());
         signed.eip2718_encode(&mut raw_tx);
@@ -1791,6 +1977,26 @@ mod tests {
             .await
             .expect("EIP-1559 raw tx should be intercepted in IGRA mode");
 
+        assert_eq!(inner.calls(), 0, "inner transport should not be called");
+        assert_eq!(submitter.calls(), 1, "submitter should be called once");
+    }
+
+    #[tokio::test]
+    async fn igra_transport_allows_falcon_l5_q_raw_tx_without_evm_decode() {
+        let inner = RecordingTransport::default();
+        let submitter = RecordingSubmitter::success();
+        let transport = IgraTransport::new(inner.clone(), true)
+            .with_transport_config(q_test_transport_config())
+            .with_submitter_for_tests(Arc::new(submitter.clone()));
+        let raw_tx = [super::IGRA_FALCON_L5_TX_TYPE, 0xf0, 0x0d];
+        let expected_l2_hash = format!("0x{}", hex::encode(keccak256(raw_tx)));
+
+        let response = transport
+            .request(send_raw_packet(&raw_tx))
+            .await
+            .expect("Falcon-L5 q raw tx should be intercepted in IGRA q-zone mode");
+
+        assert_eq!(single_success_string(response), expected_l2_hash);
         assert_eq!(inner.calls(), 0, "inner transport should not be called");
         assert_eq!(submitter.calls(), 1, "submitter should be called once");
     }
@@ -1993,6 +2199,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn igra_transport_q_zone_rejects_canonical_raw_txs() {
+        let inner = RecordingTransport::default();
+        let transport = IgraTransport::new(inner.clone(), true)
+            .with_transport_config(q_test_transport_config());
+
+        let err = transport
+            .request(send_raw_packet(&[0x02, 0x00]))
+            .await
+            .expect_err("canonical EIP-1559 raw tx should be rejected in q-zone mode");
+
+        assert!(err.to_string().contains(super::IGRA_Q_RAW_TRANSACTION_ERROR));
+        assert!(err.to_string().contains("expected Falcon-L5 q transaction type 0x7c"));
+        assert_eq!(inner.calls(), 0, "inner transport should not be called on rejected q tx");
+    }
+
+    #[tokio::test]
     async fn igra_transport_rejects_malformed_send_raw_transaction_params() {
         let inner = RecordingTransport::default();
         let transport = IgraTransport::new(inner.clone(), true);
@@ -2092,6 +2314,86 @@ mod tests {
         assert_eq!(payload[0], 0x94, "expected IGRA (v=0x9, type=0x4) header");
         assert_eq!(&payload[1..4], &raw_tx);
         assert_eq!(&payload[4..8], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn igra_q_zone_payload_wraps_q_raw_tx_under_0x9f() {
+        let raw_tx = [super::IGRA_FALCON_L5_TX_TYPE, 0x01, 0x02];
+        let payload_data = super::build_igra_l2data(
+            &raw_tx,
+            None,
+            Some("falcon-l5"),
+            super::IgraPayloadKind::FalconL5RawTx,
+        )
+        .expect("q l2data builds");
+        let payload =
+            super::build_payload_with_nonce(payload_data.header, &payload_data.l2data, 0x01020304);
+
+        assert_eq!(payload_data.header, 0x9f);
+        assert_eq!(payload[0], 0x9f);
+        assert_eq!(&payload[1..5], &[0x01, 0x00, 0x02, 0x04]);
+        assert_eq!(&payload[5..8], &raw_tx);
+        assert_eq!(&payload[8..12], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn igra_q_zone_payload_wraps_q_entry_under_0x9f() {
+        let mut entry = [0u8; super::IGRA_Q_ENTRY_BYTES];
+        entry[..20].copy_from_slice(&[0x11; 20]);
+        entry[20..].copy_from_slice(&123_456u64.to_le_bytes());
+        let payload_data = super::build_igra_l2data(
+            &entry,
+            None,
+            Some("falcon-l5"),
+            super::IgraPayloadKind::FalconL5Entry,
+        )
+        .expect("q entry l2data builds");
+        let payload =
+            super::build_payload_with_nonce(payload_data.header, &payload_data.l2data, 0x01020304);
+
+        assert_eq!(payload_data.header, 0x9f);
+        assert_eq!(payload[0], 0x9f);
+        assert_eq!(&payload[1..5], &[0x01, 0x00, 0x02, 0x02]);
+        assert_eq!(&payload[5..33], &entry);
+        assert_eq!(&payload[33..37], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn igra_q_zone_payload_enforces_shared_vanilla_l2data_cap() {
+        let raw_tx = vec![super::IGRA_FALCON_L5_TX_TYPE; super::IGRA_Q_RAW_TX_MAX_BYTES];
+        let payload_data = super::build_igra_l2data(
+            &raw_tx,
+            None,
+            Some("falcon-l5"),
+            super::IgraPayloadKind::FalconL5RawTx,
+        )
+        .expect("q tx at cap builds");
+        assert_eq!(payload_data.l2data.len(), super::IGRA_MAX_L2DATA_BYTES);
+
+        let oversized = vec![super::IGRA_FALCON_L5_TX_TYPE; super::IGRA_Q_RAW_TX_MAX_BYTES + 1];
+        let err = super::build_igra_l2data(
+            &oversized,
+            None,
+            Some("falcon-l5"),
+            super::IgraPayloadKind::FalconL5RawTx,
+        )
+        .expect_err("q tx above cap rejected");
+        assert!(err.contains("raw q transaction size"));
+        assert!(err.contains(&super::IGRA_Q_RAW_TX_MAX_BYTES.to_string()));
+    }
+
+    #[test]
+    fn igra_q_zone_payload_rejects_compression() {
+        let raw_tx = [super::IGRA_FALCON_L5_TX_TYPE, 0x01, 0x02];
+        let err = super::build_igra_l2data(
+            &raw_tx,
+            Some("zlib"),
+            Some("falcon-l5"),
+            super::IgraPayloadKind::FalconL5RawTx,
+        )
+        .expect_err("q-zone compression is rejected");
+
+        assert!(err.contains("q-zone does not support"));
     }
 
     #[tokio::test]

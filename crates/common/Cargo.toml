@@ -31,6 +31,7 @@ alloy-primitives = { workspace = true, features = [
 ] }
 alloy-provider.workspace = true
 alloy-pubsub.workspace = true
+alloy-rlp.workspace = true
 alloy-rpc-client.workspace = true
 alloy-rpc-types = { workspace = true, features = ["eth", "engine"] }
 alloy-serde.workspace = true
@@ -86,6 +87,8 @@ anstyle.workspace = true
 ciborium.workspace = true
 
 flate2.workspace = true
+falcon-det = "=0.1.0"
+falcon-det-sys = "=0.1.0"
 
 [build-dependencies]
 chrono.workspace = true
