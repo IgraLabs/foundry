@@ -90,8 +90,10 @@ const IGRA_Q_ENTRY_BYTES: usize = 28;
 const IGRA_Q_ENTRY_ADDRESS_BYTES: usize = 20;
 const CACHE_TTL_SECS: u64 = 20;
 const BASE_SUBMIT_FEE_SOMPI: u64 = 200_000;
-const FEE_PER_KIB_SOMPI: u64 = 20_000;
-const EXTRA_INPUT_FEE_SOMPI: u64 = 10_000;
+const INITIAL_FEE_PER_PAYLOAD_BYTE_SOMPI: u64 = 200;
+const EXTRA_INPUT_FEE_SOMPI: u64 = 100_000;
+const CURRENT_KASPA_MIN_RELAY_FEE_PER_KG_SOMPI: u64 = 100_000;
+const FEE_SELECTION_ATTEMPTS: usize = 4;
 const MIN_CHANGE_SOMPI: u64 = 1_000;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -531,13 +533,20 @@ fn resolve_keystore_path(config: &IgraKaspaWalletConfig) -> Result<PathBuf, Stri
     Err("IGRA key resolution error: kaspa keystore path or account is required".to_string())
 }
 
-fn estimated_fee_sompi(payload_len: usize, inputs: usize) -> u64 {
+fn initial_fee_sompi(payload_len: usize, inputs: usize) -> u64 {
     let payload_len = u64::try_from(payload_len).unwrap_or(u64::MAX);
-    let kib = payload_len.div_ceil(1024);
     let input_tail = u64::try_from(inputs.saturating_sub(1)).unwrap_or(u64::MAX);
     BASE_SUBMIT_FEE_SOMPI
-        .saturating_add(kib.saturating_mul(FEE_PER_KIB_SOMPI))
+        .max(payload_len.saturating_mul(INITIAL_FEE_PER_PAYLOAD_BYTE_SOMPI))
         .saturating_add(input_tail.saturating_mul(EXTRA_INPUT_FEE_SOMPI))
+}
+
+fn minimum_relay_fee_sompi_for_mass(mass: u64) -> u64 {
+    let mut fee = mass.saturating_mul(CURRENT_KASPA_MIN_RELAY_FEE_PER_KG_SOMPI) / 1000;
+    if fee == 0 {
+        fee = CURRENT_KASPA_MIN_RELAY_FEE_PER_KG_SOMPI;
+    }
+    fee
 }
 
 /// Transport wrapper that applies IGRA-specific request interception.
@@ -1384,133 +1393,158 @@ fn mine_and_build_signed_payload_transaction(
         return Err("IGRA config error: `tx_id_prefix` cannot be empty".to_string());
     }
 
-    // Select inputs once; payload nonce changes do not change payload length.
     // IGRA payload: 1-byte header + L2Data + 4-byte nonce.
     let payload_len = 1usize.saturating_add(l2data.len()).saturating_add(4);
 
     let mut sorted = utxos.to_vec();
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
-    let mut selected = Vec::new();
-    let mut total_input = 0u64;
     let deposit_amount = entry_deposit.map(|deposit| deposit.amount_sompi).unwrap_or_default();
     let minimum_change = if entry_deposit.is_some() { 0 } else { MIN_CHANGE_SOMPI };
-
-    for entry in sorted {
-        total_input = total_input.saturating_add(entry.utxo_entry.amount);
-        selected.push(entry);
-        let required_fee = estimated_fee_sompi(payload_len, selected.len());
-        let required_total =
-            deposit_amount.saturating_add(required_fee).saturating_add(minimum_change);
-        if total_input >= required_total {
-            break;
-        }
-    }
-
-    let fee = estimated_fee_sompi(payload_len, selected.len());
-    let required_total = deposit_amount.saturating_add(fee).saturating_add(minimum_change);
-    if total_input < required_total {
-        return Err(format!(
-            "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
-        ));
-    }
-
     let source_script_public_key = pay_to_address_script(source_address);
-    let inputs = selected
-        .iter()
-        .map(|entry| KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1))
-        .collect::<Vec<_>>();
-    let mut outputs = Vec::new();
-    if let Some(entry_deposit) = entry_deposit {
-        outputs.push(KaspaTransactionOutput::new(
-            entry_deposit.amount_sompi,
-            ScriptPublicKey::from_vec(0, entry_deposit.lock_script_pubkey.clone()),
-        ));
-        let change_value =
-            total_input.saturating_sub(entry_deposit.amount_sompi).saturating_sub(fee);
-        if change_value >= MIN_CHANGE_SOMPI {
-            outputs.push(KaspaTransactionOutput::new(change_value, source_script_public_key));
+    let mass_calculator =
+        KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
+
+    let mut fee_floor = initial_fee_sompi(payload_len, 1);
+    for attempt in 0..FEE_SELECTION_ATTEMPTS {
+        let mut selected = Vec::new();
+        let mut total_input = 0u64;
+        for entry in sorted.iter().cloned() {
+            total_input = total_input.saturating_add(entry.utxo_entry.amount);
+            selected.push(entry);
+            let selected_fee = fee_floor.max(initial_fee_sompi(payload_len, selected.len()));
+            let required_total =
+                deposit_amount.saturating_add(selected_fee).saturating_add(minimum_change);
+            if total_input >= required_total {
+                break;
+            }
         }
-    } else {
-        let output_value = total_input.saturating_sub(fee);
-        if output_value < MIN_CHANGE_SOMPI {
+
+        let fee = fee_floor.max(initial_fee_sompi(payload_len, selected.len()));
+        let required_total = deposit_amount.saturating_add(fee).saturating_add(minimum_change);
+        if total_input < required_total {
             return Err(format!(
                 "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
             ));
         }
-        outputs.push(KaspaTransactionOutput::new(output_value, source_script_public_key));
-    }
 
-    let payload = build_payload_with_nonce(payload_header, l2data, 0);
-    let nonce_offset = payload.len().saturating_sub(4);
-    let mut tx = KaspaTransaction::new(0, inputs, outputs, 0, SubnetworkId::default(), 0, payload);
+        let inputs = selected
+            .iter()
+            .map(|entry| {
+                KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1)
+            })
+            .collect::<Vec<_>>();
+        let mut outputs = Vec::new();
+        if let Some(entry_deposit) = entry_deposit {
+            outputs.push(KaspaTransactionOutput::new(
+                entry_deposit.amount_sompi,
+                ScriptPublicKey::from_vec(0, entry_deposit.lock_script_pubkey.clone()),
+            ));
+            let change_value =
+                total_input.saturating_sub(entry_deposit.amount_sompi).saturating_sub(fee);
+            if change_value >= MIN_CHANGE_SOMPI {
+                outputs.push(KaspaTransactionOutput::new(
+                    change_value,
+                    source_script_public_key.clone(),
+                ));
+            }
+        } else {
+            let output_value = total_input.saturating_sub(fee);
+            if output_value < MIN_CHANGE_SOMPI {
+                return Err(format!(
+                    "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
+                ));
+            }
+            outputs
+                .push(KaspaTransactionOutput::new(output_value, source_script_public_key.clone()));
+        }
 
-    let start = Instant::now();
-    let mut nonce = 0_u32;
-    loop {
-        if start.elapsed() > timeout {
+        let payload = build_payload_with_nonce(payload_header, l2data, 0);
+        let nonce_offset = payload.len().saturating_sub(4);
+        let mut tx =
+            KaspaTransaction::new(0, inputs, outputs, 0, SubnetworkId::default(), 0, payload);
+
+        let start = Instant::now();
+        let mut nonce = 0_u32;
+        loop {
+            if start.elapsed() > timeout {
+                return Err(format!(
+                    "{IGRA_MINING_TIMEOUT_ERROR_CODE}: timed out mining kaspa txid prefix after {}ms",
+                    timeout.as_millis()
+                ));
+            }
+
+            tx.payload[nonce_offset..].copy_from_slice(&nonce.to_be_bytes());
+            tx.finalize();
+            let tx_id = tx.id();
+            if tx_id.as_bytes().starts_with(tx_id_prefix) {
+                break;
+            }
+
+            nonce = nonce.wrapping_add(1);
+            if nonce == 0 {
+                // Extremely unlikely: exhausted full u32 space. Perturb outputs to create variance.
+                if let Some(first) = tx.outputs.first_mut() {
+                    first.value = first.value.saturating_sub(1);
+                }
+                tx.finalize();
+            }
+        }
+
+        // Sign the mined transaction once.
+        // Safety: verify txid prefix on the fully signed transaction as well.
+        let entries = selected
+            .iter()
+            .map(|entry| KaspaUtxoEntry {
+                amount: entry.utxo_entry.amount,
+                script_public_key: entry.utxo_entry.script_public_key.clone(),
+                block_daa_score: entry.utxo_entry.block_daa_score,
+                is_coinbase: entry.utxo_entry.is_coinbase,
+            })
+            .collect::<Vec<_>>();
+
+        let signable = KaspaSignableTransaction::with_entries(tx, entries);
+        let signed = kaspa_sign_with_multiple_v2(signable, std::slice::from_ref(private_key))
+            .fully_signed()
+            .map_err(|err| format!("IGRA submit error: failed to sign Kaspa tx: {err}"))?;
+        kaspa_verify(&signed.as_verifiable())
+            .map_err(|err| format!("IGRA submit error: invalid Kaspa signature set: {err}"))?;
+
+        if !signed.tx.id().as_bytes().starts_with(tx_id_prefix) {
+            return Err("IGRA submit error: mined Kaspa txid prefix changed after signing; refusing to broadcast".to_string());
+        }
+
+        let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
+        let contextual =
+            mass_calculator.calc_contextual_masses(&signed.as_verifiable()).ok_or_else(|| {
+                "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string()
+            })?;
+        let mass = contextual.max(non_contextual);
+        if mass > MAX_STANDARD_KASPA_TX_MASS {
             return Err(format!(
-                "{IGRA_MINING_TIMEOUT_ERROR_CODE}: timed out mining kaspa txid prefix after {}ms",
-                timeout.as_millis()
+                "IGRA submit error: Kaspa transaction mass {mass} exceeds standard limit {MAX_STANDARD_KASPA_TX_MASS}"
             ));
         }
 
-        tx.payload[nonce_offset..].copy_from_slice(&nonce.to_be_bytes());
-        tx.finalize();
-        let tx_id = tx.id();
-        if tx_id.as_bytes().starts_with(tx_id_prefix) {
-            break;
+        let output_total =
+            signed.tx.outputs.iter().fold(0_u64, |sum, output| sum.saturating_add(output.value));
+        let actual_fee = total_input.saturating_sub(output_total);
+        let required_relay_fee = minimum_relay_fee_sompi_for_mass(mass);
+        if actual_fee >= required_relay_fee {
+            let tx = signed.tx;
+            tx.set_mass(mass);
+            return Ok((nonce as u64, tx));
         }
 
-        nonce = nonce.wrapping_add(1);
-        if nonce == 0 {
-            // Extremely unlikely: exhausted full u32 space. Perturb outputs to create variance.
-            if let Some(first) = tx.outputs.first_mut() {
-                first.value = first.value.saturating_sub(1);
-            }
-            tx.finalize();
+        if attempt + 1 == FEE_SELECTION_ATTEMPTS {
+            return Err(format!(
+                "IGRA submit error: Kaspa transaction fee {actual_fee} is below required relay fee {required_relay_fee} for mass {mass}"
+            ));
         }
+
+        fee_floor = required_relay_fee;
     }
 
-    // Sign the mined transaction once.
-    // Safety: verify txid prefix on the fully signed transaction as well.
-    let entries = selected
-        .iter()
-        .map(|entry| KaspaUtxoEntry {
-            amount: entry.utxo_entry.amount,
-            script_public_key: entry.utxo_entry.script_public_key.clone(),
-            block_daa_score: entry.utxo_entry.block_daa_score,
-            is_coinbase: entry.utxo_entry.is_coinbase,
-        })
-        .collect::<Vec<_>>();
-
-    let signable = KaspaSignableTransaction::with_entries(tx, entries);
-    let signed = kaspa_sign_with_multiple_v2(signable, std::slice::from_ref(private_key))
-        .fully_signed()
-        .map_err(|err| format!("IGRA submit error: failed to sign Kaspa tx: {err}"))?;
-    kaspa_verify(&signed.as_verifiable())
-        .map_err(|err| format!("IGRA submit error: invalid Kaspa signature set: {err}"))?;
-
-    if !signed.tx.id().as_bytes().starts_with(tx_id_prefix) {
-        return Err("IGRA submit error: mined Kaspa txid prefix changed after signing; refusing to broadcast".to_string());
-    }
-
-    let mass_calculator =
-        KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
-    let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
-    let contextual =
-        mass_calculator.calc_contextual_masses(&signed.as_verifiable()).ok_or_else(|| {
-            "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string()
-        })?;
-    let mass = contextual.max(non_contextual);
-    if mass > MAX_STANDARD_KASPA_TX_MASS {
-        return Err(format!(
-            "IGRA submit error: Kaspa transaction mass {mass} exceeds standard limit {MAX_STANDARD_KASPA_TX_MASS}"
-        ));
-    }
-
-    let tx = signed.tx;
-    tx.set_mass(mass);
-    Ok((nonce as u64, tx))
+    Err("IGRA submit error: failed to select a sufficient Kaspa relay fee".to_string())
 }
 
 fn now_ms() -> u64 {
@@ -2499,6 +2533,16 @@ mod tests {
         .expect_err("q tx above cap rejected");
         assert!(err.contains("raw q transaction size"));
         assert!(err.contains(&super::IGRA_Q_RAW_TX_MAX_BYTES.to_string()));
+    }
+
+    #[test]
+    fn igra_kaspa_relay_fee_uses_current_minimum_fee_floor() {
+        assert_eq!(super::minimum_relay_fee_sompi_for_mass(7_304), 730_400);
+        assert_eq!(super::minimum_relay_fee_sompi_for_mass(1), 100);
+        assert_eq!(
+            super::minimum_relay_fee_sompi_for_mass(0),
+            super::CURRENT_KASPA_MIN_RELAY_FEE_PER_KG_SOMPI
+        );
     }
 
     #[test]
