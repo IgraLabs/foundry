@@ -32,9 +32,9 @@ use kaspa_consensus_core::{
     sign::{sign_with_multiple_v2 as kaspa_sign_with_multiple_v2, verify as kaspa_verify},
     subnets::SubnetworkId,
     tx::{
-        SignableTransaction as KaspaSignableTransaction, Transaction as KaspaTransaction,
-        TransactionInput as KaspaTransactionInput, TransactionOutput as KaspaTransactionOutput,
-        UtxoEntry as KaspaUtxoEntry,
+        ScriptPublicKey, SignableTransaction as KaspaSignableTransaction,
+        Transaction as KaspaTransaction, TransactionInput as KaspaTransactionInput,
+        TransactionOutput as KaspaTransactionOutput, UtxoEntry as KaspaUtxoEntry,
     },
 };
 use kaspa_grpc_client::GrpcClient;
@@ -87,6 +87,7 @@ const IGRA_Q_ENTRY_TX_TYPE: u8 = 0x02;
 const IGRA_Q_RAW_TX_TYPE: u8 = 0x04;
 const IGRA_FALCON_L5_TX_TYPE: u8 = 0x7c;
 const IGRA_Q_ENTRY_BYTES: usize = 28;
+const IGRA_Q_ENTRY_ADDRESS_BYTES: usize = 20;
 const CACHE_TTL_SECS: u64 = 20;
 const BASE_SUBMIT_FEE_SOMPI: u64 = 200_000;
 const FEE_PER_KIB_SOMPI: u64 = 20_000;
@@ -121,6 +122,7 @@ pub struct IgraSubmitRequest {
     pub kaspa_network: Option<String>,
     pub payload_compression: Option<String>,
     pub logic_zone: Option<String>,
+    pub entry_lock_script_pubkey: Option<String>,
     pub kaspa_wallet: IgraKaspaWalletConfig,
 }
 
@@ -159,6 +161,12 @@ struct IgraPayloadData {
     header: u8,
     l2data: Vec<u8>,
     max_l2data_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EntryDepositOutput {
+    amount_sompi: u64,
+    lock_script_pubkey: Vec<u8>,
 }
 
 /// Result returned by a Kaspa submitter implementation.
@@ -223,6 +231,11 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                 payload_data.max_l2data_bytes
             ));
         }
+        let entry_deposit = entry_deposit_output_for_request(
+            request.payload_kind,
+            &request.raw_tx_bytes,
+            request.entry_lock_script_pubkey.as_deref(),
+        )?;
 
         let rpc_url = request
             .kaspa_rpc_url
@@ -282,6 +295,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
             let prefix_for_build = prefix_bytes.clone();
             let mining_timeout_for_build = mining_timeout;
             let payload_header = payload_data.header;
+            let entry_deposit_for_build = entry_deposit.clone();
             let (payload_nonce, transaction) = tokio::task::spawn_blocking(move || {
                 mine_and_build_signed_payload_transaction(
                     &private_key_for_build,
@@ -292,6 +306,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                     &prefix_for_build,
                     mining_timeout_for_build,
                     &utxos,
+                    entry_deposit_for_build.as_ref(),
                 )
             })
             .await
@@ -1023,6 +1038,7 @@ impl<T> IgraTransport<T> {
                             }
                             .to_string(),
                         ),
+                        entry_lock_script_pubkey: None,
                         kaspa_wallet,
                     };
                     let submit_result = submitter
@@ -1307,6 +1323,46 @@ fn validate_q_entry(entry: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn q_entry_amount_sompi(entry: &[u8]) -> Result<u64, String> {
+    validate_q_entry(entry)?;
+    let amount_bytes: [u8; 8] = entry[IGRA_Q_ENTRY_ADDRESS_BYTES..IGRA_Q_ENTRY_BYTES]
+        .try_into()
+        .map_err(|_| "q Entry amount bytes are malformed".to_string())?;
+    Ok(u64::from_le_bytes(amount_bytes))
+}
+
+fn parse_lock_script_pubkey_hex(value: &str) -> Result<Vec<u8>, String> {
+    let value = value.trim().trim_start_matches("0x");
+    if value.is_empty() {
+        return Err("Entry lock script pubkey cannot be empty".to_string());
+    }
+    if value.len() % 2 != 0 {
+        return Err(
+            "Entry lock script pubkey must have an even number of hex characters".to_string()
+        );
+    }
+    hex::decode(value).map_err(|err| format!("Entry lock script pubkey must be hex-encoded: {err}"))
+}
+
+fn entry_deposit_output_for_request(
+    payload_kind: IgraPayloadKind,
+    raw_tx: &[u8],
+    entry_lock_script_pubkey: Option<&str>,
+) -> Result<Option<EntryDepositOutput>, String> {
+    if payload_kind != IgraPayloadKind::FalconL5Entry {
+        return Ok(None);
+    }
+
+    let lock_script_pubkey = entry_lock_script_pubkey.ok_or_else(|| {
+        "IGRA q Entry requires `entry_lock_script_pubkey` in [igra] or --entry-lock-script-pubkey"
+            .to_string()
+    })?;
+    Ok(Some(EntryDepositOutput {
+        amount_sompi: q_entry_amount_sompi(raw_tx)?,
+        lock_script_pubkey: parse_lock_script_pubkey_hex(lock_script_pubkey)?,
+    }))
+}
+
 fn mine_and_build_signed_payload_transaction(
     private_key: &[u8; 32],
     source_address: &KaspaAddress,
@@ -1316,6 +1372,7 @@ fn mine_and_build_signed_payload_transaction(
     tx_id_prefix: &[u8],
     timeout: Duration,
     utxos: &[RpcUtxosByAddressesEntry],
+    entry_deposit: Option<&EntryDepositOutput>,
 ) -> Result<(u64, KaspaTransaction), String> {
     if utxos.is_empty() {
         return Err(format!(
@@ -1335,35 +1392,53 @@ fn mine_and_build_signed_payload_transaction(
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
     let mut selected = Vec::new();
     let mut total_input = 0u64;
+    let deposit_amount = entry_deposit.map(|deposit| deposit.amount_sompi).unwrap_or_default();
+    let minimum_change = if entry_deposit.is_some() { 0 } else { MIN_CHANGE_SOMPI };
+
     for entry in sorted {
         total_input = total_input.saturating_add(entry.utxo_entry.amount);
         selected.push(entry);
         let required_fee = estimated_fee_sompi(payload_len, selected.len());
-        if total_input >= required_fee.saturating_add(MIN_CHANGE_SOMPI) {
+        let required_total =
+            deposit_amount.saturating_add(required_fee).saturating_add(minimum_change);
+        if total_input >= required_total {
             break;
         }
     }
 
     let fee = estimated_fee_sompi(payload_len, selected.len());
-    if total_input < fee.saturating_add(MIN_CHANGE_SOMPI) {
+    let required_total = deposit_amount.saturating_add(fee).saturating_add(minimum_change);
+    if total_input < required_total {
         return Err(format!(
             "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
         ));
     }
 
-    let output_value = total_input.saturating_sub(fee);
-    if output_value < MIN_CHANGE_SOMPI {
-        return Err(format!(
-            "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
-        ));
-    }
-
-    let script_public_key = pay_to_address_script(source_address);
+    let source_script_public_key = pay_to_address_script(source_address);
     let inputs = selected
         .iter()
         .map(|entry| KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1))
         .collect::<Vec<_>>();
-    let outputs = vec![KaspaTransactionOutput::new(output_value, script_public_key)];
+    let mut outputs = Vec::new();
+    if let Some(entry_deposit) = entry_deposit {
+        outputs.push(KaspaTransactionOutput::new(
+            entry_deposit.amount_sompi,
+            ScriptPublicKey::from_vec(0, entry_deposit.lock_script_pubkey.clone()),
+        ));
+        let change_value =
+            total_input.saturating_sub(entry_deposit.amount_sompi).saturating_sub(fee);
+        if change_value >= MIN_CHANGE_SOMPI {
+            outputs.push(KaspaTransactionOutput::new(change_value, source_script_public_key));
+        }
+    } else {
+        let output_value = total_input.saturating_sub(fee);
+        if output_value < MIN_CHANGE_SOMPI {
+            return Err(format!(
+                "IGRA submit error: insufficient Kaspa UTXOs for fee payment (source address: {source_address})"
+            ));
+        }
+        outputs.push(KaspaTransactionOutput::new(output_value, source_script_public_key));
+    }
 
     let payload = build_payload_with_nonce(payload_header, l2data, 0);
     let nonce_offset = payload.len().saturating_sub(4);
@@ -2356,6 +2431,50 @@ mod tests {
         assert_eq!(&payload[1..5], &[0x01, 0x00, 0x02, 0x02]);
         assert_eq!(&payload[5..33], &entry);
         assert_eq!(&payload[33..37], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn igra_q_entry_deposit_output_uses_payload_amount_and_lock_script() {
+        let mut entry = [0u8; super::IGRA_Q_ENTRY_BYTES];
+        entry[..20].copy_from_slice(&[0x11; 20]);
+        entry[20..].copy_from_slice(&123_456u64.to_le_bytes());
+
+        let deposit = super::entry_deposit_output_for_request(
+            super::IgraPayloadKind::FalconL5Entry,
+            &entry,
+            Some("0x203705fd"),
+        )
+        .expect("q Entry output mode builds")
+        .expect("q Entry uses deposit output");
+
+        assert_eq!(deposit.amount_sompi, 123_456);
+        assert_eq!(deposit.lock_script_pubkey, hex::decode("203705fd").unwrap());
+    }
+
+    #[test]
+    fn igra_q_entry_deposit_output_requires_lock_script() {
+        let entry = [0u8; super::IGRA_Q_ENTRY_BYTES];
+
+        let err = super::entry_deposit_output_for_request(
+            super::IgraPayloadKind::FalconL5Entry,
+            &entry,
+            None,
+        )
+        .expect_err("q Entry requires lock script");
+
+        assert!(err.contains("entry_lock_script_pubkey"));
+    }
+
+    #[test]
+    fn igra_q_entry_deposit_output_is_not_used_for_q_raw_tx() {
+        let output = super::entry_deposit_output_for_request(
+            super::IgraPayloadKind::FalconL5RawTx,
+            &[super::IGRA_FALCON_L5_TX_TYPE],
+            None,
+        )
+        .expect("q RawTx should not require entry lock script");
+
+        assert!(output.is_none());
     }
 
     #[test]

@@ -182,6 +182,10 @@ pub struct IgraQEntryArgs {
     #[arg(long)]
     amount_sompi: u64,
 
+    /// Kaspa script public key that receives the Entry deposit output.
+    #[arg(long, env = "IGRA_LOCK_SCRIPT_PUBKEY")]
+    entry_lock_script_pubkey: Option<String>,
+
     #[command(flatten)]
     rpc: RpcOpts,
 
@@ -196,6 +200,14 @@ impl IgraQEntryArgs {
             eyre::bail!("IGRA mode is not enabled in the active Foundry config");
         }
         self.wallet.apply_igra_kaspa_wallet_overrides(&mut config);
+        let entry_lock_script_pubkey = self
+            .entry_lock_script_pubkey
+            .or_else(|| config.igra.entry_lock_script_pubkey.clone())
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "IGRA q Entry requires `entry_lock_script_pubkey` in [igra] or --entry-lock-script-pubkey"
+                )
+            })?;
 
         let entry_payload = encode_q_entry_payload(self.address, self.amount_sompi);
         let entry_hash = format!("0x{}", hex::encode(keccak256(entry_payload)));
@@ -212,6 +224,7 @@ impl IgraQEntryArgs {
             kaspa_network: config.igra.kaspa_network,
             payload_compression: None,
             logic_zone: Some("falcon-l5".to_string()),
+            entry_lock_script_pubkey: Some(entry_lock_script_pubkey),
             kaspa_wallet: config.igra.kaspa_wallet,
         };
 

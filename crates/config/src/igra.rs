@@ -69,6 +69,10 @@ pub struct IgraConfig {
     ///
     /// Supported: "canonical" (default), "falcon-l5".
     pub logic_zone: Option<String>,
+    /// Kaspa script public key that receives Entry deposits.
+    ///
+    /// Required by `cast igra-q-entry`; raw q transaction submission does not use it.
+    pub entry_lock_script_pubkey: Option<String>,
     /// Sender lock timeout in seconds.
     pub sender_lock_timeout_secs: Option<u64>,
     /// Retention period for completed IGRA tx-map entries.
@@ -174,6 +178,10 @@ impl IgraConfig {
             }
         }
 
+        if let Some(script) = self.entry_lock_script_pubkey.as_deref() {
+            validate_hex_string("entry_lock_script_pubkey", script)?;
+        }
+
         Ok(())
     }
 }
@@ -226,6 +234,23 @@ fn validate_positive_opt(field: &'static str, value: Option<u64>) -> Result<(), 
     Ok(())
 }
 
+fn validate_hex_string(field: &'static str, value: &str) -> Result<(), IgraConfigError> {
+    let value = value.trim().trim_start_matches("0x");
+    if value.is_empty() {
+        return Err(IgraConfigError::Invalid { field, reason: "must not be empty".to_string() });
+    }
+    if value.len() % 2 != 0 {
+        return Err(IgraConfigError::Invalid {
+            field,
+            reason: "must have an even number of hex characters".to_string(),
+        });
+    }
+    if !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(IgraConfigError::Invalid { field, reason: "must be hex-encoded".to_string() });
+    }
+    Ok(())
+}
+
 /// IGRA config validation error.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum IgraConfigError {
@@ -253,6 +278,7 @@ mod tests {
             mining_timeout_secs: Some(120),
             payload_compression: None,
             logic_zone: None,
+            entry_lock_script_pubkey: None,
             sender_lock_timeout_secs: Some(60),
             completed_retention_hours: Some(168),
             failed_retention_hours: Some(720),
