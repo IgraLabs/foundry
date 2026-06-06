@@ -76,6 +76,7 @@ const MAX_STANDARD_KASPA_TX_MASS: u64 = 100_000;
 // Per IGRA Transaction Protocol: L2Data (raw EVM tx bytes) must not exceed this.
 const IGRA_MAX_L2DATA_BYTES: usize = 24_800;
 const IGRA_VERSION: u8 = 0x9;
+const IGRA_CANONICAL_ENTRY_TX_TYPE: u8 = 0x2;
 const IGRA_CANONICAL_RAW_TX_TYPE: u8 = 0x4;
 const IGRA_LOGIC_ZONE_TX_TYPE: u8 = 0x0f;
 const IGRA_LOGIC_ZONE_HEADER_SIZE: usize = 4;
@@ -130,6 +131,7 @@ pub struct IgraSubmitRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IgraPayloadKind {
+    CanonicalEntry,
     CanonicalRawTx,
     FalconL5RawTx,
     FalconL5Entry,
@@ -1240,10 +1242,11 @@ fn build_igra_l2data(
     let mode = payload_compression.unwrap_or("none").trim().to_ascii_lowercase();
 
     match payload_kind {
-        IgraPayloadKind::CanonicalRawTx if logic_zone.is_falcon_l5() => {
+        IgraPayloadKind::CanonicalEntry | IgraPayloadKind::CanonicalRawTx
+            if logic_zone.is_falcon_l5() =>
+        {
             return Err(
-                "IGRA config error: canonical raw transactions cannot target falcon-l5 q-zone"
-                    .to_string(),
+                "IGRA config error: canonical payloads cannot target falcon-l5 q-zone".to_string()
             );
         }
         IgraPayloadKind::FalconL5RawTx | IgraPayloadKind::FalconL5Entry
@@ -1254,6 +1257,22 @@ fn build_igra_l2data(
             );
         }
         _ => {}
+    }
+
+    if payload_kind == IgraPayloadKind::CanonicalEntry {
+        if !matches!(mode.as_str(), "" | "none") {
+            return Err(
+                "IGRA config error: canonical Entry does not support `payload_compression`; use `none`"
+                    .to_string(),
+            );
+        }
+        validate_q_entry(raw_tx)?;
+
+        return Ok(IgraPayloadData {
+            header: (IGRA_VERSION << 4) | IGRA_CANONICAL_ENTRY_TX_TYPE,
+            l2data: raw_tx.to_vec(),
+            max_l2data_bytes: IGRA_MAX_L2DATA_BYTES,
+        });
     }
 
     if matches!(payload_kind, IgraPayloadKind::FalconL5RawTx | IgraPayloadKind::FalconL5Entry) {
@@ -1273,7 +1292,7 @@ fn build_igra_l2data(
                 validate_q_entry(raw_tx)?;
                 IGRA_Q_ENTRY_TX_TYPE
             }
-            IgraPayloadKind::CanonicalRawTx => unreachable!(),
+            IgraPayloadKind::CanonicalEntry | IgraPayloadKind::CanonicalRawTx => unreachable!(),
         };
 
         let mut l2data = Vec::with_capacity(IGRA_LOGIC_ZONE_HEADER_SIZE + raw_tx.len());
@@ -1358,12 +1377,12 @@ fn entry_deposit_output_for_request(
     raw_tx: &[u8],
     entry_lock_script_pubkey: Option<&str>,
 ) -> Result<Option<EntryDepositOutput>, String> {
-    if payload_kind != IgraPayloadKind::FalconL5Entry {
+    if !matches!(payload_kind, IgraPayloadKind::CanonicalEntry | IgraPayloadKind::FalconL5Entry) {
         return Ok(None);
     }
 
     let lock_script_pubkey = entry_lock_script_pubkey.ok_or_else(|| {
-        "IGRA q Entry requires `entry_lock_script_pubkey` in [igra] or --entry-lock-script-pubkey"
+        "IGRA Entry requires `entry_lock_script_pubkey` in [igra] or --entry-lock-script-pubkey"
             .to_string()
     })?;
     Ok(Some(EntryDepositOutput {
@@ -2468,6 +2487,27 @@ mod tests {
     }
 
     #[test]
+    fn igra_canonical_entry_payload_wraps_under_0x92() {
+        let mut entry = [0u8; super::IGRA_Q_ENTRY_BYTES];
+        entry[..20].copy_from_slice(&[0x22; 20]);
+        entry[20..].copy_from_slice(&100_000_000u64.to_le_bytes());
+        let payload_data = super::build_igra_l2data(
+            &entry,
+            None,
+            Some("canonical"),
+            super::IgraPayloadKind::CanonicalEntry,
+        )
+        .expect("canonical entry l2data builds");
+        let payload =
+            super::build_payload_with_nonce(payload_data.header, &payload_data.l2data, 0x01020304);
+
+        assert_eq!(payload_data.header, 0x92);
+        assert_eq!(payload[0], 0x92);
+        assert_eq!(&payload[1..29], &entry);
+        assert_eq!(&payload[29..33], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
     fn igra_q_entry_deposit_output_uses_payload_amount_and_lock_script() {
         let mut entry = [0u8; super::IGRA_Q_ENTRY_BYTES];
         entry[..20].copy_from_slice(&[0x11; 20]);
@@ -2482,6 +2522,24 @@ mod tests {
         .expect("q Entry uses deposit output");
 
         assert_eq!(deposit.amount_sompi, 123_456);
+        assert_eq!(deposit.lock_script_pubkey, hex::decode("203705fd").unwrap());
+    }
+
+    #[test]
+    fn igra_canonical_entry_deposit_output_uses_payload_amount_and_lock_script() {
+        let mut entry = [0u8; super::IGRA_Q_ENTRY_BYTES];
+        entry[..20].copy_from_slice(&[0x22; 20]);
+        entry[20..].copy_from_slice(&100_000_000u64.to_le_bytes());
+
+        let deposit = super::entry_deposit_output_for_request(
+            super::IgraPayloadKind::CanonicalEntry,
+            &entry,
+            Some("0x203705fd"),
+        )
+        .expect("canonical Entry output mode builds")
+        .expect("canonical Entry uses deposit output");
+
+        assert_eq!(deposit.amount_sompi, 100_000_000);
         assert_eq!(deposit.lock_script_pubkey, hex::decode("203705fd").unwrap());
     }
 

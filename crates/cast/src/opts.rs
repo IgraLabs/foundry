@@ -11,7 +11,7 @@ use crate::cmd::{
     erc20::Erc20Subcommand,
     estimate::EstimateArgs,
     find_block::FindBlockArgs,
-    igra_q::{IgraQAddressArgs, IgraQEntryArgs, IgraQKeygenArgs, IgraQMakeTxArgs},
+    igra_q::{IgraEntryArgs, IgraQAddressArgs, IgraQEntryArgs, IgraQKeygenArgs, IgraQMakeTxArgs},
     interface::InterfaceArgs,
     logs::LogsArgs,
     mktx::MakeTxArgs,
@@ -568,6 +568,10 @@ pub enum CastSubcommand {
         #[command(flatten)]
         rpc: RpcOpts,
     },
+
+    /// Submit a canonical first-zone IGRA Entry through Kaspa.
+    #[command(name = "igra-entry")]
+    IgraEntry(IgraEntryArgs),
 
     /// Derive an IGRA Falcon-L5 q-zone address from a q private key.
     #[command(name = "igra-q-address")]
