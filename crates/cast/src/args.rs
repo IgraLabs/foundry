@@ -824,6 +824,7 @@ fn load_igra_status_json(
         expected_el_chain_id: config.igra.expected_el_chain_id,
         el_rpc_url: config.igra.el_rpc_url.clone(),
         kaspa_rpc_url: config.igra.kaspa_rpc_url.clone(),
+        db_path: config.igra.store_db_path.clone().map(std::path::PathBuf::from),
         ..Default::default()
     })?;
 

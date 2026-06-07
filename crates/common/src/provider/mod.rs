@@ -207,6 +207,7 @@ impl<N: Network> ProviderBuilder<N> {
             completed_retention_hours: config.igra.completed_retention_hours,
             failed_retention_hours: config.igra.failed_retention_hours,
             max_db_size_mb: config.igra.max_db_size_mb,
+            db_path: config.igra.store_db_path.clone().map(PathBuf::from),
             ..Default::default()
         });
         builder = builder.igra_transport_config(IgraTransportConfig {

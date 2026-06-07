@@ -81,6 +81,8 @@ pub struct IgraConfig {
     pub failed_retention_hours: Option<u64>,
     /// Max size of IGRA tx-map database in MB.
     pub max_db_size_mb: Option<u64>,
+    /// Optional path for the IGRA tx-map database.
+    pub store_db_path: Option<String>,
     /// Optional Kaspa signer source configuration for in-process submission.
     #[serde(default)]
     pub kaspa_wallet: IgraKaspaWalletConfig,
@@ -283,6 +285,7 @@ mod tests {
             completed_retention_hours: Some(168),
             failed_retention_hours: Some(720),
             max_db_size_mb: Some(512),
+            store_db_path: None,
             kaspa_wallet: IgraKaspaWalletConfig::default(),
         }
     }

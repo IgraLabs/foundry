@@ -43,6 +43,7 @@ use kaspa_txscript::pay_to_address_script;
 use serde_json::Value;
 use std::{
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -96,6 +97,7 @@ const EXTRA_INPUT_FEE_SOMPI: u64 = 100_000;
 const CURRENT_KASPA_MIN_RELAY_FEE_PER_KG_SOMPI: u64 = 100_000;
 const FEE_SELECTION_ATTEMPTS: usize = 4;
 const MIN_CHANGE_SOMPI: u64 = 1_000;
+const KASPA_UTXO_LOCK_STALE_SECS: u64 = 300;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -256,9 +258,25 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
             "IGRA submit: kaspa_source_address={} kaspa_network={} kaspa_rpc_url={} l2_tx_hash={}",
             source_address, network, rpc_url, request.l2_tx_hash
         );
-        let mut client = GrpcClient::connect(rpc_url.to_string())
-            .await
-            .map_err(|err| format!("IGRA submit error: failed to connect to Kaspa RPC: {err}"))?;
+        let mut connect_attempt = 0u64;
+        let mut client = loop {
+            match GrpcClient::connect(rpc_url.to_string()).await {
+                Ok(client) => break client,
+                Err(err) if connect_attempt < 2 => {
+                    connect_attempt = connect_attempt.saturating_add(1);
+                    warn!(
+                        "IGRA submit: failed to connect to Kaspa RPC on attempt {}: {err}",
+                        connect_attempt
+                    );
+                    tokio::time::sleep(Duration::from_millis(200 * connect_attempt)).await;
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "IGRA submit error: failed to connect to Kaspa RPC: {err}"
+                    ));
+                }
+            }
+        };
 
         let prefix = normalize_hex_prefix(request.tx_id_prefix.clone());
         if prefix.is_empty() {
@@ -267,6 +285,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
         let prefix_bytes = hex::decode(prefix.clone())
             .map_err(|err| format!("IGRA config error: `tx_id_prefix` is invalid hex: {err}"))?;
         let mining_timeout = Duration::from_secs(request.mining_timeout_secs);
+        let payload_len = 1usize.saturating_add(payload_data.l2data.len()).saturating_add(4);
 
         for attempt in 0..=1 {
             let force_refresh = attempt > 0;
@@ -293,6 +312,14 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                 return Err(message);
             }
 
+            let mut reservation = reserve_kaspa_utxos(
+                network,
+                &source_address,
+                payload_len,
+                entry_deposit.as_ref(),
+                &utxos,
+            )?;
+            let reserved_utxos = reservation.entries.clone();
             let private_key_for_build = private_key;
             let source_address_for_build = source_address.clone();
             let l2data_for_build = payload_data.l2data.clone();
@@ -309,7 +336,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                     &l2data_for_build,
                     &prefix_for_build,
                     mining_timeout_for_build,
-                    &utxos,
+                    &reserved_utxos,
                     entry_deposit_for_build.as_ref(),
                 )
             })
@@ -324,6 +351,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
             match client.submit_transaction(rpc_transaction, false).await {
                 Ok(tx_id) => {
                     self.invalidate_utxo_cache().await;
+                    reservation.commit();
                     let kaspa_tx_id = tx_id.to_string();
                     info!(
                         "IGRA submit: kaspa_tx_id={} payload_nonce={} payload_header=0x{:02x} l2data_len={} payload_compression={} l2_tx_hash={}",
@@ -391,6 +419,153 @@ impl InProcessKaspaPayloadSubmitter {
         }
         Ok(entries)
     }
+}
+
+struct KaspaUtxoReservation {
+    entries: Vec<RpcUtxosByAddressesEntry>,
+    lock_dirs: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl KaspaUtxoReservation {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for KaspaUtxoReservation {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+
+        for lock_dir in &self.lock_dirs {
+            if let Err(err) = fs::remove_dir(lock_dir)
+                && err.kind() != ErrorKind::NotFound
+            {
+                warn!(
+                    "failed to release IGRA Kaspa UTXO reservation {}: {err}",
+                    lock_dir.display()
+                );
+            }
+        }
+    }
+}
+
+fn reserve_kaspa_utxos(
+    network: &str,
+    source_address: &KaspaAddress,
+    payload_len: usize,
+    entry_deposit: Option<&EntryDepositOutput>,
+    utxos: &[RpcUtxosByAddressesEntry],
+) -> Result<KaspaUtxoReservation, String> {
+    let lock_parent = kaspa_utxo_lock_parent(network, source_address);
+    fs::create_dir_all(&lock_parent).map_err(|err| {
+        format!(
+            "IGRA submit error: failed to create Kaspa UTXO reservation directory {}: {err}",
+            lock_parent.display()
+        )
+    })?;
+    cleanup_stale_kaspa_utxo_locks(&lock_parent);
+
+    let deposit_amount = entry_deposit.map(|deposit| deposit.amount_sompi).unwrap_or_default();
+    let minimum_change = if entry_deposit.is_some() { 0 } else { MIN_CHANGE_SOMPI };
+    let mut sorted = utxos.to_vec();
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.utxo_entry.amount));
+
+    let mut reservation =
+        KaspaUtxoReservation { entries: Vec::new(), lock_dirs: Vec::new(), committed: false };
+    let mut total_input = 0u64;
+    for entry in sorted {
+        let lock_dir = kaspa_utxo_lock_dir(&lock_parent, &entry);
+        if !try_acquire_kaspa_utxo_lock(&lock_dir)? {
+            continue;
+        }
+
+        total_input = total_input.saturating_add(entry.utxo_entry.amount);
+        reservation.lock_dirs.push(lock_dir);
+        reservation.entries.push(entry);
+        let selected_fee = initial_fee_sompi(payload_len, reservation.entries.len());
+        let required_total =
+            deposit_amount.saturating_add(selected_fee).saturating_add(minimum_change);
+        if total_input >= required_total {
+            return Ok(reservation);
+        }
+    }
+
+    Err(format!(
+        "IGRA submit error: insufficient unreserved Kaspa UTXOs for fee payment (source address: {source_address})"
+    ))
+}
+
+fn try_acquire_kaspa_utxo_lock(lock_dir: &Path) -> Result<bool, String> {
+    match fs::create_dir(lock_dir) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            if kaspa_utxo_lock_is_stale(lock_dir) {
+                warn!("removing stale IGRA Kaspa UTXO reservation {}", lock_dir.display());
+                let _ = fs::remove_dir(lock_dir);
+                match fs::create_dir(lock_dir) {
+                    Ok(()) => return Ok(true),
+                    Err(err) if err.kind() == ErrorKind::AlreadyExists => return Ok(false),
+                    Err(err) => {
+                        return Err(format!(
+                            "IGRA submit error: failed to acquire Kaspa UTXO reservation {}: {err}",
+                            lock_dir.display()
+                        ));
+                    }
+                }
+            }
+            Ok(false)
+        }
+        Err(err) => Err(format!(
+            "IGRA submit error: failed to acquire Kaspa UTXO reservation {}: {err}",
+            lock_dir.display()
+        )),
+    }
+}
+
+fn kaspa_utxo_lock_parent(network: &str, source_address: &KaspaAddress) -> PathBuf {
+    let cache_root =
+        Config::foundry_cache_dir().unwrap_or_else(|| std::env::temp_dir().join("foundry-cache"));
+    cache_root
+        .join("igra")
+        .join("kaspa-utxo-reservations")
+        .join(sanitize_lock_component(network))
+        .join(sanitize_lock_component(&source_address.to_string()))
+}
+
+fn kaspa_utxo_lock_dir(parent: &Path, entry: &RpcUtxosByAddressesEntry) -> PathBuf {
+    parent.join(format!("{}-{}.lockdir", entry.outpoint.transaction_id, entry.outpoint.index))
+}
+
+fn cleanup_stale_kaspa_utxo_locks(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("lockdir")
+            && kaspa_utxo_lock_is_stale(&path)
+        {
+            let _ = fs::remove_dir(path);
+        }
+    }
+}
+
+fn kaspa_utxo_lock_is_stale(lock_dir: &Path) -> bool {
+    fs::metadata(lock_dir)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed > Duration::from_secs(KASPA_UTXO_LOCK_STALE_SECS))
+}
+
+fn sanitize_lock_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') { ch } else { '-' })
+        .collect()
 }
 
 fn kaspa_network_descriptor(
