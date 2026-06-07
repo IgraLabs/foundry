@@ -129,9 +129,9 @@ q_receipt_by_hash() {
 
 receipt_from_publish_output() {
   local output="$1"
-  local receipt status tx_hash recovered_receipt
+  local receipt receipt_status tx_hash recovered_receipt
 
-  receipt="$(printf '%s\n' "$output" | jq -c '
+  receipt="$(printf '%s\n' "$output" | sed -n '/^[[:space:]]*{/p' | jq -c '
     if type == "object" then
       if has("result") then .result else . end
     else
@@ -144,8 +144,8 @@ receipt_from_publish_output() {
     return 1
   fi
 
-  status="$(jq -r '.status // empty' <<<"$receipt")"
-  if [ "$status" = "0x1" ]; then
+  receipt_status="$(jq -r '.status // empty' <<<"$receipt")"
+  if [ "$receipt_status" = "0x1" ]; then
     printf '%s\n' "$receipt"
     return 0
   fi
@@ -197,7 +197,11 @@ q_publish_with_config() {
   tx_hash="$(q_tx_hash "$raw")"
 
   if publish_output=$(cd "$work_dir" && FOUNDRY_CONFIG="$config_path" "$CAST" publish "$raw" 2>&1); then
-    printf '%s\n' "$publish_output"
+    if recovered_receipt="$(receipt_from_publish_output "$publish_output")"; then
+      printf '%s\n' "$recovered_receipt"
+    else
+      printf '%s\n' "$publish_output"
+    fi
     return 0
   else
     rc=$?
