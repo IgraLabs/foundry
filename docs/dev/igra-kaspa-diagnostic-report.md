@@ -472,6 +472,7 @@ If IGRA team confirms they're using a different prefix, update Foundry config:
 ```toml
 [igra]
 tx_id_prefix = "XXXX"  # Use whatever prefix they confirm
+lane_id = "97b10000"  # Post-KIP21 IGRA lane namespace
 ```
 
 ---

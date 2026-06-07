@@ -90,6 +90,7 @@ kaspa_network = "testnet-10"
 
 # Submission and finality
 tx_id_prefix = "97b4" # testnet-10 (galleon-testnet). Use "97b1" for mainnet.
+lane_id = "97b10000" # post-KIP21 IGRA lane namespace
 kaspa_submit_timeout_secs = 30
 mining_timeout_secs = 120
 kaspa_acceptance_confirmations = 0
@@ -149,15 +150,17 @@ burst = 40
 1. `el_rpc_url = https://galleon-testnet.igralabs.com:8545`
 2. `kaspa_rpc_url = grpc://stage-roman.igralabs.com:16210`
 3. `kaspa_network = testnet-10`
-4. `tx_id_prefix = 97b4` (Viaduct Transaction ID Prefix)
-4. `el_confirmations = 1`
+4. `tx_id_prefix = 97b4` (legacy/pre-KIP21 Viaduct Transaction ID Prefix)
+5. `lane_id = 97b10000` (post-KIP21 IGRA lane namespace)
+6. `el_confirmations = 1`
 
 `mainnet` defaults:
 
 1. `kaspa_network = mainnet`
-2. `tx_id_prefix = 97b1` (Viaduct Transaction ID Prefix)
-2. `el_confirmations = 12`
-3. Requires explicit `el_rpc_url` and `kaspa_rpc_url`
+2. `tx_id_prefix = 97b1` (legacy/pre-KIP21 Viaduct Transaction ID Prefix)
+3. `lane_id = 97b10000` (post-KIP21 IGRA lane namespace)
+4. `el_confirmations = 12`
+5. Requires explicit `el_rpc_url` and `kaspa_rpc_url`
 
 `devnet` and `simnet` defaults:
 

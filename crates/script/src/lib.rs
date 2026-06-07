@@ -984,7 +984,8 @@ mod tests {
         config.igra.kaspa_rpc_url = Some("grpc://127.0.0.1:16110".to_string());
         config.igra.expected_el_chain_id = Some(1337);
         config.igra.kaspa_network = Some("testnet-10".to_string());
-        config.igra.tx_id_prefix = Some("97b1".to_string());
+        config.igra.tx_id_prefix = Some("97b4".to_string());
+        config.igra.lane_id = Some("97b10000".to_string());
         config.igra.el_receipt_timeout_secs = Some(300);
         config
     }
@@ -1024,8 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_resume_without_broadcast()
-    {
+    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_resume_without_broadcast() {
         let unlocked_args = ScriptArgs::parse_from([
             "foundry-cli",
             "Contract.sol",
@@ -1054,8 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_verify_without_broadcast()
-    {
+    fn guardrails_reject_unsupported_signer_flows_when_igra_enabled_and_verify_without_broadcast() {
         let mut unlocked_args = ScriptArgs::parse_from([
             "foundry-cli",
             "Contract.sol",

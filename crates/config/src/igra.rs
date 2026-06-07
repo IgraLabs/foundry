@@ -54,6 +54,9 @@ pub struct IgraConfig {
     pub kaspa_network: Option<String>,
     /// Prefix for mined Kaspa transaction IDs, encoded as even-length hex.
     pub tx_id_prefix: Option<String>,
+    /// Post-KIP21 IGRA Kaspa lane id, encoded as 8 hex chars for the 4-byte
+    /// namespace or 40 hex chars for the full subnetwork id.
+    pub lane_id: Option<String>,
     /// Timeout in seconds while waiting for EL receipts.
     pub el_receipt_timeout_secs: Option<u64>,
     /// Timeout in seconds while mining payload nonces for tx-id prefix.
@@ -137,6 +140,9 @@ impl IgraConfig {
                 reason: "must be hex-encoded".to_string(),
             });
         }
+
+        let lane_id = required_str("lane_id", self.lane_id.as_deref())?;
+        validate_lane_id_string("lane_id", lane_id)?;
 
         let timeout = self
             .el_receipt_timeout_secs
@@ -253,6 +259,58 @@ fn validate_hex_string(field: &'static str, value: &str) -> Result<(), IgraConfi
     Ok(())
 }
 
+fn validate_lane_id_string(field: &'static str, value: &str) -> Result<(), IgraConfigError> {
+    let value = value.trim().trim_start_matches("0x").trim_start_matches("0X");
+    validate_hex_string(field, value)?;
+    match value.len() {
+        8 => {
+            let bytes = decode_hex_bytes(field, value)?;
+            if bytes[1..].iter().all(|byte| *byte == 0) {
+                return Err(IgraConfigError::Invalid {
+                    field,
+                    reason: "reserved system lane shape is not allowed".to_string(),
+                });
+            }
+        }
+        40 => {
+            let bytes = decode_hex_bytes(field, value)?;
+            if bytes[1..].iter().all(|byte| *byte == 0) {
+                return Err(IgraConfigError::Invalid {
+                    field,
+                    reason: "reserved system lane shape is not allowed".to_string(),
+                });
+            }
+            if bytes[4..].iter().any(|byte| *byte != 0) {
+                return Err(IgraConfigError::Invalid {
+                    field,
+                    reason: "full lane id must use user-lane shape [namespace(4), zero_tail(16)]"
+                        .to_string(),
+                });
+            }
+        }
+        len => {
+            return Err(IgraConfigError::Invalid {
+                field,
+                reason: format!(
+                    "expected 8 hex chars (4-byte namespace) or 40 hex chars (20-byte subnetwork id), got {len}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn decode_hex_bytes(field: &'static str, value: &str) -> Result<Vec<u8>, IgraConfigError> {
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for index in (0..value.len()).step_by(2) {
+        let byte = u8::from_str_radix(&value[index..index + 2], 16).map_err(|err| {
+            IgraConfigError::Invalid { field, reason: format!("must be hex-encoded: {err}") }
+        })?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
 /// IGRA config validation error.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum IgraConfigError {
@@ -276,6 +334,7 @@ mod tests {
             expected_el_chain_id: Some(1337),
             kaspa_network: Some("testnet-10".to_string()),
             tx_id_prefix: Some("97b1".to_string()),
+            lane_id: Some("97b10000".to_string()),
             el_receipt_timeout_secs: Some(300),
             mining_timeout_secs: Some(120),
             payload_compression: None,
@@ -314,6 +373,33 @@ mod tests {
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("IGRA config error"));
         assert!(err.contains("even number of hex"));
+    }
+
+    #[test]
+    fn validate_rejects_missing_lane_id() {
+        let mut config = valid_config();
+        config.lane_id = None;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert_eq!(err, "IGRA config error: `lane_id` is required when `igra.enabled=true`");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_lane_id_shape() {
+        let mut config = valid_config();
+        config.lane_id = Some("010203".to_string());
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("lane_id"));
+        assert!(err.contains("expected 8 hex chars"));
+
+        config.lane_id = Some("01000000".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("reserved system lane shape"));
+
+        config.lane_id = Some("97b1000000000000000000000000000000000001".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("user-lane shape"));
     }
 
     #[test]

@@ -216,6 +216,7 @@ impl IgraEntryArgs {
             raw_tx_bytes: entry_payload.to_vec(),
             payload_kind: IgraPayloadKind::CanonicalEntry,
             tx_id_prefix: required_igra_string("tx_id_prefix", config.igra.tx_id_prefix)?,
+            lane_id: required_igra_string("lane_id", config.igra.lane_id)?,
             mining_timeout_secs: config
                 .igra
                 .mining_timeout_secs
@@ -291,6 +292,7 @@ impl IgraQEntryArgs {
             raw_tx_bytes: entry_payload.to_vec(),
             payload_kind: IgraPayloadKind::FalconL5Entry,
             tx_id_prefix: required_igra_string("tx_id_prefix", config.igra.tx_id_prefix)?,
+            lane_id: required_igra_string("lane_id", config.igra.lane_id)?,
             mining_timeout_secs: config
                 .igra
                 .mining_timeout_secs

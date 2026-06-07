@@ -4898,7 +4898,8 @@ mod tests {
                 kaspa_rpc_url = 'grpc://127.0.0.1:16110'
                 expected_el_chain_id = 1337
                 kaspa_network = 'testnet-10'
-                tx_id_prefix = '97b1'
+                tx_id_prefix = '97b4'
+                lane_id = '97b10000'
                 el_receipt_timeout_secs = 300
             ",
             )?;
@@ -4931,7 +4932,8 @@ mod tests {
         config.igra.kaspa_rpc_url = Some("grpc://127.0.0.1:16110".to_string());
         config.igra.expected_el_chain_id = Some(1337);
         config.igra.kaspa_network = Some("testnet-10".to_string());
-        config.igra.tx_id_prefix = Some("97b1".to_string());
+        config.igra.tx_id_prefix = Some("97b4".to_string());
+        config.igra.lane_id = Some("97b10000".to_string());
         config.igra.el_receipt_timeout_secs = Some(300);
 
         assert!(config.validate_igra().is_ok());

@@ -30,7 +30,7 @@ use kaspa_consensus_core::{
     mass::MassCalculator as KaspaMassCalculator,
     network::NetworkType as KaspaNetworkType,
     sign::{sign_with_multiple_v2 as kaspa_sign_with_multiple_v2, verify as kaspa_verify},
-    subnets::SubnetworkId,
+    subnets::{SUBNETWORK_ID_SIZE, SubnetworkId},
     tx::{
         ScriptPublicKey, SignableTransaction as KaspaSignableTransaction,
         Transaction as KaspaTransaction, TransactionInput as KaspaTransactionInput,
@@ -90,6 +90,9 @@ const IGRA_Q_RAW_TX_TYPE: u8 = 0x04;
 const IGRA_FALCON_L5_TX_TYPE: u8 = 0x7c;
 const IGRA_Q_ENTRY_BYTES: usize = 28;
 const IGRA_Q_ENTRY_ADDRESS_BYTES: usize = 20;
+const KASPA_TX_VERSION_NATIVE: u16 = 0;
+const KASPA_TX_VERSION_TOCCATA: u16 = 1;
+const KASPA_SUBNETWORK_NAMESPACE_LEN: usize = 4;
 const CACHE_TTL_SECS: u64 = 20;
 const BASE_SUBMIT_FEE_SOMPI: u64 = 200_000;
 const INITIAL_FEE_PER_PAYLOAD_BYTE_SOMPI: u64 = 200;
@@ -105,6 +108,7 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Default)]
 pub struct IgraTransportConfig {
     pub tx_id_prefix: Option<String>,
+    pub lane_id: Option<String>,
     pub mining_timeout_secs: Option<u64>,
     pub kaspa_rpc_url: Option<String>,
     pub kaspa_network: Option<String>,
@@ -122,6 +126,7 @@ pub struct IgraSubmitRequest {
     pub raw_tx_bytes: Vec<u8>,
     pub payload_kind: IgraPayloadKind,
     pub tx_id_prefix: String,
+    pub lane_id: String,
     pub mining_timeout_secs: u64,
     pub kaspa_rpc_url: Option<String>,
     pub kaspa_network: Option<String>,
@@ -284,6 +289,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
         }
         let prefix_bytes = hex::decode(prefix.clone())
             .map_err(|err| format!("IGRA config error: `tx_id_prefix` is invalid hex: {err}"))?;
+        let subnetwork_id = parse_igra_lane_id(&request.lane_id)?;
         let mining_timeout = Duration::from_secs(request.mining_timeout_secs);
         let payload_len = 1usize.saturating_add(payload_data.l2data.len()).saturating_add(4);
 
@@ -324,6 +330,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
             let source_address_for_build = source_address.clone();
             let l2data_for_build = payload_data.l2data.clone();
             let prefix_for_build = prefix_bytes.clone();
+            let subnetwork_id_for_build = subnetwork_id.clone();
             let mining_timeout_for_build = mining_timeout;
             let payload_header = payload_data.header;
             let entry_deposit_for_build = entry_deposit.clone();
@@ -335,6 +342,7 @@ impl IgraPayloadSubmitter for InProcessKaspaPayloadSubmitter {
                     payload_header,
                     &l2data_for_build,
                     &prefix_for_build,
+                    subnetwork_id_for_build,
                     mining_timeout_for_build,
                     &reserved_utxos,
                     entry_deposit_for_build.as_ref(),
@@ -733,6 +741,7 @@ pub struct IgraTransport<T> {
     enabled: bool,
     store: Option<Arc<IgraStore>>,
     tx_id_prefix: Option<String>,
+    lane_id: Option<String>,
     mining_timeout: Duration,
     kaspa_rpc_url: Option<String>,
     kaspa_network: Option<String>,
@@ -750,6 +759,7 @@ impl<T> IgraTransport<T> {
             enabled,
             store: None,
             tx_id_prefix: None,
+            lane_id: None,
             mining_timeout: Duration::from_secs(DEFAULT_MINING_TIMEOUT_SECS),
             kaspa_rpc_url: None,
             kaspa_network: None,
@@ -763,6 +773,7 @@ impl<T> IgraTransport<T> {
     /// Sets runtime IGRA settings used by the raw-submit interception path.
     pub fn with_transport_config(mut self, config: IgraTransportConfig) -> Self {
         self.tx_id_prefix = config.tx_id_prefix.map(normalize_hex_prefix);
+        self.lane_id = config.lane_id;
         self.mining_timeout =
             Duration::from_secs(config.mining_timeout_secs.unwrap_or(DEFAULT_MINING_TIMEOUT_SECS));
         self.kaspa_rpc_url = config.kaspa_rpc_url;
@@ -1082,6 +1093,7 @@ impl<T> IgraTransport<T> {
         if let Some(raw_send) = raw_send {
             let tracked_send = self.tracked_send(&raw_send.metadata);
             let tx_id_prefix = self.tx_id_prefix.clone();
+            let lane_id = self.lane_id.clone();
             let mining_timeout = self.mining_timeout;
             let kaspa_rpc_url = self.kaspa_rpc_url.clone();
             let kaspa_network = self.kaspa_network.clone();
@@ -1099,6 +1111,9 @@ impl<T> IgraTransport<T> {
                 let result: Result<ResponsePacket, TransportError> = async {
                     let tx_id_prefix = tx_id_prefix.ok_or_else(|| {
                         Self::reject_error("IGRA config error: `tx_id_prefix` is required")
+                    })?;
+                    let lane_id = lane_id.ok_or_else(|| {
+                        Self::reject_error("IGRA config error: `lane_id` is required")
                     })?;
 
                     if let Some(tracked) = tracked.as_ref() {
@@ -1213,6 +1228,7 @@ impl<T> IgraTransport<T> {
                             IgraLogicZone::FalconL5 => IgraPayloadKind::FalconL5RawTx,
                         },
                         tx_id_prefix: tx_id_prefix.clone(),
+                        lane_id: lane_id.clone(),
                         mining_timeout_secs: mining_timeout.as_secs(),
                         kaspa_rpc_url,
                         kaspa_network,
@@ -1547,6 +1563,53 @@ fn parse_lock_script_pubkey_hex(value: &str) -> Result<Vec<u8>, String> {
     hex::decode(value).map_err(|err| format!("Entry lock script pubkey must be hex-encoded: {err}"))
 }
 
+fn parse_igra_lane_id(value: &str) -> Result<SubnetworkId, String> {
+    let value = value.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if value.is_empty() {
+        return Err("IGRA config error: `lane_id` cannot be empty".to_string());
+    }
+    if !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err("IGRA config error: `lane_id` must be hex-encoded".to_string());
+    }
+
+    let subnetwork_id = match value.len() {
+        8 => {
+            let mut namespace = [0u8; KASPA_SUBNETWORK_NAMESPACE_LEN];
+            hex::decode_to_slice(value, &mut namespace)
+                .map_err(|err| format!("IGRA config error: `lane_id` is invalid hex: {err}"))?;
+            let mut bytes = [0u8; SUBNETWORK_ID_SIZE];
+            bytes[..KASPA_SUBNETWORK_NAMESPACE_LEN].copy_from_slice(&namespace);
+            SubnetworkId::from_bytes(bytes)
+        }
+        40 => {
+            let mut bytes = [0u8; SUBNETWORK_ID_SIZE];
+            hex::decode_to_slice(value, &mut bytes)
+                .map_err(|err| format!("IGRA config error: `lane_id` is invalid hex: {err}"))?;
+            SubnetworkId::from_bytes(bytes)
+        }
+        len => {
+            return Err(format!(
+                "IGRA config error: `lane_id` expected 8 hex chars (4-byte namespace) or 40 hex chars (20-byte subnetwork id), got {len}"
+            ));
+        }
+    };
+
+    let bytes: &[u8; SUBNETWORK_ID_SIZE] = subnetwork_id.as_ref();
+    if bytes[1..].iter().all(|byte| *byte == 0) {
+        return Err(
+            "IGRA config error: `lane_id` reserved system lane shape is not allowed".to_string()
+        );
+    }
+    if bytes[KASPA_SUBNETWORK_NAMESPACE_LEN..].iter().any(|byte| *byte != 0) {
+        return Err(
+            "IGRA config error: `lane_id` full lane id must use user-lane shape [namespace(4), zero_tail(16)]"
+                .to_string(),
+        );
+    }
+
+    Ok(subnetwork_id)
+}
+
 fn entry_deposit_output_for_request(
     payload_kind: IgraPayloadKind,
     raw_tx: &[u8],
@@ -1573,6 +1636,7 @@ fn mine_and_build_signed_payload_transaction(
     payload_header: u8,
     l2data: &[u8],
     tx_id_prefix: &[u8],
+    subnetwork_id: SubnetworkId,
     timeout: Duration,
     utxos: &[RpcUtxosByAddressesEntry],
     entry_deposit: Option<&EntryDepositOutput>,
@@ -1654,8 +1718,20 @@ fn mine_and_build_signed_payload_transaction(
 
         let payload = build_payload_with_nonce(payload_header, l2data, 0);
         let nonce_offset = payload.len().saturating_sub(4);
-        let mut tx =
-            KaspaTransaction::new(0, inputs, outputs, 0, SubnetworkId::default(), 0, payload);
+        let tx_version = if subnetwork_id == SubnetworkId::default() {
+            KASPA_TX_VERSION_NATIVE
+        } else {
+            KASPA_TX_VERSION_TOCCATA
+        };
+        let mut tx = KaspaTransaction::new(
+            tx_version,
+            inputs,
+            outputs,
+            0,
+            subnetwork_id.clone(),
+            0,
+            payload,
+        );
 
         let start = Instant::now();
         let mut nonce = 0_u32;
@@ -1823,8 +1899,9 @@ mod tests {
     use super::{
         IGRA_EIP4844_UNSUPPORTED_ERROR, IGRA_EIP7702_UNSUPPORTED_ERROR,
         IGRA_SEND_TRANSACTION_UNSUPPORTED_ERROR, IgraPayloadSubmitter, IgraTransport,
-        IgraTransportConfig, KaspaAddress, KaspaAddressPrefix, KaspaAddressVersion,
-        kaspa_address_from_private_key, resolve_mnemonic_private_key,
+        IgraTransportConfig, KASPA_SUBNETWORK_NAMESPACE_LEN, KaspaAddress, KaspaAddressPrefix,
+        KaspaAddressVersion, SUBNETWORK_ID_SIZE, SubnetworkId, kaspa_address_from_private_key,
+        resolve_mnemonic_private_key,
     };
     use crate::igra_store::{
         IGRA_NONCE_REPLACEMENT_CANDIDATE_ERROR_CODE, IgraStore, IgraStoreConfig, TxLifecycleState,
@@ -2145,6 +2222,7 @@ mod tests {
     fn test_transport_config() -> IgraTransportConfig {
         IgraTransportConfig {
             tx_id_prefix: Some("00".to_string()),
+            lane_id: Some("97b10000".to_string()),
             mining_timeout_secs: Some(2),
             kaspa_rpc_url: Some("grpc://127.0.0.1:16110".to_string()),
             kaspa_network: Some("testnet-10".to_string()),
@@ -2776,6 +2854,29 @@ mod tests {
             super::minimum_relay_fee_sompi_for_mass(0),
             super::CURRENT_KASPA_MIN_RELAY_FEE_PER_KG_SOMPI
         );
+    }
+
+    #[test]
+    fn igra_lane_id_parser_accepts_official_namespace_and_full_id() {
+        let shorthand = super::parse_igra_lane_id("97b10000").expect("official lane parses");
+        let full = super::parse_igra_lane_id("97b1000000000000000000000000000000000000")
+            .expect("full lane parses");
+
+        assert_eq!(shorthand, full);
+        let mut expected = [0u8; SUBNETWORK_ID_SIZE];
+        expected[..KASPA_SUBNETWORK_NAMESPACE_LEN].copy_from_slice(&[0x97, 0xb1, 0x00, 0x00]);
+        assert_eq!(shorthand, SubnetworkId::from_bytes(expected));
+    }
+
+    #[test]
+    fn igra_lane_id_parser_rejects_reserved_and_non_user_shapes() {
+        let reserved =
+            super::parse_igra_lane_id("01000000").expect_err("reserved shape is rejected");
+        assert!(reserved.contains("reserved system lane shape"));
+
+        let non_user = super::parse_igra_lane_id("97b1000000000000000000000000000000000001")
+            .expect_err("non-zero full tail is rejected");
+        assert!(non_user.contains("user-lane shape"));
     }
 
     #[test]

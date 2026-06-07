@@ -212,6 +212,7 @@ impl<N: Network> ProviderBuilder<N> {
         });
         builder = builder.igra_transport_config(IgraTransportConfig {
             tx_id_prefix: config.igra.tx_id_prefix.clone(),
+            lane_id: config.igra.lane_id.clone(),
             mining_timeout_secs: config
                 .igra
                 .mining_timeout_secs
@@ -579,7 +580,8 @@ mod tests {
         config.igra.kaspa_rpc_url = Some("grpc://127.0.0.1:16110".to_string());
         config.igra.expected_el_chain_id = Some(1337);
         config.igra.kaspa_network = Some("testnet-10".to_string());
-        config.igra.tx_id_prefix = Some("97b1".to_string());
+        config.igra.tx_id_prefix = Some("97b4".to_string());
+        config.igra.lane_id = Some("97b10000".to_string());
         config.igra.el_receipt_timeout_secs = Some(300);
         config.igra.mining_timeout_secs = Some(42);
 

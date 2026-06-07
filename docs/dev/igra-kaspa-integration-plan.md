@@ -63,6 +63,7 @@ kaspa_network = "testnet-10"
 
 # Mining + submission
 tx_id_prefix = "97b4" # testnet-10 (galleon-testnet). Use "97b1" for mainnet.
+lane_id = "97b10000" # post-KIP21 IGRA lane namespace
 kaspa_submit_timeout_secs = 30
 mining_timeout_secs = 120
 kaspa_acceptance_confirmations = 0 # v1 default: mempool acceptance only
