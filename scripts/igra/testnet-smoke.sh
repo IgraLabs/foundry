@@ -41,6 +41,8 @@ IGRA_KASPA_NETWORK="${IGRA_KASPA_NETWORK:-testnet-10}"
 # - galleon-testnet (testnet-10): 97b4
 # - mainnet: 97b1
 IGRA_TX_ID_PREFIX="${IGRA_TX_ID_PREFIX:-97b4}"
+# Post-KIP21 IGRA lane namespace. Shared by mainnet and testnet-10.
+IGRA_LANE_ID="${IGRA_LANE_ID:-97b10000}"
 IGRA_EL_RECEIPT_TIMEOUT_SECS="${IGRA_EL_RECEIPT_TIMEOUT_SECS:-300}"
 IGRA_MINING_TIMEOUT_SECS="${IGRA_MINING_TIMEOUT_SECS:-120}"
 IGRA_SENDER_LOCK_TIMEOUT_SECS="${IGRA_SENDER_LOCK_TIMEOUT_SECS:-60}"
@@ -118,6 +120,7 @@ kaspa_rpc_url = "${IGRA_KASPA_RPC_URL}"
 expected_el_chain_id = ${IGRA_EXPECTED_CHAIN_ID}
 kaspa_network = "${IGRA_KASPA_NETWORK}"
 tx_id_prefix = "${IGRA_TX_ID_PREFIX}"
+lane_id = "${IGRA_LANE_ID}"
 el_receipt_timeout_secs = ${IGRA_EL_RECEIPT_TIMEOUT_SECS}
 mining_timeout_secs = ${IGRA_MINING_TIMEOUT_SECS}
 sender_lock_timeout_secs = ${IGRA_SENDER_LOCK_TIMEOUT_SECS}

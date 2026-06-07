@@ -18,6 +18,7 @@ CHAIN_ID="${IGRA_Q_CHAIN_ID:-48836}"
 GAS_PRICE="${IGRA_Q_GAS_PRICE:-1}"
 KASPA_NETWORK="${IGRA_Q_KASPA_NETWORK:-testnet-10}"
 TX_ID_PREFIX="${IGRA_Q_TX_ID_PREFIX:-97b4}"
+LANE_ID="${IGRA_Q_LANE_ID:-97b10000}"
 KASPA_MNEMONIC="${IGRA_Q_KASPA_MNEMONIC:-abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about}"
 MASTER_SEED="${IGRA_Q_MASTER_SEED:-696772612d712d6c6f6769632d7a6f6e652d66616c636f6e2d6c352d73746167696e672d736d6f6b652d7631}"
 
@@ -62,6 +63,7 @@ kaspa_rpc_url = "$KASPA_RPC"
 expected_el_chain_id = $CHAIN_ID
 kaspa_network = "$KASPA_NETWORK"
 tx_id_prefix = "$TX_ID_PREFIX"
+lane_id = "$LANE_ID"
 el_receipt_timeout_secs = 180
 mining_timeout_secs = 120
 sender_lock_timeout_secs = 180
