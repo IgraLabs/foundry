@@ -432,7 +432,6 @@ vergen = { package = "vergen-gitcl", version = "10.0.0-beta.5", default-features
 ] }
 
 # Kaspa / IGRA in-process submission stack
-kaswallet-common = { path = "../kaswallet/common", package = "kaswallet-common" }
 kaspa-addresses = { path = "../rusty-kaspa/crypto/addresses" }
 kaspa-bip32 = { path = "../rusty-kaspa/wallet/bip32" }
 # Compatibility: some environments still derive Kaspa addresses using older kaspa-bip32 semantics.

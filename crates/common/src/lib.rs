@@ -7,7 +7,6 @@
 
 #[expect(unused_extern_crates)] // Used by `ConsoleFmt`.
 extern crate self as foundry_common;
-use kaswallet_common as _;
 
 #[macro_use]
 extern crate tracing;

@@ -27,7 +27,7 @@ use kaspa_bip32::{
 };
 use kaspa_consensus_core::{
     config::params::Params as KaspaParams,
-    mass::MassCalculator as KaspaMassCalculator,
+    mass::{Mass as KaspaMass, MassCalculator as KaspaMassCalculator},
     network::NetworkType as KaspaNetworkType,
     sign::{sign_with_multiple_v2 as kaspa_sign_with_multiple_v2, verify as kaspa_verify},
     subnets::{SUBNETWORK_ID_SIZE, SubnetworkId},
@@ -92,6 +92,7 @@ const IGRA_Q_ENTRY_BYTES: usize = 28;
 const IGRA_Q_ENTRY_ADDRESS_BYTES: usize = 20;
 const KASPA_TX_VERSION_NATIVE: u16 = 0;
 const KASPA_TX_VERSION_TOCCATA: u16 = 1;
+const KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT: u16 = 10;
 const KASPA_SUBNETWORK_NAMESPACE_LEN: usize = 4;
 const CACHE_TTL_SECS: u64 = 20;
 const BASE_SUBMIT_FEE_SOMPI: u64 = 200_000;
@@ -1659,8 +1660,9 @@ fn mine_and_build_signed_payload_transaction(
     let deposit_amount = entry_deposit.map(|deposit| deposit.amount_sompi).unwrap_or_default();
     let minimum_change = if entry_deposit.is_some() { 0 } else { MIN_CHANGE_SOMPI };
     let source_script_public_key = pay_to_address_script(source_address);
-    let mass_calculator =
-        KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
+    let consensus_params = KaspaParams::from(network_type);
+    let mass_calculator = KaspaMassCalculator::new_with_consensus_params(&consensus_params);
+    let mass_cofactors = consensus_params.mempool_block_mass_cofactors().after();
 
     let mut fee_floor = initial_fee_sompi(payload_len, 1);
     for attempt in 0..FEE_SELECTION_ATTEMPTS {
@@ -1685,10 +1687,25 @@ fn mine_and_build_signed_payload_transaction(
             ));
         }
 
+        let tx_version = if subnetwork_id == SubnetworkId::default() {
+            KASPA_TX_VERSION_NATIVE
+        } else {
+            KASPA_TX_VERSION_TOCCATA
+        };
         let inputs = selected
             .iter()
             .map(|entry| {
-                KaspaTransactionInput::new(entry.outpoint.clone().into(), Vec::new(), 0, 1)
+                let outpoint = entry.outpoint.clone().into();
+                if tx_version == KASPA_TX_VERSION_TOCCATA {
+                    KaspaTransactionInput::new_with_compute_budget(
+                        outpoint,
+                        Vec::new(),
+                        0,
+                        KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT,
+                    )
+                } else {
+                    KaspaTransactionInput::new(outpoint, Vec::new(), 0, 1)
+                }
             })
             .collect::<Vec<_>>();
         let mut outputs = Vec::new();
@@ -1718,11 +1735,6 @@ fn mine_and_build_signed_payload_transaction(
 
         let payload = build_payload_with_nonce(payload_header, l2data, 0);
         let nonce_offset = payload.len().saturating_sub(4);
-        let tx_version = if subnetwork_id == SubnetworkId::default() {
-            KASPA_TX_VERSION_NATIVE
-        } else {
-            KASPA_TX_VERSION_TOCCATA
-        };
         let mut tx = KaspaTransaction::new(
             tx_version,
             inputs,
@@ -1769,6 +1781,7 @@ fn mine_and_build_signed_payload_transaction(
                 script_public_key: entry.utxo_entry.script_public_key.clone(),
                 block_daa_score: entry.utxo_entry.block_daa_score,
                 is_coinbase: entry.utxo_entry.is_coinbase,
+                covenant_id: entry.utxo_entry.covenant_id,
             })
             .collect::<Vec<_>>();
 
@@ -1788,7 +1801,8 @@ fn mine_and_build_signed_payload_transaction(
             mass_calculator.calc_contextual_masses(&signed.as_verifiable()).ok_or_else(|| {
                 "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string()
             })?;
-        let mass = contextual.max(non_contextual);
+        let storage_mass = contextual.storage_mass;
+        let mass = KaspaMass::new(non_contextual, contextual).normalized_max(&mass_cofactors);
         if mass > MAX_STANDARD_KASPA_TX_MASS {
             return Err(format!(
                 "IGRA submit error: Kaspa transaction mass {mass} exceeds standard limit {MAX_STANDARD_KASPA_TX_MASS}"
@@ -1801,7 +1815,7 @@ fn mine_and_build_signed_payload_transaction(
         let required_relay_fee = minimum_relay_fee_sompi_for_mass(mass);
         if actual_fee >= required_relay_fee {
             let tx = signed.tx;
-            tx.set_mass(mass);
+            tx.set_storage_mass(storage_mass);
             return Ok((nonce as u64, tx));
         }
 
@@ -2794,6 +2808,65 @@ mod tests {
 
         assert_eq!(deposit.amount_sompi, 100_000_000);
         assert_eq!(deposit.lock_script_pubkey, hex::decode("203705fd").unwrap());
+    }
+
+    #[test]
+    fn igra_entry_carrier_uses_toccata_lane_transaction() {
+        let private_key = [1u8; 32];
+        let source_address =
+            super::kaspa_address_from_private_key(&private_key, KaspaAddressPrefix::Testnet)
+                .expect("test private key should derive an address");
+        let source_script_public_key = kaspa_txscript::pay_to_address_script(&source_address);
+        let utxo = kaspa_rpc_core::RpcUtxosByAddressesEntry {
+            address: Some(source_address.clone()),
+            outpoint: kaspa_rpc_core::RpcTransactionOutpoint {
+                transaction_id: kaspa_consensus_core::Hash::from_u64_word(42),
+                index: 0,
+            },
+            utxo_entry: kaspa_rpc_core::RpcUtxoEntry::new(
+                200_000_000,
+                source_script_public_key,
+                1,
+                false,
+                None,
+            ),
+        };
+        let mut entry = [0u8; super::IGRA_Q_ENTRY_BYTES];
+        entry[..20].copy_from_slice(&[0x33; 20]);
+        entry[20..].copy_from_slice(&100_000_000u64.to_le_bytes());
+        let entry_deposit = super::entry_deposit_output_for_request(
+            super::IgraPayloadKind::FalconL5Entry,
+            &entry,
+            Some("0x203705fd"),
+        )
+        .expect("entry deposit output should build")
+        .expect("entry carrier should include a deposit output");
+        let subnetwork_id =
+            super::parse_igra_lane_id("97b10000").expect("official lane should parse");
+
+        let (_payload_nonce, tx) = super::mine_and_build_signed_payload_transaction(
+            &private_key,
+            &source_address,
+            kaspa_consensus_core::network::NetworkType::Testnet,
+            0x9f,
+            &entry,
+            &[0x00],
+            subnetwork_id.clone(),
+            Duration::from_secs(30),
+            &[utxo],
+            Some(&entry_deposit),
+        )
+        .expect("entry carrier should build");
+
+        assert_eq!(tx.version, super::KASPA_TX_VERSION_TOCCATA);
+        assert_eq!(tx.subnetwork_id, subnetwork_id);
+        assert_eq!(
+            tx.inputs[0].compute_commit.compute_budget(),
+            Some(super::KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT)
+        );
+        assert_eq!(tx.inputs[0].compute_commit.sig_op_count(), None);
+        assert_eq!(tx.outputs[0].value, 100_000_000);
+        assert_eq!(tx.outputs[0].script_public_key.script(), &[0x20, 0x37, 0x05, 0xfd]);
     }
 
     #[test]

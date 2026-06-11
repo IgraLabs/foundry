@@ -12,8 +12,8 @@ unsetopt xtrace verbose 2>/dev/null || true
 
 ROOT="${IGRA_Q_ROOT:-/Users/user/Source/igra/quantum-logic-zone}"
 CAST="${IGRA_Q_CAST:-$ROOT/foundry/target/debug/cast}"
-RPC="${IGRA_Q_RPC:-http://127.0.0.1:49545}"
-KASPA_RPC="${IGRA_Q_KASPA_RPC:-grpc://stage-roman.igralabs.com:56210}"
+RPC="${IGRA_Q_RPC:-http://127.0.0.1:39545}"
+KASPA_RPC="${IGRA_Q_KASPA_RPC:-grpc://127.0.0.1:59210}"
 CHAIN_ID="${IGRA_Q_CHAIN_ID:-48836}"
 GAS_PRICE="${IGRA_Q_GAS_PRICE:-1}"
 KASPA_NETWORK="${IGRA_Q_KASPA_NETWORK:-testnet-10}"
@@ -31,6 +31,8 @@ FUND_AMOUNT_WEI="${IGRA_Q_FUND_AMOUNT_WEI:-1000000000000}"
 MIN_Q_BALANCE_WEI="${IGRA_Q_MIN_Q_BALANCE_WEI:-100000000000}"
 HEALTH_INTERVAL_SECONDS="${IGRA_Q_HEALTH_INTERVAL_SECONDS:-30}"
 RECEIPT_RECOVERY_TIMEOUT_SECONDS="${IGRA_Q_RECEIPT_RECOVERY_TIMEOUT_SECONDS:-90}"
+ERROR_BACKOFF_SECONDS="${IGRA_Q_ERROR_BACKOFF_SECONDS:-20}"
+MAX_CONSECUTIVE_ERRORS="${IGRA_Q_MAX_CONSECUTIVE_ERRORS:-12}"
 SENDER_SEED_PREFIX="${IGRA_Q_SENDER_SEED_PREFIX:-igra-q-endurance-eoa}"
 RUN_ID="${IGRA_Q_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 RUN_DIR="${IGRA_Q_ENDURANCE_DIR:-/tmp/igra-q-eoa-endurance-$RUN_ID}"
@@ -348,7 +350,31 @@ if [ "$FUND_SENDERS" = "true" ]; then
     balance_dec="$(hex_to_dec "$balance_hex")"
     printf 'sender_preflight index=%s address=%s balance=%s\n' "$((i - 1))" "$addr" "$balance_hex"
     if [ "$balance_dec" -lt "$MIN_Q_BALANCE_WEI" ]; then
-      receipt=$(q_publish "$master_pk" "$master_nonce" 21000 --to "$addr" --value "$FUND_AMOUNT_WEI")
+      receipt=""
+      rc=1
+      fund_attempt_limit="$MAX_CONSECUTIVE_ERRORS"
+      if [ "$fund_attempt_limit" -le 0 ]; then
+        fund_attempt_limit=1
+      fi
+      for attempt in $(seq 1 "$fund_attempt_limit"); do
+        set +e
+        receipt=$(q_publish "$master_pk" "$master_nonce" 21000 --to "$addr" --value "$FUND_AMOUNT_WEI" 2>&1)
+        rc=$?
+        set -e
+        if [ "$rc" -eq 0 ] && jq -e . >/dev/null 2>&1 <<<"$receipt"; then
+          break
+        fi
+        printf 'fund_sender_error index=%s attempt=%s/%s error=%s\n' \
+          "$((i - 1))" "$attempt" "$fund_attempt_limit" "$(printf '%s' "$receipt" | tail -c 500)" >&2
+        if [ "$attempt" -lt "$fund_attempt_limit" ]; then
+          sleep "$ERROR_BACKOFF_SECONDS"
+        fi
+      done
+      if [ "$rc" -ne 0 ] || ! jq -e . >/dev/null 2>&1 <<<"$receipt"; then
+        printf 'funding failed for sender index=%s address=%s\n%s\n' \
+          "$((i - 1))" "$addr" "$receipt" >&2
+        exit 1
+      fi
       print_receipt_line "fund_sender_$((i - 1))" "$receipt"
       receipt_status="$(jq -r .status <<<"$receipt")"
       if [ "$receipt_status" != "0x1" ]; then
@@ -384,6 +410,7 @@ worker_loop() {
   local address="$5"
   local worker_dir="$RUN_DIR/worker-$worker_index"
   local worker_config="$worker_dir/foundry-igra.toml"
+  local consecutive_errors=0
 
   mkdir -p "$worker_dir"
   awk -v path="$worker_dir/igra-store.sqlite" '
@@ -402,6 +429,12 @@ worker_loop() {
     local started_ms finished_ms receipt tx_status tx_hash block gas sink error
     started_ms="$(now_ms)"
     sink=$(printf '0x%040x' $((0x400000 + worker_index * 100000 + nonce)))
+    receipt=""
+    tx_status=""
+    tx_hash=""
+    block=""
+    gas=""
+    error=""
 
     set +e
     receipt=$(q_publish_with_config \
@@ -422,13 +455,22 @@ worker_loop() {
       tx_hash="$(jq -r '.transactionHash // "null"' <<<"$receipt")"
       block="$(jq -r '.blockNumber // "null"' <<<"$receipt")"
       gas="$(jq -r '.gasUsed // "null"' <<<"$receipt")"
+      error=""
       emit_result "$worker_index" "$nonce" "$started_ms" "$finished_ms" true "$tx_status" "$tx_hash" "$block" "$gas" ""
+      consecutive_errors=0
       nonce=$((nonce + 1))
     else
       error="$(printf '%s' "$receipt" | tail -c 800)"
       emit_result "$worker_index" "$nonce" "$started_ms" "$finished_ms" false "" "" "" "" "$error"
       printf 'worker_error index=%s nonce=%s error=%s\n' "$worker_index" "$nonce" "$error" >&2
-      break
+      consecutive_errors=$((consecutive_errors + 1))
+      if [ "$MAX_CONSECUTIVE_ERRORS" -gt 0 ] && [ "$consecutive_errors" -ge "$MAX_CONSECUTIVE_ERRORS" ]; then
+        printf 'worker_error_limit index=%s nonce=%s consecutive_errors=%s\n' \
+          "$worker_index" "$nonce" "$consecutive_errors" >&2
+        break
+      fi
+      sleep "$ERROR_BACKOFF_SECONDS"
+      continue
     fi
 
     local elapsed_ms sleep_for_ms
@@ -466,6 +508,8 @@ observed_tps="$(awk -v ok="$success_count" -v ms="$elapsed_ms" 'BEGIN { if (ms >
   printf 'target_tps=%s\n' "$TARGET_TPS"
   printf 'duration_seconds=%s\n' "$DURATION_SECONDS"
   printf 'num_senders=%s\n' "$NUM_SENDERS"
+  printf 'error_backoff_seconds=%s\n' "$ERROR_BACKOFF_SECONDS"
+  printf 'max_consecutive_errors=%s\n' "$MAX_CONSECUTIVE_ERRORS"
   printf 'total_results=%s\n' "$total_count"
   printf 'success_count=%s\n' "$success_count"
   printf 'failure_count=%s\n' "$failure_count"
