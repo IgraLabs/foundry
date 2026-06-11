@@ -24,7 +24,7 @@ use std::{fs, path::Path, str::FromStr};
 
 const DEFAULT_IGRA_MINING_TIMEOUT_SECS: u64 = 120;
 const Q_MNEMONIC_DOMAIN: &[u8] = b"IGRA_FALCON_L5_Q_MNEMONIC_V1";
-const Q_MNEMONIC_INFO_PREFIX: &str = "igra-q-zone-falcon-l5/m/44'/111111'/0'/0/";
+const Q_MNEMONIC_INFO_PREFIX: &str = "igra-q-zone-falcon-l5/m/44'/igra-q-coin'/0'/0/";
 
 /// CLI arguments for `cast igra-q-address`.
 #[derive(Debug, Parser)]
@@ -573,9 +573,9 @@ mod tests {
     }
 
     #[test]
-    fn q_mnemonic_info_uses_kaspa_bip44_path_label() {
-        assert_eq!(q_mnemonic_info(0), "igra-q-zone-falcon-l5/m/44'/111111'/0'/0/0");
-        assert_eq!(q_mnemonic_info(17), "igra-q-zone-falcon-l5/m/44'/111111'/0'/0/17");
+    fn q_mnemonic_info_uses_q_zone_path_label() {
+        assert_eq!(q_mnemonic_info(0), "igra-q-zone-falcon-l5/m/44'/igra-q-coin'/0'/0/0");
+        assert_eq!(q_mnemonic_info(17), "igra-q-zone-falcon-l5/m/44'/igra-q-coin'/0'/0/17");
     }
 
     #[test]
