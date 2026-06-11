@@ -63,7 +63,7 @@ op-alloy-flz.workspace = true
 chrono.workspace = true
 eyre.workspace = true
 futures.workspace = true
-hmac = "0.12"
+hkdf = "0.12"
 revm = { workspace = true, features = ["optional_balance_check"] }
 rand.workspace = true
 rand_08.workspace = true

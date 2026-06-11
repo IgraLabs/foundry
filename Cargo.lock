@@ -3086,7 +3086,7 @@ dependencies = [
  "foundry-test-utils",
  "foundry-wallets",
  "futures",
- "hmac",
+ "hkdf",
  "itertools 0.14.0",
  "op-alloy-flz",
  "rand 0.8.5",
@@ -6329,6 +6329,15 @@ dependencies = [
  "libc",
  "pkg-config",
  "rusb",
+]
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
 ]
 
 [[package]]

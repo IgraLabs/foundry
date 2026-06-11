@@ -18,14 +18,13 @@ use foundry_common::{
     shell,
 };
 use foundry_wallets::WalletOpts;
-use hmac::{Hmac, Mac};
+use hkdf::Hkdf;
 use sha2::Sha512;
 use std::{fs, path::Path, str::FromStr};
 
 const DEFAULT_IGRA_MINING_TIMEOUT_SECS: u64 = 120;
 const Q_MNEMONIC_DOMAIN: &[u8] = b"IGRA_FALCON_L5_Q_MNEMONIC_V1";
-
-type HmacSha512 = Hmac<Sha512>;
+const Q_MNEMONIC_INFO_PREFIX: &str = "igra-q-zone-falcon-l5/m/44'/111111'/0'/0/";
 
 /// CLI arguments for `cast igra-q-address`.
 #[derive(Debug, Parser)]
@@ -478,15 +477,16 @@ fn q_seed_from_mnemonic(
         Mnemonic::<English>::new_from_phrase(&phrase).wrap_err("invalid q-zone BIP39 mnemonic")?;
     let bip39_seed = mnemonic.to_seed(passphrase).wrap_err("failed to derive q-zone BIP39 seed")?;
 
-    let mut mac =
-        HmacSha512::new_from_slice(Q_MNEMONIC_DOMAIN).expect("HMAC-SHA512 accepts any key length");
-    mac.update(&bip39_seed);
-    mac.update(&index.to_be_bytes());
-    let bytes = mac.finalize().into_bytes();
+    let hkdf = Hkdf::<Sha512>::new(Some(Q_MNEMONIC_DOMAIN), &bip39_seed);
     let mut q_seed = [0u8; 64];
-    q_seed.copy_from_slice(&bytes);
+    hkdf.expand(q_mnemonic_info(index).as_bytes(), &mut q_seed)
+        .map_err(|_| eyre::eyre!("failed to derive q-zone HKDF seed"))?;
 
     Ok((q_seed, word_count))
+}
+
+fn q_mnemonic_info(index: u32) -> String {
+    format!("{Q_MNEMONIC_INFO_PREFIX}{index}")
 }
 
 fn resolve_mnemonic_phrase(mnemonic_q: &str) -> Result<String> {
@@ -570,6 +570,12 @@ mod tests {
         assert_eq!(compact.0, spaced.0);
         assert_eq!(compact.1, 12);
         assert_eq!(spaced.1, 12);
+    }
+
+    #[test]
+    fn q_mnemonic_info_uses_kaspa_bip44_path_label() {
+        assert_eq!(q_mnemonic_info(0), "igra-q-zone-falcon-l5/m/44'/111111'/0'/0/0");
+        assert_eq!(q_mnemonic_info(17), "igra-q-zone-falcon-l5/m/44'/111111'/0'/0/17");
     }
 
     #[test]
