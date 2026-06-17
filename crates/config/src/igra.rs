@@ -178,10 +178,10 @@ impl IgraConfig {
 
         if let Some(logic_zone) = self.logic_zone.as_deref() {
             let logic_zone = logic_zone.trim().to_ascii_lowercase();
-            if !matches!(logic_zone.as_str(), "" | "canonical" | "falcon-l5") {
+            if !matches!(logic_zone.as_str(), "" | "canonical" | "falcon-l5" | "kyc") {
                 return Err(IgraConfigError::Invalid {
                     field: "logic_zone",
-                    reason: "supported values: canonical, falcon-l5".to_string(),
+                    reason: "supported values: canonical, falcon-l5, kyc".to_string(),
                 });
             }
         }

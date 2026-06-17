@@ -323,6 +323,84 @@ impl IgraQEntryArgs {
     }
 }
 
+/// CLI arguments for `cast igra-kyc-entry` — fund an address on the KYC logic zone (0x0003).
+/// Same 28-byte entry payload as the q-zone, but carried under the KYC envelope so the adapter
+/// credits the KYC zone EL (not canonical).
+#[derive(Debug, Parser)]
+pub struct IgraKycEntryArgs {
+    /// KYC-zone recipient address.
+    #[arg(long)]
+    address: Address,
+
+    /// Amount to credit, in sompi, before the KYC EL applies its iKAS conversion.
+    #[arg(long)]
+    amount_sompi: u64,
+
+    /// Kaspa script public key that receives the Entry deposit output.
+    #[arg(long, env = "IGRA_LOCK_SCRIPT_PUBKEY")]
+    entry_lock_script_pubkey: Option<String>,
+
+    #[command(flatten)]
+    rpc: RpcOpts,
+
+    #[command(flatten)]
+    wallet: WalletOpts,
+}
+
+impl IgraKycEntryArgs {
+    pub async fn run(self) -> Result<()> {
+        let mut config = self.rpc.load_config()?;
+        if !config.igra.enabled {
+            eyre::bail!("IGRA mode is not enabled in the active Foundry config");
+        }
+        self.wallet.apply_igra_kaspa_wallet_overrides(&mut config);
+        let entry_lock_script_pubkey = self
+            .entry_lock_script_pubkey
+            .or_else(|| config.igra.entry_lock_script_pubkey.clone())
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "IGRA KYC Entry requires `entry_lock_script_pubkey` in [igra] or --entry-lock-script-pubkey"
+                )
+            })?;
+
+        let entry_payload = encode_q_entry_payload(self.address, self.amount_sompi);
+        let entry_hash = format!("0x{}", hex::encode(keccak256(entry_payload)));
+        let submit_request = IgraSubmitRequest {
+            l2_tx_hash: entry_hash.clone(),
+            raw_tx_bytes: entry_payload.to_vec(),
+            payload_kind: IgraPayloadKind::KycEntry,
+            tx_id_prefix: required_igra_string("tx_id_prefix", config.igra.tx_id_prefix)?,
+            lane_id: required_igra_string("lane_id", config.igra.lane_id)?,
+            mining_timeout_secs: config
+                .igra
+                .mining_timeout_secs
+                .unwrap_or(DEFAULT_IGRA_MINING_TIMEOUT_SECS),
+            kaspa_rpc_url: config.igra.kaspa_rpc_url,
+            kaspa_network: config.igra.kaspa_network,
+            payload_compression: None,
+            logic_zone: Some("kyc".to_string()),
+            entry_lock_script_pubkey: Some(entry_lock_script_pubkey),
+            kaspa_wallet: config.igra.kaspa_wallet,
+        };
+
+        let submitter = InProcessKaspaPayloadSubmitter::default();
+        let result = submitter.submit_payload(&submit_request).await.map_err(eyre::Report::msg)?;
+
+        sh_println!(
+            "{}",
+            serde_json::json!({
+                "entry_hash": entry_hash,
+                "kyc_address": format!("{:#x}", self.address),
+                "amount_sompi": self.amount_sompi,
+                "kaspa_tx_id": result.kaspa_tx_id,
+                "payload_nonce": result.payload_nonce,
+            })
+        )?;
+
+        Ok(())
+    }
+}
+
 fn q_tx_data(data: Option<String>, sig: Option<String>, args: Vec<String>) -> Result<Bytes> {
     if let Some(data) = data {
         return Ok(Bytes::from(decode_hex(&data, "data")?));

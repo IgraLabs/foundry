@@ -560,6 +560,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::IgraQKeygen(cmd) => cmd.run()?,
         CastSubcommand::IgraQMakeTx(cmd) => cmd.run()?,
         CastSubcommand::IgraQEntry(cmd) => cmd.run().await?,
+        CastSubcommand::IgraKycEntry(cmd) => cmd.run().await?,
         CastSubcommand::Run(cmd) => cmd.run().await?,
         CastSubcommand::SendTx(cmd) => cmd.run().await?,
         CastSubcommand::Tx { tx_hash, from, nonce, field, raw, rpc, to_request } => {

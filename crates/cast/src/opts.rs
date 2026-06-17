@@ -11,7 +11,7 @@ use crate::cmd::{
     erc20::Erc20Subcommand,
     estimate::EstimateArgs,
     find_block::FindBlockArgs,
-    igra_q::{IgraEntryArgs, IgraQAddressArgs, IgraQEntryArgs, IgraQKeygenArgs, IgraQMakeTxArgs},
+    igra_q::{IgraEntryArgs, IgraKycEntryArgs, IgraQAddressArgs, IgraQEntryArgs, IgraQKeygenArgs, IgraQMakeTxArgs},
     interface::InterfaceArgs,
     logs::LogsArgs,
     mktx::MakeTxArgs,
@@ -588,6 +588,10 @@ pub enum CastSubcommand {
     /// Submit an IGRA Falcon-L5 q-zone Entry through Kaspa.
     #[command(name = "igra-q-entry")]
     IgraQEntry(IgraQEntryArgs),
+
+    /// Submit an IGRA KYC-zone (0x0003) Entry through Kaspa.
+    #[command(name = "igra-kyc-entry")]
+    IgraKycEntry(IgraKycEntryArgs),
 
     /// Sign and publish a transaction.
     #[command(name = "send", visible_alias = "s")]

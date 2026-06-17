@@ -89,6 +89,14 @@ const IGRA_Q_ENTRY_TX_TYPE: u8 = 0x02;
 const IGRA_Q_RAW_TX_TYPE: u8 = 0x04;
 const IGRA_FALCON_L5_TX_TYPE: u8 = 0x7c;
 const IGRA_Q_ENTRY_BYTES: usize = 28;
+// IGRA KYC logic zone: a third top-level zone, ECDSA-authed (like canonical) but carried in the
+// same `0x9f` logic-zone envelope as the q-zone, under its own zone id 0x0003. The EL enforces
+// KYC (sender allow-list) at execution; the carrier shape is what the explorer keys on.
+const IGRA_KYC_ZONE_ID: u16 = 0x0003;
+// Zone tx types inside the KYC envelope mirror the q-zone's (entry vs raw tx); the wrapped bytes
+// are an ECDSA raw tx, not Falcon.
+const IGRA_KYC_ENTRY_TX_TYPE: u8 = 0x02;
+const IGRA_KYC_RAW_TX_TYPE: u8 = 0x04;
 const IGRA_Q_ENTRY_ADDRESS_BYTES: usize = 20;
 const KASPA_TX_VERSION_NATIVE: u16 = 0;
 const KASPA_TX_VERSION_TOCCATA: u16 = 1;
@@ -143,12 +151,15 @@ pub enum IgraPayloadKind {
     CanonicalRawTx,
     FalconL5RawTx,
     FalconL5Entry,
+    KycRawTx,
+    KycEntry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IgraLogicZone {
     Canonical,
     FalconL5,
+    Kyc,
 }
 
 impl IgraLogicZone {
@@ -157,14 +168,19 @@ impl IgraLogicZone {
         match value.as_str() {
             "" | "canonical" => Ok(Self::Canonical),
             "falcon-l5" => Ok(Self::FalconL5),
+            "kyc" => Ok(Self::Kyc),
             _ => Err(format!(
-                "IGRA config error: `logic_zone` is invalid (supported: canonical, falcon-l5)"
+                "IGRA config error: `logic_zone` is invalid (supported: canonical, falcon-l5, kyc)"
             )),
         }
     }
 
     const fn is_falcon_l5(self) -> bool {
         matches!(self, Self::FalconL5)
+    }
+
+    const fn is_kyc(self) -> bool {
+        matches!(self, Self::Kyc)
     }
 }
 
@@ -1227,6 +1243,7 @@ impl<T> IgraTransport<T> {
                         payload_kind: match logic_zone {
                             IgraLogicZone::Canonical => IgraPayloadKind::CanonicalRawTx,
                             IgraLogicZone::FalconL5 => IgraPayloadKind::FalconL5RawTx,
+                            IgraLogicZone::Kyc => IgraPayloadKind::KycRawTx,
                         },
                         tx_id_prefix: tx_id_prefix.clone(),
                         lane_id: lane_id.clone(),
@@ -1238,6 +1255,7 @@ impl<T> IgraTransport<T> {
                             match logic_zone {
                                 IgraLogicZone::Canonical => "canonical",
                                 IgraLogicZone::FalconL5 => "falcon-l5",
+                                IgraLogicZone::Kyc => "kyc",
                             }
                             .to_string(),
                         ),
@@ -1448,6 +1466,16 @@ fn build_igra_l2data(
                 "IGRA config error: Falcon-L5 q payloads require logic_zone=falcon-l5".to_string()
             );
         }
+        IgraPayloadKind::KycRawTx | IgraPayloadKind::KycEntry if !logic_zone.is_kyc() => {
+            return Err(
+                "IGRA config error: KYC payloads require logic_zone=kyc".to_string()
+            );
+        }
+        IgraPayloadKind::CanonicalEntry | IgraPayloadKind::CanonicalRawTx if logic_zone.is_kyc() => {
+            return Err(
+                "IGRA config error: canonical payloads cannot target the KYC zone".to_string()
+            );
+        }
         _ => {}
     }
 
@@ -1484,12 +1512,51 @@ fn build_igra_l2data(
                 validate_q_entry(raw_tx)?;
                 IGRA_Q_ENTRY_TX_TYPE
             }
-            IgraPayloadKind::CanonicalEntry | IgraPayloadKind::CanonicalRawTx => unreachable!(),
+            IgraPayloadKind::CanonicalEntry
+            | IgraPayloadKind::CanonicalRawTx
+            | IgraPayloadKind::KycRawTx
+            | IgraPayloadKind::KycEntry => unreachable!(),
         };
 
         let mut l2data = Vec::with_capacity(IGRA_LOGIC_ZONE_HEADER_SIZE + raw_tx.len());
         l2data.push(IGRA_Q_ENVELOPE_VERSION);
         l2data.extend_from_slice(&IGRA_FALCON_L5_Q_ZONE_ID.to_be_bytes());
+        l2data.push(zone_tx_type);
+        l2data.extend_from_slice(raw_tx);
+
+        return Ok(IgraPayloadData {
+            header: (IGRA_VERSION << 4) | IGRA_LOGIC_ZONE_TX_TYPE,
+            l2data,
+            max_l2data_bytes: IGRA_Q_L2DATA_MAX_BYTES,
+        });
+    }
+
+    // IGRA KYC logic zone: same `0x9f` logic-zone envelope as the q-zone, under zone id 0x0003,
+    // but the wrapped payload is an ECDSA raw tx (validated as a canonical-style raw tx), not
+    // Falcon. The zone declares itself in the carrier; the EL enforces the KYC allow-list.
+    if matches!(payload_kind, IgraPayloadKind::KycRawTx | IgraPayloadKind::KycEntry) {
+        if !matches!(mode.as_str(), "" | "none") {
+            return Err(
+                "IGRA config error: KYC zone does not support `payload_compression`; use `none`"
+                    .to_string(),
+            );
+        }
+
+        let zone_tx_type = match payload_kind {
+            IgraPayloadKind::KycRawTx => {
+                validate_kyc_raw_tx(raw_tx)?;
+                IGRA_KYC_RAW_TX_TYPE
+            }
+            IgraPayloadKind::KycEntry => {
+                validate_q_entry(raw_tx)?;
+                IGRA_KYC_ENTRY_TX_TYPE
+            }
+            _ => unreachable!(),
+        };
+
+        let mut l2data = Vec::with_capacity(IGRA_LOGIC_ZONE_HEADER_SIZE + raw_tx.len());
+        l2data.push(IGRA_Q_ENVELOPE_VERSION);
+        l2data.extend_from_slice(&IGRA_KYC_ZONE_ID.to_be_bytes());
         l2data.push(zone_tx_type);
         l2data.extend_from_slice(raw_tx);
 
@@ -1538,6 +1605,27 @@ fn validate_q_entry(entry: &[u8]) -> Result<(), String> {
         return Err(format!(
             "q Entry payload size {} bytes must equal {IGRA_Q_ENTRY_BYTES} bytes",
             entry.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the raw tx wrapped in a KYC-zone (0x0003) envelope. Unlike the Falcon q-zone, the KYC
+/// zone is ECDSA: it carries a standard Ethereum raw tx (legacy RLP list `>= 0xc0`, or typed
+/// EIP-2930 `0x01` / EIP-1559 `0x02`). Reject Falcon (`0x7c`) and the unsupported blob/7702 types.
+fn validate_kyc_raw_tx(raw_tx: &[u8]) -> Result<(), String> {
+    let first = *raw_tx.first().ok_or("empty raw KYC transaction bytes")?;
+    let ok = first >= 0xc0 /* legacy RLP list */ || matches!(first, 0x01 | 0x02);
+    if !ok {
+        return Err(format!(
+            "KYC zone expects an ECDSA raw tx (legacy, EIP-2930 0x01, or EIP-1559 0x02), got first byte 0x{first:02x}"
+        ));
+    }
+    if raw_tx.len() > IGRA_Q_RAW_TX_MAX_BYTES {
+        return Err(format!(
+            "raw KYC transaction size {} bytes exceeds max {} bytes",
+            raw_tx.len(),
+            IGRA_Q_RAW_TX_MAX_BYTES
         ));
     }
     Ok(())
@@ -1616,7 +1704,10 @@ fn entry_deposit_output_for_request(
     raw_tx: &[u8],
     entry_lock_script_pubkey: Option<&str>,
 ) -> Result<Option<EntryDepositOutput>, String> {
-    if !matches!(payload_kind, IgraPayloadKind::CanonicalEntry | IgraPayloadKind::FalconL5Entry) {
+    if !matches!(
+        payload_kind,
+        IgraPayloadKind::CanonicalEntry | IgraPayloadKind::FalconL5Entry | IgraPayloadKind::KycEntry
+    ) {
         return Ok(None);
     }
 
@@ -2729,6 +2820,43 @@ mod tests {
         assert_eq!(&payload[1..5], &[0x01, 0x00, 0x02, 0x04]);
         assert_eq!(&payload[5..8], &raw_tx);
         assert_eq!(&payload[8..12], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn igra_kyc_zone_payload_wraps_ecdsa_raw_tx_under_0x9f_zone_0003() {
+        // KYC zone carries an ECDSA raw tx (EIP-1559 0x02 here) under the same 0x9f logic-zone
+        // envelope as the q-zone, but zone id 0x0003 and zone tx type 0x04 (raw tx).
+        let raw_tx = [0x02u8, 0xaa, 0xbb];
+        let payload_data = super::build_igra_l2data(
+            &raw_tx,
+            None,
+            Some("kyc"),
+            super::IgraPayloadKind::KycRawTx,
+        )
+        .expect("kyc l2data builds");
+        let payload =
+            super::build_payload_with_nonce(payload_data.header, &payload_data.l2data, 0x01020304);
+
+        assert_eq!(payload_data.header, 0x9f, "KYC uses the logic-zone header");
+        assert_eq!(payload[0], 0x9f);
+        // [envVer=0x01][zoneId hi=0x00][zoneId lo=0x03][zoneTxType=0x04]
+        assert_eq!(&payload[1..5], &[0x01, 0x00, 0x03, 0x04]);
+        assert_eq!(&payload[5..8], &raw_tx);
+        assert_eq!(&payload[8..12], &[0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[test]
+    fn igra_kyc_zone_rejects_falcon_raw_tx() {
+        // A Falcon tx (0x7c) must not be accepted as a KYC-zone payload (KYC is ECDSA).
+        let raw_tx = [super::IGRA_FALCON_L5_TX_TYPE, 0x01, 0x02];
+        let err = super::build_igra_l2data(
+            &raw_tx,
+            None,
+            Some("kyc"),
+            super::IgraPayloadKind::KycRawTx,
+        )
+        .expect_err("falcon tx rejected on KYC zone");
+        assert!(err.contains("ECDSA"), "unexpected error: {err}");
     }
 
     #[test]
