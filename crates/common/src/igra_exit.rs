@@ -646,6 +646,7 @@ pub fn verify_unsigned_exit(
                 materialized.id()
             );
         }
+        verify_signed_exit_scripts(&materialized, manifest)?;
         Some(materialized)
     } else {
         None
@@ -753,6 +754,7 @@ pub async fn broadcast_wallet_transaction(
     kaspa_rpc_url: &str,
 ) -> Result<String> {
     let tx = materialize_signed_wallet_transaction(manifest, wallet_hex)?;
+    verify_signed_exit_scripts(&tx, manifest)?;
     let expected_tx_id = tx.id().to_string();
     let client = GrpcClient::connect(kaspa_rpc_url.to_string())
         .await
@@ -1318,6 +1320,18 @@ fn apply_signed_exit_compute_budgets(
     }
     tx.finalize();
     Ok(())
+}
+
+fn verify_signed_exit_scripts(
+    tx: &KaspaTransaction,
+    manifest: &UnsignedExitManifest,
+) -> Result<()> {
+    let input = build_input_from_manifest(manifest);
+    compute_required_compute_budgets(tx, &input, &manifest.network, false)
+        .map(|_| ())
+        .wrap_err(
+            "signed Kaspa transaction scripts failed validation; signatures are not valid for current consensus rules",
+        )
 }
 
 fn compute_required_compute_budgets(
@@ -2895,6 +2909,48 @@ mod tests {
                 .iter()
                 .all(|input| input.compute_commit.compute_budget() == Some(computed_budget))
         );
+    }
+
+    #[test]
+    fn verify_exit_rejects_invalid_fully_signed_scripts() {
+        let output = build_unsigned_exit(
+            sample_input(),
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
+                mining_timeout: Duration::from_secs(30),
+                max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: false,
+                allow_mass_limit_override_for_testing: false,
+            },
+        )
+        .expect("build unsigned exit");
+
+        let mut pst = PartiallySignedTransactionProto::decode(
+            decode_fixed_hex(&output.wallet_hex, "wallet hex").unwrap().as_slice(),
+        )
+        .expect("decode pst");
+        for partial_input in &mut pst.partially_signed_inputs {
+            partial_input.pub_key_signature_pairs[0].signature =
+                vec![1_u8; KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE];
+            partial_input.pub_key_signature_pairs[1].signature =
+                vec![2_u8; KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE];
+        }
+        let wallet_hex = hex::encode(pst.encode_to_vec());
+
+        let err = verify_unsigned_exit(
+            &output.manifest,
+            &wallet_hex,
+            VerifyExitOptions {
+                allow_signatures: true,
+                require_fully_signed: true,
+                allow_non_igra_lock_script_for_testing: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("signed Kaspa transaction scripts failed validation"));
     }
 
     #[test]
