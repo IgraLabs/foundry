@@ -412,17 +412,31 @@ Each signer should inspect:
 - `tx_id_prefix`
 - multisig xpubs and `minimum_signatures`
 
-## Sign With Official Kaspawallet
+## Sign With Cast V1 Signer
+
+Do not use Go `kaspawallet sign` for lane v1 exit transactions. It is valid for
+normal Toccata wallet flows, but it does not sign this IGRA v1 subnetwork PST
+shape correctly. Each offline signer should use the patched `cast igra
+sign-exit` command.
 
 Signer 1:
 
 ```bash
-kaspawallet sign \
-  --keys-file signer1.json \
-  --password 'SIGNER_1_PASSWORD' \
-  --transaction-file unsigned-exit.hex \
-  > signed1.hex
+./target/debug/cast igra sign-exit \
+  --manifest unsigned-exit.json \
+  --hex unsigned-exit.hex \
+  --mnemonic-file signer1.mnemonic.txt \
+  --out-hex signed1.hex
 ```
+
+Use `--kprv-file signer1.kprv.txt` instead of `--mnemonic-file` if the signer
+keeps the kaspawallet multisig master private key. The manifest already contains
+the multisig kpubs and each input derivation path; the signer only supplies
+their own secret.
+
+If recovering from a PST that already contains invalid signatures, start again
+from `unsigned-exit.hex`. If that file is unavailable, signer 1 may add
+`--clear-existing-signatures` to discard the bad signature slots before signing.
 
 Verify signer 1 output:
 
@@ -446,17 +460,11 @@ Expected:
 Signer 2 signs signer 1 output:
 
 ```bash
-kaspawallet sign \
-  --keys-file signer2.json \
-  --password 'SIGNER_2_PASSWORD' \
-  --transaction-file signed1.hex \
-  > signed2.hex
-```
-
-The official wallet should print:
-
-```text
-The transaction is signed and ready to broadcast
+./target/debug/cast igra sign-exit \
+  --manifest unsigned-exit.json \
+  --hex signed1.hex \
+  --mnemonic-file signer2.mnemonic.txt \
+  --out-hex signed2.hex
 ```
 
 Verify final output:
@@ -482,11 +490,11 @@ Any 2 of the 3 signers can produce the final artifact. For example, signer 3 can
 instead of signer 2:
 
 ```bash
-kaspawallet sign \
-  --keys-file signer3.json \
-  --password 'SIGNER_3_PASSWORD' \
-  --transaction-file signed1.hex \
-  > signed13.hex
+./target/debug/cast igra sign-exit \
+  --manifest unsigned-exit.json \
+  --hex signed1.hex \
+  --mnemonic-file signer3.mnemonic.txt \
+  --out-hex signed13.hex
 ```
 
 Then verify:

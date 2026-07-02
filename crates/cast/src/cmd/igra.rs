@@ -2,10 +2,10 @@ use clap::{Args, Subcommand};
 use eyre::{Result, bail, eyre};
 use foundry_common::igra_bundle::verify_bundle_integral;
 use foundry_common::igra_exit::{
-    BuildExitInput, BuildExitOptions, MultisigAddressInput, VerifyExitOptions,
+    BuildExitInput, BuildExitOptions, MultisigAddressInput, SignExitOptions, VerifyExitOptions,
     broadcast_wallet_transaction, build_unsigned_exit, check_multisig_derivation_path,
-    decode_wallet_transaction, derive_multisig_address, verify_multisig_address,
-    verify_unsigned_exit,
+    decode_wallet_transaction, derive_multisig_address, sign_exit_wallet_transaction,
+    verify_multisig_address, verify_unsigned_exit,
 };
 use serde::Deserialize;
 use std::{fs, path::PathBuf, time::Duration};
@@ -24,6 +24,9 @@ pub enum IgraSubcommand {
     /// Verify an unsigned or partially signed IGRA exit transaction.
     #[command(name = "verify-exit")]
     VerifyExit(VerifyExitArgs),
+    /// Sign an IGRA exit PST with a kaspawallet mnemonic or multisig master kprv.
+    #[command(name = "sign-exit")]
+    SignExit(SignExitArgs),
     /// Derive an official kaspawallet multisig address from kpubs and a path.
     #[command(name = "derive-msig-address")]
     DeriveMsigAddress(DeriveMsigAddressArgs),
@@ -117,6 +120,37 @@ pub struct VerifyExitArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct SignExitArgs {
+    /// JSON manifest produced by `cast igra build-exit`.
+    #[arg(long = "manifest", value_hint = clap::ValueHint::FilePath)]
+    pub manifest_json: PathBuf,
+
+    /// Input kaspawallet PartiallySignedTransaction hex file.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub hex: PathBuf,
+
+    /// Output kaspawallet PartiallySignedTransaction hex file.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub out_hex: PathBuf,
+
+    /// File containing one signer mnemonic phrase.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub mnemonic_file: Option<PathBuf>,
+
+    /// File containing one kaspawallet multisig master private key, usually kprv...
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub kprv_file: Option<PathBuf>,
+
+    /// Drop existing PST signatures before signing. Use to recover from signatures made by the wrong signer.
+    #[arg(long)]
+    pub clear_existing_signatures: bool,
+
+    /// Overwrite existing output file.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct DeriveMsigAddressArgs {
     /// Kaspa network. Use `mainnet` for real mainnet addresses.
     #[arg(long)]
@@ -182,6 +216,7 @@ impl IgraArgs {
         match self.command {
             IgraSubcommand::BuildExit(args) => args.run(),
             IgraSubcommand::VerifyExit(args) => args.run().await,
+            IgraSubcommand::SignExit(args) => args.run(),
             IgraSubcommand::DeriveMsigAddress(args) => args.run(),
             IgraSubcommand::VerifyMsigAddress(args) => args.run(),
             IgraSubcommand::CheckMsigPath(args) => args.run(),
@@ -294,6 +329,65 @@ impl VerifyExitArgs {
         }
 
         foundry_common::sh_println!("{}", serde_json::to_string_pretty(&output)?)?;
+        Ok(())
+    }
+}
+
+impl SignExitArgs {
+    fn run(self) -> Result<()> {
+        if self.out_hex.exists() && !self.force {
+            bail!(
+                "output file already exists: {} (pass --force to overwrite)",
+                self.out_hex.display()
+            );
+        }
+        if self.mnemonic_file.is_none() && self.kprv_file.is_none() {
+            bail!("provide --mnemonic-file or --kprv-file");
+        }
+
+        let manifest_json = fs::read_to_string(&self.manifest_json)?;
+        let manifest = serde_json::from_str(&manifest_json)?;
+        let wallet_hex = fs::read_to_string(&self.hex)?;
+        let mut mnemonics = Vec::new();
+        let mut master_private_keys = Vec::new();
+
+        if let Some(path) = self.mnemonic_file.as_ref() {
+            let mnemonic = fs::read_to_string(path)?;
+            mnemonics.push(mnemonic.trim().to_string());
+        }
+        if let Some(path) = self.kprv_file.as_ref() {
+            let kprv = fs::read_to_string(path)?;
+            master_private_keys.push(kprv.trim().to_string());
+        }
+
+        let output = sign_exit_wallet_transaction(
+            &manifest,
+            &wallet_hex,
+            SignExitOptions {
+                mnemonics,
+                master_private_keys,
+                clear_existing_signatures: self.clear_existing_signatures,
+                allow_non_igra_lock_script_for_testing: false,
+            },
+        )?;
+
+        if let Some(parent) = self.out_hex.parent().filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&self.out_hex, format!("{}\n", output.wallet_hex))?;
+
+        foundry_common::sh_println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "kaspa_tx_id": output.kaspa_tx_id,
+                "signed_pairs_added": output.signed_pairs_added,
+                "signed_inputs": output.signed_inputs,
+                "fully_signed": output.fully_signed,
+                "out_hex": self.out_hex,
+            }))?
+        )?;
         Ok(())
     }
 }

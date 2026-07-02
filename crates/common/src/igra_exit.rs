@@ -3,8 +3,13 @@ use eyre::{Context, Result, bail, eyre};
 use kaspa_addresses::{Address as KaspaAddress, Prefix as KaspaAddressPrefix};
 use kaspa_bip32::{
     ChildNumber as KaspaChildNumber, DerivationPath as KaspaDerivationPath,
-    ExtendedPublicKey as KaspaExtendedPublicKey, Prefix as KaspaBip32Prefix,
-    PublicKey as KaspaBip32PublicKey, secp256k1::PublicKey as KaspaSecpPublicKey,
+    ExtendedPrivateKey as KaspaExtendedPrivateKey, ExtendedPublicKey as KaspaExtendedPublicKey,
+    Language as KaspaLanguage, Mnemonic as KaspaMnemonic, Prefix as KaspaBip32Prefix,
+    PublicKey as KaspaBip32PublicKey, SecretKey as KaspaSecretKey,
+    secp256k1::{
+        Keypair as KaspaSecpKeypair, Message as KaspaSecpMessage, PublicKey as KaspaSecpPublicKey,
+        SECP256K1 as KASPA_SECP256K1,
+    },
 };
 use kaspa_consensus_core::{
     config::params::Params as KaspaParams,
@@ -12,8 +17,12 @@ use kaspa_consensus_core::{
         TX_VERSION as KASPA_TX_VERSION_NATIVE, TX_VERSION_TOCCATA as KASPA_TX_VERSION_TOCCATA,
     },
     hashing::{
-        sighash::SigHashReusedValuesUnsync as KaspaSigHashReusedValuesUnsync,
-        sighash_type::SIG_HASH_ALL as KASPA_SIG_HASH_ALL, tx as kaspa_tx_hashing,
+        sighash::{
+            SigHashReusedValuesUnsync as KaspaSigHashReusedValuesUnsync,
+            calc_schnorr_signature_hash,
+        },
+        sighash_type::SIG_HASH_ALL as KASPA_SIG_HASH_ALL,
+        tx as kaspa_tx_hashing,
     },
     mass::{
         ComputeBudget as KaspaComputeBudget, ContextualMasses as KaspaContextualMasses,
@@ -55,6 +64,7 @@ const KASPA_MAXIMUM_PRE_TOCCATA_STANDARD_TRANSACTION_MASS: u64 = 100_000;
 const KASPA_MINIMUM_RELAY_TRANSACTION_FEE: u64 = 1_000;
 const KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE: usize = 65;
 const KASPA_SUBNETWORK_NAMESPACE_LEN: usize = 4;
+const KASPAWALLET_MULTISIG_MASTER_DERIVATION_PATH: &str = "m/45'/111111'/0'";
 const SUPPORTED_UNSIGNED_EXIT_SCHEMAS: &[&str] =
     &["igra.exit.unsigned.v1", "igra.exit.unsigned.v2"];
 const CURRENT_UNSIGNED_EXIT_SCHEMA: &str = "igra.exit.unsigned.v2";
@@ -236,6 +246,23 @@ pub struct KaspaMassManifest {
 pub struct BuildExitOutput {
     pub manifest: UnsignedExitManifest,
     pub wallet_hex: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SignExitOptions {
+    pub mnemonics: Vec<String>,
+    pub master_private_keys: Vec<String>,
+    pub clear_existing_signatures: bool,
+    pub allow_non_igra_lock_script_for_testing: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SignExitOutput {
+    pub wallet_hex: String,
+    pub kaspa_tx_id: String,
+    pub signed_pairs_added: usize,
+    pub signed_inputs: usize,
+    pub fully_signed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -746,6 +773,163 @@ pub fn materialize_signed_wallet_transaction(
 
     tx.finalize();
     Ok(tx)
+}
+
+pub fn sign_exit_wallet_transaction(
+    manifest: &UnsignedExitManifest,
+    wallet_hex: &str,
+    options: SignExitOptions,
+) -> Result<SignExitOutput> {
+    if manifest.multisig.ecdsa {
+        bail!("sign-exit currently supports Schnorr multisig only, not ECDSA");
+    }
+
+    let wallet_bytes = decode_wallet_hex(wallet_hex)?;
+    let mut pst = PartiallySignedTransactionProto::decode(wallet_bytes.as_slice())
+        .wrap_err("failed to decode kaspawallet PartiallySignedTransaction protobuf")?;
+    let proto_tx = pst.tx.as_ref().ok_or_else(|| eyre!("wallet protobuf is missing tx"))?;
+    let tx = transaction_from_proto(proto_tx)?;
+
+    if tx.inputs.len() != pst.partially_signed_inputs.len() {
+        bail!("partially signed input count must match transaction input count");
+    }
+    if tx.inputs.len() != manifest.locking_utxos.len() {
+        bail!("manifest locking_utxos count must match transaction input count");
+    }
+
+    if options.clear_existing_signatures {
+        for partial_input in &mut pst.partially_signed_inputs {
+            for pair in &mut partial_input.pub_key_signature_pairs {
+                pair.signature.clear();
+            }
+        }
+    }
+
+    let network_prefix = parse_network_prefix(&manifest.network)?;
+    let output_prefix = bip32_public_prefix(network_prefix);
+    let signer_keys = exit_signer_master_private_keys(&options)?;
+    if signer_keys.is_empty() {
+        bail!("provide at least one mnemonic or kprv to sign with");
+    }
+
+    let input = build_input_from_manifest(manifest);
+    let populated_tx = KaspaPopulatedTransaction::new(&tx, input_utxo_entries(&input)?);
+    let mut signed_pairs_added = 0usize;
+
+    for (input_index, partial_input) in pst.partially_signed_inputs.iter_mut().enumerate() {
+        let derivation_path =
+            partial_input.derivation_path.parse::<KaspaDerivationPath>().wrap_err_with(|| {
+                format!("invalid Kaspa derivation path `{}`", partial_input.derivation_path)
+            })?;
+        for pair in &mut partial_input.pub_key_signature_pairs {
+            if !pair.signature.is_empty() {
+                continue;
+            }
+            let Some(child_key) =
+                matching_signer_child_key(&signer_keys, &derivation_path, output_prefix, pair)?
+            else {
+                continue;
+            };
+            pair.signature =
+                sign_exit_input_signature(&populated_tx, input_index, child_key.private_key())?;
+            signed_pairs_added += 1;
+        }
+    }
+
+    if signed_pairs_added == 0 {
+        bail!(
+            "no signatures were added; provided signer keys did not match any empty PST public key"
+        );
+    }
+
+    let output_hex = hex::encode(pst.encode_to_vec());
+    let report = verify_unsigned_exit(
+        manifest,
+        &output_hex,
+        VerifyExitOptions {
+            allow_signatures: true,
+            require_fully_signed: false,
+            allow_non_igra_lock_script_for_testing: options.allow_non_igra_lock_script_for_testing,
+        },
+    )
+    .wrap_err("signed PST failed IGRA exit verification")?;
+
+    Ok(SignExitOutput {
+        wallet_hex: output_hex,
+        kaspa_tx_id: report.kaspa_tx_id,
+        signed_pairs_added,
+        signed_inputs: report.signed_inputs,
+        fully_signed: report.fully_signed,
+    })
+}
+
+fn exit_signer_master_private_keys(
+    options: &SignExitOptions,
+) -> Result<Vec<KaspaExtendedPrivateKey<KaspaSecretKey>>> {
+    let mut keys = Vec::with_capacity(options.mnemonics.len() + options.master_private_keys.len());
+    let master_path = KASPAWALLET_MULTISIG_MASTER_DERIVATION_PATH
+        .parse::<KaspaDerivationPath>()
+        .expect("hard-coded kaspawallet multisig master path is valid");
+
+    for mnemonic in &options.mnemonics {
+        let mnemonic = KaspaMnemonic::new(mnemonic.trim(), KaspaLanguage::English)
+            .wrap_err("invalid Kaspa mnemonic")?;
+        let master = KaspaExtendedPrivateKey::<KaspaSecretKey>::new(mnemonic.to_seed(""))?
+            .derive_path(&master_path)
+            .wrap_err("failed to derive kaspawallet multisig master key from mnemonic")?;
+        keys.push(master);
+    }
+
+    for key in &options.master_private_keys {
+        keys.push(
+            key.trim()
+                .parse::<KaspaExtendedPrivateKey<KaspaSecretKey>>()
+                .wrap_err("invalid Kaspa kprv")?,
+        );
+    }
+
+    Ok(keys)
+}
+
+fn matching_signer_child_key(
+    signer_keys: &[KaspaExtendedPrivateKey<KaspaSecretKey>],
+    derivation_path: &KaspaDerivationPath,
+    output_prefix: KaspaBip32Prefix,
+    pair: &PubKeySignaturePairProto,
+) -> Result<Option<KaspaExtendedPrivateKey<KaspaSecretKey>>> {
+    for master_key in signer_keys {
+        let child_key = master_key
+            .clone()
+            .derive_path(derivation_path)
+            .wrap_err("failed to derive child signing key")?;
+        let child_public_key = child_key.public_key().to_string(Some(output_prefix));
+        if child_public_key == pair.extended_pub_key {
+            return Ok(Some(child_key));
+        }
+    }
+
+    Ok(None)
+}
+
+fn sign_exit_input_signature(
+    tx: &KaspaPopulatedTransaction<'_>,
+    input_index: usize,
+    private_key: &KaspaSecretKey,
+) -> Result<Vec<u8>> {
+    let sig_hash = calc_schnorr_signature_hash(
+        tx,
+        input_index,
+        KASPA_SIG_HASH_ALL,
+        &KaspaSigHashReusedValuesUnsync::new(),
+    );
+    let msg = KaspaSecpMessage::from_digest_slice(sig_hash.as_bytes().as_slice())
+        .wrap_err("failed to build Kaspa signature message")?;
+    let keypair = KaspaSecpKeypair::from_secret_key(KASPA_SECP256K1, private_key);
+    let sig: [u8; 64] = *keypair.sign_schnorr(msg).as_ref();
+    let mut signature = Vec::with_capacity(KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE);
+    signature.extend_from_slice(&sig);
+    signature.push(KASPA_SIG_HASH_ALL.to_u8());
+    Ok(signature)
 }
 
 pub async fn broadcast_wallet_transaction(
@@ -2951,6 +3135,78 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("signed Kaspa transaction scripts failed validation"));
+    }
+
+    #[test]
+    fn sign_exit_adds_v1_valid_multisig_signatures() {
+        let mut input = sample_input();
+        let lock_report = derive_multisig_address(MultisigAddressInput {
+            network: "mainnet".to_string(),
+            derivation_path: input.locking_utxos[0].derivation_path.clone(),
+            minimum_signatures: input.multisig.minimum_signatures,
+            extended_public_keys: input.multisig.extended_public_keys.clone(),
+            ecdsa: false,
+        })
+        .expect("derive test multisig lock script");
+        input.locking_utxos[0].address = Some(lock_report.address);
+        input.locking_utxos[0].script_public_key = lock_report.script_public_key;
+
+        let output = build_unsigned_exit(
+            input,
+            BuildExitOptions {
+                network: "mainnet".to_string(),
+                tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
+                mining_timeout: Duration::from_secs(30),
+                max_nonce: Some(1_000_000),
+                allow_non_igra_lock_script_for_testing: true,
+                allow_mass_limit_override_for_testing: false,
+            },
+        )
+        .expect("build unsigned exit");
+
+        let signed_1 = sign_exit_wallet_transaction(
+            &output.manifest,
+            &output.wallet_hex,
+            SignExitOptions {
+                master_private_keys: vec![
+                    "kprv5y2qurMHCsXYqr9oKku3Ry75DcZgdraE3SFPPh1SKp4qKtr61qQeNypYTGztwUUiVauHWmjxaQXeUKHxj4QCuDG4ULpZHkvBoH9XX19ynXm".to_string(),
+                ],
+                allow_non_igra_lock_script_for_testing: true,
+                ..SignExitOptions::default()
+            },
+        )
+        .expect("sign first key");
+
+        assert_eq!(signed_1.signed_pairs_added, 1);
+        assert_eq!(signed_1.signed_inputs, 1);
+        assert!(!signed_1.fully_signed);
+
+        let signed_2 = sign_exit_wallet_transaction(
+            &output.manifest,
+            &signed_1.wallet_hex,
+            SignExitOptions {
+                master_private_keys: vec![
+                    "kprv61JFuZekJ8eXzTHWXWmgK1DBYS831w4Ej3gHMnPZJ1G7hB9GS4wjW8AxEYMEMBrgCdnyt54pxmNXC5KgNegPhHLaYDVhXid5WHnNxE7Nir6".to_string(),
+                ],
+                allow_non_igra_lock_script_for_testing: true,
+                ..SignExitOptions::default()
+            },
+        )
+        .expect("sign second key");
+
+        assert_eq!(signed_2.signed_pairs_added, 1);
+        assert!(signed_2.fully_signed);
+        verify_unsigned_exit(
+            &output.manifest,
+            &signed_2.wallet_hex,
+            VerifyExitOptions {
+                allow_signatures: true,
+                require_fully_signed: true,
+                allow_non_igra_lock_script_for_testing: true,
+            },
+        )
+        .expect("fully signed tx verifies scripts");
     }
 
     #[test]

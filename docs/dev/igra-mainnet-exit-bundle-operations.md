@@ -1083,8 +1083,14 @@ Required:
 
 ## Signing Verification
 
-Official `kaspawallet sign` writes the signed transaction hex to stdout.
-Redirect stdout to the next artifact; do not assume a `-O` output flag exists.
+Do not use Go `kaspawallet sign` for lane v1 exit transactions. It can sign
+normal Toccata wallet transactions, but this IGRA lane-id exit is a v1
+subnetwork PST and must be signed with a v1-aware signer. Use the patched
+`cast igra sign-exit` command for each offline signer.
+
+Each signer supplies only their own secret, either as a mnemonic file or a
+kaspawallet multisig master `kprv` file. The manifest already contains all
+multisig kpubs and input derivation paths.
 
 There are two signing starts:
 
@@ -1094,10 +1100,20 @@ There are two signing starts:
 Signer 1 signs:
 
 ```bash
-./kaspawallet sign \
-  -F "$BASE/${BATCH_NAME}-official-bridge.unsigned.hex" \
-  > "$BASE/${BATCH_NAME}-official-bridge.signed-1.hex"
+./target/debug/cast igra sign-exit \
+  --manifest "$BASE/${BATCH_NAME}-official-bridge.unsigned.json" \
+  --hex "$BASE/${BATCH_NAME}-official-bridge.unsigned.hex" \
+  --mnemonic-file "$SIGNER_1_MNEMONIC_FILE" \
+  --out-hex "$BASE/${BATCH_NAME}-official-bridge.signed-1.hex"
 ```
+
+Use `--kprv-file "$SIGNER_1_KPRV_FILE"` instead of `--mnemonic-file` if the
+signer stores a kaspawallet multisig master private key.
+
+If recovering from a PST that was already signed by the wrong signer
+implementation, restart from the unsigned hex. If that is unavailable, pass
+`--clear-existing-signatures` on the first `sign-exit` command to discard the
+bad signature slots before adding the first valid v1 signature.
 
 Only run that command in `unsigned-first` mode.
 
@@ -1165,9 +1181,11 @@ transaction is not fully signed according to minimum_signatures
 Signer 2 signs:
 
 ```bash
-./kaspawallet sign \
-  -F "$BASE/${BATCH_NAME}-official-bridge.signed-1.hex" \
-  > "$BASE/${BATCH_NAME}-official-bridge.signed-2.hex"
+./target/debug/cast igra sign-exit \
+  --manifest "$BASE/${BATCH_NAME}-official-bridge.unsigned.json" \
+  --hex "$BASE/${BATCH_NAME}-official-bridge.signed-1.hex" \
+  --mnemonic-file "$SIGNER_2_MNEMONIC_FILE" \
+  --out-hex "$BASE/${BATCH_NAME}-official-bridge.signed-2.hex"
 ```
 
 After signer 2:
