@@ -290,6 +290,8 @@ Useful optional flags:
 - `--lane-id 97b10000`: set the canonical IGRA Kaspa lane/subnetwork id. The builder accepts the
   4-byte namespace form (`97b10000`) or the full 20-byte subnetwork id
   (`97b1000000000000000000000000000000000000`).
+  Lane exits are Kaspa v1/Toccata transactions; Foundry computes the per-input `computeBudget`
+  from the bridge multisig signature script units instead of using legacy `sigOpCount`.
 - `--allow-non-igra-lock-script-for-testing`: permit non-official multisig UTXOs for signing
   rehearsals only. Do not use this for real bridge exits from the official IGRA lock script.
 - `--allow-mass-limit-override-for-testing`: emit artifacts even when Kaspa mass preflight says the
@@ -300,16 +302,15 @@ The command mines the 4-byte payload nonce until the Kaspa transaction ID starts
 hex prefix.
 
 Before mining, the builder performs Kaspa mass preflight using the same KIP-0009 storage-mass
-formula used by kaspad and a kaspawallet-style signed-compute estimate. By default, build fails if:
+formula used by kaspad and a kaspawallet-style signed-compute estimate. For v0/pre-Toccata
+transactions it applies the legacy `100000` standard mass cap. For v1 lane exits, the Toccata
+standard cap is relaxed, so build fails if:
 
-- estimated signed compute mass exceeds `100000`
-- transient mass exceeds `100000`
-- storage mass exceeds `100000`
 - effective mass exceeds the network block mass limit
 - `fee_sompi` is below the minimum relay fee for the effective mass
 
-For example, 20 outputs of `0.05 KAS` each can produce storage mass around `3975025`, which standard
-mainnet nodes reject with `transaction storage mass ... is larger than max allowed size of 100000`.
+For example, 20 outputs of `0.05 KAS` each can produce storage mass around `3975025`, which is above
+the post-Toccata block mass limit and will not fit in a broadcastable exit.
 Do not bypass this check for a transaction intended for broadcast. When mass preflight rejects a
 batch, the error also estimates how many exits from the same input set may fit if the batch is split
 and change is recalculated.

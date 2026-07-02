@@ -11,24 +11,32 @@ use kaspa_consensus_core::{
     constants::{
         TX_VERSION as KASPA_TX_VERSION_NATIVE, TX_VERSION_TOCCATA as KASPA_TX_VERSION_TOCCATA,
     },
-    hashing::tx as kaspa_tx_hashing,
+    hashing::{
+        sighash::SigHashReusedValuesUnsync as KaspaSigHashReusedValuesUnsync,
+        sighash_type::SIG_HASH_ALL as KASPA_SIG_HASH_ALL, tx as kaspa_tx_hashing,
+    },
     mass::{
-        ContextualMasses as KaspaContextualMasses, Mass as KaspaMass,
-        MassCalculator as KaspaMassCalculator, UtxoCell, calc_storage_mass,
+        ComputeBudget as KaspaComputeBudget, ContextualMasses as KaspaContextualMasses,
+        Gram as KaspaGram, Mass as KaspaMass, MassCalculator as KaspaMassCalculator,
+        ScriptUnits as KaspaScriptUnits, UtxoCell, calc_storage_mass,
     },
     network::NetworkType as KaspaNetworkType,
     subnets::{SUBNETWORK_ID_SIZE, SubnetworkId},
     tx::{
-        ComputeCommit as KaspaComputeCommit, ScriptPublicKey, Transaction as KaspaTransaction,
-        TransactionId, TransactionInput as KaspaTransactionInput, TransactionOutpoint,
+        ComputeCommit as KaspaComputeCommit, PopulatedTransaction as KaspaPopulatedTransaction,
+        ScriptPublicKey, Transaction as KaspaTransaction, TransactionId,
+        TransactionInput as KaspaTransactionInput, TransactionOutpoint,
         TransactionOutput as KaspaTransactionOutput, UtxoEntry,
     },
 };
 use kaspa_grpc_client::GrpcClient;
 use kaspa_rpc_core::{RpcTransaction, api::rpc::RpcApi};
 use kaspa_txscript::{
-    extract_script_pub_key_address, multisig_redeem_script, multisig_redeem_script_ecdsa,
-    pay_to_address_script, pay_to_script_hash_script, script_builder::ScriptBuilder,
+    EngineCtx as KaspaEngineCtx, EngineFlags as KaspaEngineFlags,
+    TxScriptEngine as KaspaTxScriptEngine, caches::Cache as KaspaScriptCache,
+    covenants::CovenantsContext as KaspaCovenantsContext, extract_script_pub_key_address,
+    multisig_redeem_script, multisig_redeem_script_ecdsa, pay_to_address_script,
+    pay_to_script_hash_script, script_builder::ScriptBuilder,
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -43,11 +51,10 @@ pub const KAS_LOCKING_SCRIPT_HEX: &str =
 const KASPAWALLET_CANONICAL_COSIGNER_INDEX: u32 = 0;
 const KASPAWALLET_EXTERNAL_KEYCHAIN: u32 = 0;
 const SOMPI_PER_KAS: u64 = 100_000_000;
-const KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS: u64 = 100_000;
+const KASPA_MAXIMUM_PRE_TOCCATA_STANDARD_TRANSACTION_MASS: u64 = 100_000;
 const KASPA_MINIMUM_RELAY_TRANSACTION_FEE: u64 = 1_000;
 const KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE: usize = 65;
 const KASPA_SUBNETWORK_NAMESPACE_LEN: usize = 4;
-const KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT: u16 = 10;
 const SUPPORTED_UNSIGNED_EXIT_SCHEMAS: &[&str] =
     &["igra.exit.unsigned.v1", "igra.exit.unsigned.v2"];
 const CURRENT_UNSIGNED_EXIT_SCHEMA: &str = "igra.exit.unsigned.v2";
@@ -432,6 +439,7 @@ pub fn build_unsigned_exit(
 
     let payload = build_payload_with_nonce(IGRA_EXIT_PAYLOAD_HEADER, &payload_l2data, 0);
     let mut tx = KaspaTransaction::new(tx_version, inputs, outputs, 0, subnetwork_id, 0, payload);
+    apply_unsigned_exit_compute_budgets(&mut tx, &input, &options.network)?;
     let mass = calculate_mass_preflight(&tx, &input, &options.network)?;
     validate_mass_preflight(
         &mass,
@@ -611,7 +619,6 @@ pub fn verify_unsigned_exit(
         options.allow_non_igra_lock_script_for_testing,
     )?;
     verify_outputs(&tx, manifest)?;
-    verify_mass_manifest(&tx, manifest)?;
 
     let signed_inputs = pst
         .partially_signed_inputs
@@ -629,6 +636,25 @@ pub fn verify_unsigned_exit(
     if options.require_fully_signed && !fully_signed {
         bail!("transaction is not fully signed according to minimum_signatures");
     }
+
+    let materialized_signed_tx = if options.allow_signatures && fully_signed {
+        let materialized = materialize_signed_wallet_transaction(manifest, wallet_hex)?;
+        if materialized.id() != tx_id {
+            bail!(
+                "materialized signed transaction txid mismatch: expected={}, actual={}",
+                tx_id_string,
+                materialized.id()
+            );
+        }
+        Some(materialized)
+    } else {
+        None
+    };
+    verify_mass_manifest(
+        materialized_signed_tx.as_ref().unwrap_or(&tx),
+        manifest,
+        materialized_signed_tx.is_some(),
+    )?;
 
     Ok(VerifyExitReport {
         kaspa_tx_id: tx_id_string,
@@ -707,8 +733,14 @@ pub fn materialize_signed_wallet_transaction(
             script_builder.add_data(signature)?;
         }
 
-        apply_kaspa_input_signature_mass(tx_input, tx_version, sig_op_count);
+        if !kaspa_tx_version_uses_compute_budget(tx_version) {
+            apply_kaspa_input_signature_mass(tx_input, tx_version, sig_op_count);
+        }
         tx_input.signature_script = script_builder.drain();
+    }
+
+    if kaspa_tx_version_uses_compute_budget(tx_version) {
+        apply_signed_exit_compute_budgets(&mut tx, manifest)?;
     }
 
     tx.finalize();
@@ -1133,28 +1165,55 @@ fn verify_outputs(tx: &KaspaTransaction, manifest: &UnsignedExitManifest) -> Res
     Ok(())
 }
 
-fn verify_mass_manifest(tx: &KaspaTransaction, manifest: &UnsignedExitManifest) -> Result<()> {
+fn verify_mass_manifest(
+    tx: &KaspaTransaction,
+    manifest: &UnsignedExitManifest,
+    allow_signed_mass_recompute: bool,
+) -> Result<()> {
     let Some(expected) = manifest.mass.as_ref() else {
         return Ok(());
     };
 
-    let actual = calculate_mass_preflight(
-        tx,
-        &BuildExitInput {
-            locking_utxos: manifest.locking_utxos.clone(),
-            exits: manifest.exits.clone(),
-            change: manifest.change.clone(),
-            fee_sompi: manifest.fee_sompi,
-            fee_kas: manifest.fee_kas.clone(),
-            multisig: manifest.multisig.clone(),
-        },
-        &manifest.network,
-    )?;
-    if &actual != expected {
+    let actual =
+        calculate_mass_preflight(tx, &build_input_from_manifest(manifest), &manifest.network)?;
+    if &actual != expected && !allow_signed_mass_recompute {
         bail!("manifest mass preflight does not match transaction data");
     }
+    validate_mass_manifest_passes(&actual)?;
 
     Ok(())
+}
+
+fn validate_mass_manifest_passes(mass: &KaspaMassManifest) -> Result<()> {
+    if mass.standard_limit_exceeded {
+        bail!("transaction exceeds standard mass limit {}", mass.standard_transaction_mass_limit);
+    }
+    if mass.block_limit_exceeded {
+        bail!(
+            "transaction effective mass {} exceeds block mass limit {}",
+            mass.effective_mass,
+            mass.block_mass_limit
+        );
+    }
+    if mass.fee_below_minimum_relay {
+        bail!(
+            "transaction fee {} sompi is below minimum relay fee {} sompi",
+            mass.fee_sompi,
+            mass.minimum_relay_fee_sompi
+        );
+    }
+    Ok(())
+}
+
+fn build_input_from_manifest(manifest: &UnsignedExitManifest) -> BuildExitInput {
+    BuildExitInput {
+        locking_utxos: manifest.locking_utxos.clone(),
+        exits: manifest.exits.clone(),
+        change: manifest.change.clone(),
+        fee_sompi: manifest.fee_sompi,
+        fee_kas: manifest.fee_kas.clone(),
+        multisig: manifest.multisig.clone(),
+    }
 }
 
 fn calculate_mass_preflight(
@@ -1168,7 +1227,7 @@ fn calculate_mass_preflight(
     let storage_mass = calculate_storage_mass(tx, input, &params)?;
 
     let mut signed_tx_for_mass = tx.clone();
-    apply_kaspawallet_signature_placeholders(&mut signed_tx_for_mass, input)?;
+    apply_kaspawallet_signature_placeholders(&mut signed_tx_for_mass, input, network)?;
     let non_contextual = calculator.calc_non_contextual_masses(&signed_tx_for_mass);
 
     let estimated_signed_compute_mass = non_contextual.compute_mass;
@@ -1176,6 +1235,11 @@ fn calculate_mass_preflight(
     let effective_mass = KaspaMass::new(non_contextual, KaspaContextualMasses::new(storage_mass))
         .normalized_max(&mass_cofactors);
     let minimum_relay_fee_sompi = minimum_required_transaction_relay_fee(effective_mass);
+    let standard_mass_cap = kaspa_standard_mass_cap_for_tx_version(tx.version);
+    let standard_transaction_mass_limit = standard_mass_cap.unwrap_or(mass_cofactors.reference);
+    let standard_limit_exceeded = standard_mass_cap.is_some_and(|cap| {
+        estimated_signed_compute_mass > cap || transient_mass > cap || storage_mass > cap
+    });
 
     Ok(KaspaMassManifest {
         estimated_signed_compute_mass,
@@ -1186,12 +1250,9 @@ fn calculate_mass_preflight(
         fee_kas: sompi_to_kas_string(input.fee_sompi),
         minimum_relay_fee_sompi,
         minimum_relay_fee_kas: sompi_to_kas_string(minimum_relay_fee_sompi),
-        standard_transaction_mass_limit: KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS,
+        standard_transaction_mass_limit,
         block_mass_limit: mass_cofactors.reference,
-        standard_limit_exceeded: estimated_signed_compute_mass
-            > KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS
-            || transient_mass > KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS
-            || storage_mass > KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS,
+        standard_limit_exceeded,
         block_limit_exceeded: effective_mass > mass_cofactors.reference,
         fee_below_minimum_relay: input.fee_sompi < minimum_relay_fee_sompi,
     })
@@ -1227,18 +1288,124 @@ fn calculate_storage_mass(
     .ok_or_else(|| eyre!("failed to calculate Kaspa storage mass"))
 }
 
+fn apply_unsigned_exit_compute_budgets(
+    tx: &mut KaspaTransaction,
+    input: &BuildExitInput,
+    network: &str,
+) -> Result<()> {
+    if !kaspa_tx_version_uses_compute_budget(tx.version) {
+        return Ok(());
+    }
+
+    let mut template_tx = tx.clone();
+    apply_kaspawallet_signature_placeholders(&mut template_tx, input, network)?;
+    let budgets = compute_required_compute_budgets(&template_tx, input, network, true)?;
+    for (tx_input, budget) in tx.inputs.iter_mut().zip(budgets) {
+        tx_input.compute_commit = KaspaComputeCommit::ComputeBudget(budget.into());
+    }
+    tx.finalize();
+    Ok(())
+}
+
+fn apply_signed_exit_compute_budgets(
+    tx: &mut KaspaTransaction,
+    manifest: &UnsignedExitManifest,
+) -> Result<()> {
+    let input = build_input_from_manifest(manifest);
+    let budgets = compute_required_compute_budgets(tx, &input, &manifest.network, true)?;
+    for (tx_input, budget) in tx.inputs.iter_mut().zip(budgets) {
+        tx_input.compute_commit = KaspaComputeCommit::ComputeBudget(budget.into());
+    }
+    tx.finalize();
+    Ok(())
+}
+
+fn compute_required_compute_budgets(
+    tx: &KaspaTransaction,
+    input: &BuildExitInput,
+    network: &str,
+    allow_template_script_failure: bool,
+) -> Result<Vec<u16>> {
+    let params = KaspaParams::from(parse_kaspa_network_type(network)?);
+    let entries = input_utxo_entries(input)?;
+    let populated_tx = KaspaPopulatedTransaction::new(tx, entries);
+    let covenants_ctx = KaspaCovenantsContext::from_tx(&populated_tx)
+        .wrap_err("failed to build Kaspa covenant context for compute budget")?;
+    let sig_cache = KaspaScriptCache::new(10_000);
+    let reused_values = KaspaSigHashReusedValuesUnsync::new();
+    let flags = KaspaEngineFlags {
+        covenants_enabled: kaspa_tx_version_uses_compute_budget(tx.version),
+        sigop_script_units: KaspaGram(params.mass_per_sig_op).into(),
+    };
+
+    let mut budgets = Vec::with_capacity(tx.inputs.len());
+    for (index, tx_input) in tx.inputs.iter().enumerate() {
+        let ctx = KaspaEngineCtx::new(&sig_cache)
+            .with_reused(&reused_values)
+            .with_covenants_ctx(&covenants_ctx);
+        let mut vm = KaspaTxScriptEngine::from_transaction_input_with_script_units_limit(
+            &populated_tx,
+            tx_input,
+            index,
+            &populated_tx.entries[index],
+            ctx,
+            flags,
+            KaspaScriptUnits(u64::MAX),
+        );
+        let result = vm.execute();
+        let used_script_units = vm.used_script_units();
+        if let Err(err) = result {
+            if !allow_template_script_failure || used_script_units == KaspaScriptUnits(0) {
+                return Err(err)
+                    .wrap_err_with(|| format!("failed to execute input {index} signature script"));
+            }
+        }
+        let budget = KaspaComputeBudget::checked_covering_script_units(used_script_units)
+            .ok_or_else(|| eyre!("input {index} script units exceed Kaspa compute budget range"))?;
+        budgets.push(budget.value());
+    }
+
+    Ok(budgets)
+}
+
+fn input_utxo_entries(input: &BuildExitInput) -> Result<Vec<UtxoEntry>> {
+    input
+        .locking_utxos
+        .iter()
+        .map(|utxo| {
+            let script = decode_fixed_hex(&utxo.script_public_key.script, "locking UTXO script")?;
+            Ok(UtxoEntry::new(
+                utxo.amount_sompi,
+                ScriptPublicKey::from_vec(utxo.script_public_key.version, script),
+                0,
+                false,
+                None,
+            ))
+        })
+        .collect()
+}
+
 fn apply_kaspawallet_signature_placeholders(
     tx: &mut KaspaTransaction,
     input: &BuildExitInput,
+    network: &str,
 ) -> Result<()> {
     let sig_op_count = u8::try_from(input.multisig.extended_public_keys.len())
         .wrap_err("multisig key count exceeds Kaspa sigOpCount range")?;
     let tx_version = tx.version;
 
     for (tx_input, utxo) in tx.inputs.iter_mut().zip(&input.locking_utxos) {
-        apply_kaspa_input_signature_mass(tx_input, tx_version, sig_op_count);
+        if !kaspa_tx_version_uses_compute_budget(tx_version) {
+            apply_kaspa_input_signature_mass(tx_input, tx_version, sig_op_count);
+        }
         tx_input.signature_script =
             signature_script_placeholder_for_mass(&input.multisig, &utxo.derivation_path)?;
+    }
+    if kaspa_tx_version_uses_compute_budget(tx_version) {
+        let budgets = compute_required_compute_budgets(tx, input, network, true)?;
+        for (tx_input, budget) in tx.inputs.iter_mut().zip(budgets) {
+            tx_input.compute_commit = KaspaComputeCommit::ComputeBudget(budget.into());
+        }
     }
     tx.finalize();
     Ok(())
@@ -1249,7 +1416,8 @@ fn signature_script_placeholder_for_mass(
     derivation_path: &str,
 ) -> Result<Vec<u8>> {
     let mut script_builder = ScriptBuilder::new();
-    let signature = vec![0_u8; KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE];
+    let mut signature = vec![0_u8; KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE];
+    signature[KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE - 1] = KASPA_SIG_HASH_ALL.to_u8();
     let signature_count = multisig.minimum_signatures.max(1) as usize;
 
     if multisig.extended_public_keys.len() > 1 {
@@ -1307,23 +1475,25 @@ fn validate_mass_preflight(
     }
 
     let mut failures = Vec::new();
-    if mass.estimated_signed_compute_mass > mass.standard_transaction_mass_limit {
-        failures.push(format!(
-            "estimated signed compute mass {} exceeds standard limit {}",
-            mass.estimated_signed_compute_mass, mass.standard_transaction_mass_limit
-        ));
-    }
-    if mass.transient_mass > mass.standard_transaction_mass_limit {
-        failures.push(format!(
-            "transient mass {} exceeds standard limit {}",
-            mass.transient_mass, mass.standard_transaction_mass_limit
-        ));
-    }
-    if mass.storage_mass > mass.standard_transaction_mass_limit {
-        failures.push(format!(
-            "storage mass {} exceeds standard limit {}",
-            mass.storage_mass, mass.standard_transaction_mass_limit
-        ));
+    if mass.standard_limit_exceeded {
+        if mass.estimated_signed_compute_mass > mass.standard_transaction_mass_limit {
+            failures.push(format!(
+                "estimated signed compute mass {} exceeds standard limit {}",
+                mass.estimated_signed_compute_mass, mass.standard_transaction_mass_limit
+            ));
+        }
+        if mass.transient_mass > mass.standard_transaction_mass_limit {
+            failures.push(format!(
+                "transient mass {} exceeds standard limit {}",
+                mass.transient_mass, mass.standard_transaction_mass_limit
+            ));
+        }
+        if mass.storage_mass > mass.standard_transaction_mass_limit {
+            failures.push(format!(
+                "storage mass {} exceeds standard limit {}",
+                mass.storage_mass, mass.standard_transaction_mass_limit
+            ));
+        }
     }
     if mass.effective_mass > mass.block_mass_limit {
         failures.push(format!(
@@ -1987,6 +2157,14 @@ fn kaspa_tx_version_uses_compute_budget(version: u16) -> bool {
     KaspaComputeCommit::version_expects_compute_budget_field(version)
 }
 
+fn kaspa_standard_mass_cap_for_tx_version(version: u16) -> Option<u64> {
+    if kaspa_tx_version_uses_compute_budget(version) {
+        None
+    } else {
+        Some(KASPA_MAXIMUM_PRE_TOCCATA_STANDARD_TRANSACTION_MASS)
+    }
+}
+
 fn kaspa_transaction_input_for_version(
     version: u16,
     previous_outpoint: TransactionOutpoint,
@@ -1998,7 +2176,7 @@ fn kaspa_transaction_input_for_version(
             previous_outpoint,
             signature_script,
             sequence,
-            KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT,
+            0,
         )
     } else {
         KaspaTransactionInput::new(previous_outpoint, signature_script, sequence, 0)
@@ -2065,11 +2243,7 @@ fn apply_kaspa_input_signature_mass(
     sig_op_count: u8,
 ) {
     if kaspa_tx_version_uses_compute_budget(version) {
-        let compute_budget = input
-            .compute_commit
-            .compute_budget()
-            .unwrap_or_default()
-            .max(KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT);
+        let compute_budget = input.compute_commit.compute_budget().unwrap_or_default();
         input.compute_commit = KaspaComputeCommit::ComputeBudget(compute_budget.into());
     } else {
         input.compute_commit = KaspaComputeCommit::SigopCount(sig_op_count.into());
@@ -2274,16 +2448,23 @@ mod tests {
             prefixed_hex(decoded.subnetwork_id.as_ref()),
             "0x97b1000000000000000000000000000000000000"
         );
-        assert!(decoded.inputs.iter().all(|input| {
-            input.compute_commit.compute_budget() == Some(KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT)
-        }));
+        let computed_budget = decoded.inputs[0]
+            .compute_commit
+            .compute_budget()
+            .expect("v1 input has computed budget");
+        assert!(
+            decoded
+                .inputs
+                .iter()
+                .all(|input| input.compute_commit.compute_budget() == Some(computed_budget))
+        );
         let pst = PartiallySignedTransactionProto::decode(
             decode_fixed_hex(&output.wallet_hex, "wallet hex").unwrap().as_slice(),
         )
         .expect("decode pst");
         for input in &pst.tx.as_ref().expect("pst tx").inputs {
             assert_eq!(input.sig_op_count, 0);
-            assert_eq!(input.compute_budget, KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT as u32);
+            assert_eq!(input.compute_budget, computed_budget as u32);
         }
         assert_eq!(output.manifest.locking_utxos[0].amount_kas.as_deref(), Some("3.00010000"));
         assert_eq!(output.manifest.exits[0].amount_kas.as_deref(), Some("3.00000000"));
@@ -2547,7 +2728,7 @@ mod tests {
         .unwrap_err();
         let err = err.to_string();
         assert!(err.contains("Kaspa mass preflight failed"));
-        assert!(err.contains("storage mass 3975025 exceeds standard limit 100000"));
+        assert!(err.contains("effective mass 3975025 exceeds block mass limit 500000"));
         assert!(err.contains("0 positive exits from this input set appear to fit"));
 
         let mut input_with_larger_exits = input.clone();
@@ -2589,7 +2770,7 @@ mod tests {
         .expect("testing override should emit rehearsal artifact");
         let mass = output.manifest.mass.as_ref().expect("mass preflight manifest");
         assert_eq!(mass.storage_mass, 3_975_025);
-        assert!(mass.standard_limit_exceeded);
+        assert!(!mass.standard_limit_exceeded);
         assert!(mass.block_limit_exceeded);
     }
 
@@ -2656,9 +2837,13 @@ mod tests {
         assert_eq!(tx.version, KASPA_TX_VERSION_TOCCATA);
         assert_eq!(tx.id().to_string(), output.manifest.protocol.kaspa_tx_id);
         assert_eq!(tx.inputs.len(), output.manifest.locking_utxos.len());
-        assert!(tx.inputs.iter().all(|input| {
-            input.compute_commit.compute_budget() == Some(KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT)
-        }));
+        let computed_budget =
+            tx.inputs[0].compute_commit.compute_budget().expect("v1 input has computed budget");
+        assert!(
+            tx.inputs
+                .iter()
+                .all(|input| input.compute_commit.compute_budget() == Some(computed_budget))
+        );
         assert_eq!(
             tx.outputs.len(),
             output.manifest.exits.len() + usize::from(output.manifest.change.is_some())
@@ -2703,9 +2888,13 @@ mod tests {
 
         assert_eq!(tx.id().to_string(), output.manifest.protocol.kaspa_tx_id);
         assert!(tx.inputs.iter().all(|input| !input.signature_script.is_empty()));
-        assert!(tx.inputs.iter().all(|input| {
-            input.compute_commit.compute_budget() == Some(KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT)
-        }));
+        let computed_budget =
+            tx.inputs[0].compute_commit.compute_budget().expect("v1 input has computed budget");
+        assert!(
+            tx.inputs
+                .iter()
+                .all(|input| input.compute_commit.compute_budget() == Some(computed_budget))
+        );
     }
 
     #[test]

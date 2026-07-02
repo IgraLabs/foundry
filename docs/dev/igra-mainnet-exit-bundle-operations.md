@@ -1027,6 +1027,12 @@ Build:
   --force
 ```
 
+The lane build path emits a Kaspa v1/Toccata transaction and computes per-input
+`computeBudget` from bridge multisig script units. If an older artifact used a
+lower v1 compute budget, `verify-exit --broadcast` recomputes the signed script
+budget before submitting; otherwise kaspad can reject the broadcast with
+`script units exceeded the amount committed in the input`.
+
 Verify unsigned JSON/hex consistency:
 
 ```bash
