@@ -4,8 +4,8 @@ use foundry_common::igra_bundle::verify_bundle_integral;
 use foundry_common::igra_exit::{
     BuildExitInput, BuildExitOptions, MultisigAddressInput, SignExitOptions, VerifyExitOptions,
     broadcast_wallet_transaction, build_unsigned_exit, check_multisig_derivation_path,
-    decode_wallet_transaction, derive_multisig_address, sign_exit_wallet_transaction,
-    verify_multisig_address, verify_unsigned_exit,
+    decode_wallet_transaction, derive_multisig_address, inspect_exit_wallet_transaction,
+    sign_exit_wallet_transaction, verify_multisig_address, verify_unsigned_exit,
 };
 use serde::Deserialize;
 use std::{fs, path::PathBuf, time::Duration};
@@ -27,6 +27,9 @@ pub enum IgraSubcommand {
     /// Sign an IGRA exit PST with a kaspawallet mnemonic or multisig master kprv.
     #[command(name = "sign-exit")]
     SignExit(SignExitArgs),
+    /// Decode an IGRA exit PST hex file for offline human inspection.
+    #[command(name = "inspect-exit")]
+    InspectExit(InspectExitArgs),
     /// Derive an official kaspawallet multisig address from kpubs and a path.
     #[command(name = "derive-msig-address")]
     DeriveMsigAddress(DeriveMsigAddressArgs),
@@ -151,6 +154,17 @@ pub struct SignExitArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct InspectExitArgs {
+    /// Kaspa network used for address encoding. Use `mainnet` for real exits.
+    #[arg(long)]
+    pub network: String,
+
+    /// kaspawallet PartiallySignedTransaction hex file.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub hex: PathBuf,
+}
+
+#[derive(Debug, Args)]
 pub struct DeriveMsigAddressArgs {
     /// Kaspa network. Use `mainnet` for real mainnet addresses.
     #[arg(long)]
@@ -217,6 +231,7 @@ impl IgraArgs {
             IgraSubcommand::BuildExit(args) => args.run(),
             IgraSubcommand::VerifyExit(args) => args.run().await,
             IgraSubcommand::SignExit(args) => args.run(),
+            IgraSubcommand::InspectExit(args) => args.run(),
             IgraSubcommand::DeriveMsigAddress(args) => args.run(),
             IgraSubcommand::VerifyMsigAddress(args) => args.run(),
             IgraSubcommand::CheckMsigPath(args) => args.run(),
@@ -388,6 +403,15 @@ impl SignExitArgs {
                 "out_hex": self.out_hex,
             }))?
         )?;
+        Ok(())
+    }
+}
+
+impl InspectExitArgs {
+    fn run(self) -> Result<()> {
+        let wallet_hex = fs::read_to_string(&self.hex)?;
+        let report = inspect_exit_wallet_transaction(&wallet_hex, &self.network)?;
+        foundry_common::sh_println!("{}", serde_json::to_string_pretty(&report)?)?;
         Ok(())
     }
 }

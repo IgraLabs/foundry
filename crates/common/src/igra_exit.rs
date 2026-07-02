@@ -265,6 +265,83 @@ pub struct SignExitOutput {
     pub fully_signed: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InspectExitReport {
+    pub kaspa_tx_id: String,
+    pub version: u16,
+    pub subnetwork_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_id: Option<String>,
+    pub lock_time: u64,
+    pub gas: u64,
+    pub payload: InspectExitPayloadReport,
+    pub inputs: Vec<InspectExitInputReport>,
+    pub outputs: Vec<InspectExitOutputReport>,
+    pub partial_inputs: Vec<InspectExitPartialInputReport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InspectExitPayloadReport {
+    pub hex: String,
+    pub len: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub message_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InspectExitInputReport {
+    pub index: usize,
+    pub previous_transaction_id: String,
+    pub previous_output_index: u32,
+    pub sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sig_op_count: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compute_budget: Option<u16>,
+    pub signature_script_len: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InspectExitOutputReport {
+    pub index: usize,
+    pub amount_sompi: u64,
+    pub amount_kas: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    pub script_public_key: ScriptPublicKeyJson,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InspectExitPartialInputReport {
+    pub index: usize,
+    pub derivation_path: String,
+    pub minimum_signatures: u32,
+    pub signatures_present: usize,
+    pub prev_output: InspectExitPrevOutputReport,
+    pub pub_key_signature_pairs: Vec<InspectExitSignaturePairReport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InspectExitPrevOutputReport {
+    pub amount_sompi: u64,
+    pub amount_kas: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    pub script_public_key: ScriptPublicKeyJson,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InspectExitSignaturePairReport {
+    pub index: usize,
+    pub extended_pub_key: String,
+    pub signature_present: bool,
+    pub signature_len: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct VerifyExitReport {
     pub kaspa_tx_id: String,
@@ -700,6 +777,179 @@ pub fn decode_wallet_transaction(wallet_hex: &str) -> Result<KaspaTransaction> {
         .wrap_err("failed to decode kaspawallet PartiallySignedTransaction protobuf")?;
     let proto_tx = pst.tx.as_ref().ok_or_else(|| eyre!("wallet protobuf is missing tx"))?;
     transaction_from_proto(proto_tx)
+}
+
+pub fn inspect_exit_wallet_transaction(
+    wallet_hex: &str,
+    network: &str,
+) -> Result<InspectExitReport> {
+    let network_prefix = parse_network_prefix(network)?;
+    let wallet_bytes = decode_wallet_hex(wallet_hex)?;
+    let pst = PartiallySignedTransactionProto::decode(wallet_bytes.as_slice())
+        .wrap_err("failed to decode kaspawallet PartiallySignedTransaction protobuf")?;
+    let proto_tx = pst.tx.as_ref().ok_or_else(|| eyre!("wallet protobuf is missing tx"))?;
+    let tx = transaction_from_proto(proto_tx)?;
+
+    let inputs = tx
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| InspectExitInputReport {
+            index,
+            previous_transaction_id: input.previous_outpoint.transaction_id.to_string(),
+            previous_output_index: input.previous_outpoint.index,
+            sequence: input.sequence,
+            sig_op_count: input.compute_commit.sig_op_count(),
+            compute_budget: input.compute_commit.compute_budget().map(u16::from),
+            signature_script_len: input.signature_script.len(),
+        })
+        .collect();
+
+    let outputs = tx
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| inspect_exit_output(index, output, network_prefix))
+        .collect::<Result<Vec<_>>>()?;
+
+    let partial_inputs = pst
+        .partially_signed_inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| inspect_exit_partial_input(index, input, network_prefix))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(InspectExitReport {
+        kaspa_tx_id: tx.id().to_string(),
+        version: tx.version,
+        subnetwork_id: prefixed_hex(tx.subnetwork_id.as_ref()),
+        lane_id: inspect_lane_id(&tx.subnetwork_id),
+        lock_time: tx.lock_time,
+        gas: tx.gas,
+        payload: inspect_exit_payload(&tx.payload),
+        inputs,
+        outputs,
+        partial_inputs,
+    })
+}
+
+fn inspect_exit_output(
+    index: usize,
+    output: &KaspaTransactionOutput,
+    network_prefix: KaspaAddressPrefix,
+) -> Result<InspectExitOutputReport> {
+    Ok(InspectExitOutputReport {
+        index,
+        amount_sompi: output.value,
+        amount_kas: sompi_to_kas_string(output.value),
+        address: script_public_key_address(
+            output.script_public_key.version(),
+            output.script_public_key.script(),
+            network_prefix,
+        )?,
+        script_public_key: ScriptPublicKeyJson {
+            version: output.script_public_key.version(),
+            script: hex::encode(output.script_public_key.script()),
+        },
+    })
+}
+
+fn inspect_exit_partial_input(
+    index: usize,
+    input: &PartiallySignedInputProto,
+    network_prefix: KaspaAddressPrefix,
+) -> Result<InspectExitPartialInputReport> {
+    let prev_output = input
+        .prev_output
+        .as_ref()
+        .ok_or_else(|| eyre!("partial input {index} missing prevOutput"))?;
+    let prev_spk = prev_output
+        .script_public_key
+        .as_ref()
+        .ok_or_else(|| eyre!("partial input {index} prevOutput missing scriptPublicKey"))?;
+    if prev_spk.version > u16::MAX as u32 {
+        bail!("partial input {index} prevOutput scriptPublicKey version is too large");
+    }
+    let signatures_present =
+        input.pub_key_signature_pairs.iter().filter(|pair| !pair.signature.is_empty()).count();
+    let pairs = input
+        .pub_key_signature_pairs
+        .iter()
+        .enumerate()
+        .map(|(index, pair)| InspectExitSignaturePairReport {
+            index,
+            extended_pub_key: pair.extended_pub_key.clone(),
+            signature_present: !pair.signature.is_empty(),
+            signature_len: pair.signature.len(),
+        })
+        .collect();
+
+    Ok(InspectExitPartialInputReport {
+        index,
+        derivation_path: input.derivation_path.clone(),
+        minimum_signatures: input.minimum_signatures,
+        signatures_present,
+        prev_output: InspectExitPrevOutputReport {
+            amount_sompi: prev_output.value,
+            amount_kas: sompi_to_kas_string(prev_output.value),
+            address: script_public_key_address(
+                prev_spk.version as u16,
+                &prev_spk.script,
+                network_prefix,
+            )?,
+            script_public_key: ScriptPublicKeyJson {
+                version: prev_spk.version as u16,
+                script: hex::encode(&prev_spk.script),
+            },
+        },
+        pub_key_signature_pairs: pairs,
+    })
+}
+
+fn script_public_key_address(
+    version: u16,
+    script: &[u8],
+    network_prefix: KaspaAddressPrefix,
+) -> Result<Option<String>> {
+    let script_public_key = ScriptPublicKey::from_vec(version, script.to_vec());
+    Ok(extract_script_pub_key_address(&script_public_key, network_prefix)
+        .ok()
+        .map(|addr| addr.to_string()))
+}
+
+fn inspect_exit_payload(payload: &[u8]) -> InspectExitPayloadReport {
+    let mut report = InspectExitPayloadReport {
+        hex: prefixed_hex(payload),
+        len: payload.len(),
+        header: payload.first().map(|header| prefixed_hex(&[*header])),
+        nonce: None,
+        message_ids: Vec::new(),
+    };
+
+    if payload.len() >= 5 && payload[0] == IGRA_EXIT_PAYLOAD_HEADER {
+        let body_len = payload.len() - 1 - 4;
+        if body_len % 32 == 0 {
+            let nonce_offset = payload.len() - 4;
+            if let Ok(bytes) = payload[nonce_offset..].try_into() {
+                report.nonce = Some(u32::from_be_bytes(bytes));
+            }
+            report.message_ids =
+                payload[1..nonce_offset].chunks_exact(32).map(prefixed_hex).collect();
+        }
+    }
+
+    report
+}
+
+fn inspect_lane_id(subnetwork_id: &SubnetworkId) -> Option<String> {
+    if *subnetwork_id == SubnetworkId::default() {
+        return None;
+    }
+    let bytes: &[u8] = subnetwork_id.as_ref();
+    bytes[KASPA_SUBNETWORK_NAMESPACE_LEN..]
+        .iter()
+        .all(|byte| *byte == 0)
+        .then(|| prefixed_hex(&bytes[..KASPA_SUBNETWORK_NAMESPACE_LEN]))
 }
 
 pub fn materialize_signed_wallet_transaction(
