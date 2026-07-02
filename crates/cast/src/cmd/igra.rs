@@ -1,5 +1,10 @@
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit},
+};
 use clap::{Args, Subcommand};
-use eyre::{Result, bail, eyre};
+use eyre::{Result, WrapErr, bail, eyre};
 use foundry_common::igra_bundle::verify_bundle_integral;
 use foundry_common::igra_exit::{
     BuildExitInput, BuildExitOptions, MultisigAddressInput, SignExitOptions, VerifyExitOptions,
@@ -24,7 +29,7 @@ pub enum IgraSubcommand {
     /// Verify an unsigned or partially signed IGRA exit transaction.
     #[command(name = "verify-exit")]
     VerifyExit(VerifyExitArgs),
-    /// Sign an IGRA exit PST with a kaspawallet mnemonic or multisig master kprv.
+    /// Sign an IGRA exit PST with a kaspawallet keys.json, mnemonic, or multisig master kprv.
     #[command(name = "sign-exit")]
     SignExit(SignExitArgs),
     /// Decode an IGRA exit PST hex file for offline human inspection.
@@ -144,6 +149,22 @@ pub struct SignExitArgs {
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub kprv_file: Option<PathBuf>,
 
+    /// Go kaspawallet keys.json file containing encryptedMnemonics.
+    #[arg(long = "keys-file", value_hint = clap::ValueHint::FilePath)]
+    pub keys_file: Option<PathBuf>,
+
+    /// File containing the Go kaspawallet keys.json password.
+    #[arg(long = "keys-password-file", value_hint = clap::ValueHint::FilePath, requires = "keys_file")]
+    pub keys_password_file: Option<PathBuf>,
+
+    /// Go kaspawallet keys.json password in cleartext. Prefer the hidden prompt or --keys-password-file.
+    #[arg(
+        long = "unsafe-keys-password",
+        env = "KASPAWALLET_KEYS_PASSWORD",
+        hide_env_values = true
+    )]
+    pub unsafe_keys_password: Option<String>,
+
     /// Drop existing PST signatures before signing. Use to recover from signatures made by the wrong signer.
     #[arg(long)]
     pub clear_existing_signatures: bool,
@@ -223,6 +244,36 @@ struct KaspawalletPublicKeysFile {
     minimum_signatures: Option<u32>,
     #[serde(default)]
     ecdsa: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[allow(dead_code)]
+struct GoKaspawalletKeysFile {
+    version: u32,
+    #[serde(default)]
+    num_threads: u8,
+    #[serde(rename = "encryptedMnemonics")]
+    encrypted_mnemonics: Vec<GoKaspawalletEncryptedMnemonic>,
+    #[serde(default)]
+    public_keys: Vec<String>,
+    #[serde(default)]
+    minimum_signatures: u32,
+    #[serde(default)]
+    cosigner_index: u32,
+    #[serde(default)]
+    last_used_external_index: u32,
+    #[serde(default)]
+    last_used_internal_index: u32,
+    #[serde(default)]
+    ecdsa: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoKaspawalletEncryptedMnemonic {
+    cipher: String,
+    salt: String,
 }
 
 impl IgraArgs {
@@ -356,8 +407,8 @@ impl SignExitArgs {
                 self.out_hex.display()
             );
         }
-        if self.mnemonic_file.is_none() && self.kprv_file.is_none() {
-            bail!("provide --mnemonic-file or --kprv-file");
+        if self.mnemonic_file.is_none() && self.kprv_file.is_none() && self.keys_file.is_none() {
+            bail!("provide --keys-file, --mnemonic-file, or --kprv-file");
         }
 
         let manifest_json = fs::read_to_string(&self.manifest_json)?;
@@ -369,6 +420,11 @@ impl SignExitArgs {
         if let Some(path) = self.mnemonic_file.as_ref() {
             let mnemonic = fs::read_to_string(path)?;
             mnemonics.push(mnemonic.trim().to_string());
+        }
+        if let Some(path) = self.keys_file.as_ref() {
+            let keys_json = fs::read_to_string(path)?;
+            let password = self.resolve_keys_file_password()?;
+            mnemonics.extend(decrypt_go_kaspawallet_mnemonics(&keys_json, password.as_bytes())?);
         }
         if let Some(path) = self.kprv_file.as_ref() {
             let kprv = fs::read_to_string(path)?;
@@ -405,6 +461,130 @@ impl SignExitArgs {
         )?;
         Ok(())
     }
+
+    fn resolve_keys_file_password(&self) -> Result<String> {
+        match (&self.keys_password_file, &self.unsafe_keys_password) {
+            (Some(_), Some(_)) => {
+                bail!("use only one of --keys-password-file or --unsafe-keys-password")
+            }
+            (Some(path), None) => {
+                let password = fs::read_to_string(path)?;
+                Ok(password.trim_end_matches(['\r', '\n']).to_string())
+            }
+            (None, Some(password)) => Ok(password.clone()),
+            (None, None) => rpassword::prompt_password("Enter Go kaspawallet keys.json password: ")
+                .map_err(Into::into),
+        }
+    }
+}
+
+const GO_KASPAWALLET_DEFAULT_NUM_THREADS: u8 = 8;
+const GO_KASPAWALLET_ARGON2_MEMORY_KIB: u32 = 64 * 1024;
+const GO_KASPAWALLET_ARGON2_TIME_COST: u32 = 1;
+const GO_KASPAWALLET_KEY_LEN: usize = 32;
+const GO_KASPAWALLET_XCHACHA_NONCE_LEN: usize = 24;
+
+fn decrypt_go_kaspawallet_mnemonics(keys_json: &str, password: &[u8]) -> Result<Vec<String>> {
+    let keys_file: GoKaspawalletKeysFile =
+        serde_json::from_str(keys_json).wrap_err("failed to parse Go kaspawallet keys.json")?;
+
+    if keys_file.ecdsa {
+        bail!("Go kaspawallet keys.json has ecdsa=true; sign-exit supports Schnorr keys only");
+    }
+    if keys_file.encrypted_mnemonics.is_empty() {
+        bail!("Go kaspawallet keys.json contains no encryptedMnemonics");
+    }
+
+    let num_threads = go_kaspawallet_num_threads(&keys_file, password)?;
+    keys_file
+        .encrypted_mnemonics
+        .iter()
+        .enumerate()
+        .map(|(index, encrypted)| {
+            decrypt_go_kaspawallet_mnemonic(num_threads, encrypted, password)
+                .wrap_err_with(|| format!("failed to decrypt Go kaspawallet mnemonic #{index}"))
+        })
+        .collect()
+}
+
+fn go_kaspawallet_num_threads(keys_file: &GoKaspawalletKeysFile, password: &[u8]) -> Result<u8> {
+    if keys_file.version != 0 {
+        return Ok(GO_KASPAWALLET_DEFAULT_NUM_THREADS);
+    }
+
+    let first_guess = if keys_file.num_threads == 0 {
+        let available = std::thread::available_parallelism().map_or(1, |threads| threads.get());
+        available.min(u8::MAX as usize) as u8
+    } else {
+        keys_file.num_threads
+    };
+
+    if decrypt_go_kaspawallet_mnemonic(
+        first_guess,
+        keys_file
+            .encrypted_mnemonics
+            .first()
+            .ok_or_else(|| eyre!("Go kaspawallet keys.json contains no encryptedMnemonics"))?,
+        password,
+    )
+    .is_ok()
+    {
+        return Ok(first_guess);
+    }
+
+    for num_threads in 1..=u8::MAX {
+        if num_threads == first_guess {
+            continue;
+        }
+        if decrypt_go_kaspawallet_mnemonic(
+            num_threads,
+            keys_file
+                .encrypted_mnemonics
+                .first()
+                .ok_or_else(|| eyre!("Go kaspawallet keys.json contains no encryptedMnemonics"))?,
+            password,
+        )
+        .is_ok()
+        {
+            return Ok(num_threads);
+        }
+    }
+
+    bail!("failed to decrypt Go kaspawallet keys.json; wrong password or unsupported key file")
+}
+
+fn decrypt_go_kaspawallet_mnemonic(
+    num_threads: u8,
+    encrypted: &GoKaspawalletEncryptedMnemonic,
+    password: &[u8],
+) -> Result<String> {
+    let cipher =
+        hex::decode(&encrypted.cipher).wrap_err("invalid hex in keys.json encrypted cipher")?;
+    let salt = hex::decode(&encrypted.salt).wrap_err("invalid hex in keys.json encrypted salt")?;
+    if cipher.len() < GO_KASPAWALLET_XCHACHA_NONCE_LEN {
+        bail!("keys.json encrypted cipher is shorter than the XChaCha20-Poly1305 nonce");
+    }
+
+    let mut key = [0u8; GO_KASPAWALLET_KEY_LEN];
+    let params = Params::new(
+        GO_KASPAWALLET_ARGON2_MEMORY_KIB,
+        GO_KASPAWALLET_ARGON2_TIME_COST,
+        num_threads.into(),
+        Some(GO_KASPAWALLET_KEY_LEN),
+    )
+    .map_err(|err| eyre!("invalid Go kaspawallet Argon2id parameters: {err}"))?;
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(password, &salt, &mut key)
+        .map_err(|err| eyre!("failed to derive Go kaspawallet encryption key: {err}"))?;
+
+    let aead = XChaCha20Poly1305::new_from_slice(&key)
+        .wrap_err("failed to initialize XChaCha20-Poly1305")?;
+    let (nonce, ciphertext) = cipher.split_at(GO_KASPAWALLET_XCHACHA_NONCE_LEN);
+    let plaintext = aead
+        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .map_err(|_| eyre!("message authentication failed"))?;
+
+    String::from_utf8(plaintext).wrap_err("decrypted Go kaspawallet mnemonic is not UTF-8")
 }
 
 impl InspectExitArgs {
@@ -494,5 +674,68 @@ impl VerifyBundleIntegralArgs {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const TEST_PASSWORD: &[u8] = b"test-password";
+
+    fn encrypted_mnemonic_json(version: u32, num_threads: u8) -> serde_json::Value {
+        let encrypted = encrypt_go_kaspawallet_test_mnemonic(num_threads);
+        serde_json::json!({
+            "version": version,
+            "numThreads": if version == 0 { 1 } else { num_threads },
+            "encryptedMnemonics": [encrypted],
+            "publicKeys": [],
+            "minimumSignatures": 2,
+            "cosignerIndex": 0,
+            "lastUsedExternalIndex": 0,
+            "lastUsedInternalIndex": 0,
+            "ecdsa": false
+        })
+    }
+
+    fn encrypt_go_kaspawallet_test_mnemonic(num_threads: u8) -> serde_json::Value {
+        let salt = [7u8; 16];
+        let nonce = [9u8; GO_KASPAWALLET_XCHACHA_NONCE_LEN];
+        let mut key = [0u8; GO_KASPAWALLET_KEY_LEN];
+        let params = Params::new(
+            GO_KASPAWALLET_ARGON2_MEMORY_KIB,
+            GO_KASPAWALLET_ARGON2_TIME_COST,
+            num_threads.into(),
+            Some(GO_KASPAWALLET_KEY_LEN),
+        )
+        .unwrap();
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into(TEST_PASSWORD, &salt, &mut key)
+            .unwrap();
+        let aead = XChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let mut cipher = nonce.to_vec();
+        cipher.extend(aead.encrypt(XNonce::from_slice(&nonce), TEST_MNEMONIC.as_bytes()).unwrap());
+
+        serde_json::json!({
+            "cipher": hex::encode(cipher),
+            "salt": hex::encode(salt)
+        })
+    }
+
+    #[test]
+    fn decrypts_go_kaspawallet_v1_keys_json() {
+        let keys_json = encrypted_mnemonic_json(1, GO_KASPAWALLET_DEFAULT_NUM_THREADS);
+        let mnemonics =
+            decrypt_go_kaspawallet_mnemonics(&keys_json.to_string(), TEST_PASSWORD).unwrap();
+        assert_eq!(mnemonics, vec![TEST_MNEMONIC]);
+    }
+
+    #[test]
+    fn detects_go_kaspawallet_v0_num_threads() {
+        let keys_json = encrypted_mnemonic_json(0, 2);
+        let mnemonics =
+            decrypt_go_kaspawallet_mnemonics(&keys_json.to_string(), TEST_PASSWORD).unwrap();
+        assert_eq!(mnemonics, vec![TEST_MNEMONIC]);
     }
 }

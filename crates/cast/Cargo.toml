@@ -60,7 +60,9 @@ alloy-eips.workspace = true
 
 op-alloy-flz.workspace = true
 
+argon2 = "0.5"
 chrono.workspace = true
+chacha20poly1305 = "0.10"
 eyre.workspace = true
 futures.workspace = true
 revm = { workspace = true, features = ["optional_balance_check"] }
@@ -69,6 +71,7 @@ rand_08.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+hex = "0.4"
 
 # bin
 foundry-cli.workspace = true

@@ -1088,9 +1088,10 @@ normal Toccata wallet transactions, but this IGRA lane-id exit is a v1
 subnetwork PST and must be signed with a v1-aware signer. Use the patched
 `cast igra sign-exit` command for each offline signer.
 
-Each signer supplies only their own secret, either as a mnemonic file or a
-kaspawallet multisig master `kprv` file. The manifest already contains all
-multisig kpubs and input derivation paths.
+Each signer supplies only their own secret. The preferred source is their
+protected Go `kaspawallet` `keys.json`; `cast` decrypts `encryptedMnemonics` in
+memory using the wallet password and does not print the mnemonic. The manifest
+already contains all multisig kpubs and input derivation paths.
 
 There are two signing starts:
 
@@ -1103,12 +1104,17 @@ Signer 1 signs:
 ./target/debug/cast igra sign-exit \
   --manifest "$BASE/${BATCH_NAME}-official-bridge.unsigned.json" \
   --hex "$BASE/${BATCH_NAME}-official-bridge.unsigned.hex" \
-  --mnemonic-file "$SIGNER_1_MNEMONIC_FILE" \
+  --keys-file "$SIGNER_1_KEYS_FILE" \
   --out-hex "$BASE/${BATCH_NAME}-official-bridge.signed-1.hex"
 ```
 
-Use `--kprv-file "$SIGNER_1_KPRV_FILE"` instead of `--mnemonic-file` if the
-signer stores a kaspawallet multisig master private key.
+If the command is attached to a terminal, it prompts for the Go wallet password.
+For scripted offline signing, add `--keys-password-file "$SIGNER_1_PASSWORD_FILE"`.
+
+Fallbacks are still supported: use `--mnemonic-file "$SIGNER_1_MNEMONIC_FILE"`
+if the signer intentionally exports a mnemonic, or `--kprv-file
+"$SIGNER_1_KPRV_FILE"` if the signer stores a kaspawallet multisig master
+private key.
 
 If recovering from a PST that was already signed by the wrong signer
 implementation, restart from the unsigned hex. If that is unavailable, pass
@@ -1184,7 +1190,7 @@ Signer 2 signs:
 ./target/debug/cast igra sign-exit \
   --manifest "$BASE/${BATCH_NAME}-official-bridge.unsigned.json" \
   --hex "$BASE/${BATCH_NAME}-official-bridge.signed-1.hex" \
-  --mnemonic-file "$SIGNER_2_MNEMONIC_FILE" \
+  --keys-file "$SIGNER_2_KEYS_FILE" \
   --out-hex "$BASE/${BATCH_NAME}-official-bridge.signed-2.hex"
 ```
 

@@ -20,7 +20,7 @@ Every signer should receive both files and verify them before signing.
 From the Foundry repository:
 
 ```bash
-git switch roman/igra-exit-unsigned-cli
+git switch roman/igra-exit-lane-id
 cargo build -p cast
 ```
 
@@ -417,7 +417,9 @@ Each signer should inspect:
 Do not use Go `kaspawallet sign` for lane v1 exit transactions. It is valid for
 normal Toccata wallet flows, but it does not sign this IGRA v1 subnetwork PST
 shape correctly. Each offline signer should use the patched `cast igra
-sign-exit` command.
+sign-exit` command with their protected Go `kaspawallet` `keys.json`. The
+command decrypts `encryptedMnemonics` in memory using the wallet password and
+does not print the mnemonic.
 
 Signer 1:
 
@@ -425,14 +427,18 @@ Signer 1:
 ./target/debug/cast igra sign-exit \
   --manifest unsigned-exit.json \
   --hex unsigned-exit.hex \
-  --mnemonic-file signer1.mnemonic.txt \
+  --keys-file signer1.keys.json \
   --out-hex signed1.hex
 ```
 
-Use `--kprv-file signer1.kprv.txt` instead of `--mnemonic-file` if the signer
-keeps the kaspawallet multisig master private key. The manifest already contains
-the multisig kpubs and each input derivation path; the signer only supplies
-their own secret.
+If the command is attached to a terminal, it prompts for the Go wallet password.
+For scripted offline signing, add `--keys-password-file signer1.password.txt`.
+
+Fallbacks are still supported: use `--mnemonic-file signer1.mnemonic.txt` if the
+signer intentionally exports a mnemonic, or `--kprv-file signer1.kprv.txt` if
+the signer keeps the kaspawallet multisig master private key. The manifest
+already contains the multisig kpubs and each input derivation path; the signer
+only supplies their own secret.
 
 If recovering from a PST that already contains invalid signatures, start again
 from `unsigned-exit.hex`. If that file is unavailable, signer 1 may add
@@ -463,7 +469,7 @@ Signer 2 signs signer 1 output:
 ./target/debug/cast igra sign-exit \
   --manifest unsigned-exit.json \
   --hex signed1.hex \
-  --mnemonic-file signer2.mnemonic.txt \
+  --keys-file signer2.keys.json \
   --out-hex signed2.hex
 ```
 
@@ -493,7 +499,7 @@ instead of signer 2:
 ./target/debug/cast igra sign-exit \
   --manifest unsigned-exit.json \
   --hex signed1.hex \
-  --mnemonic-file signer3.mnemonic.txt \
+  --keys-file signer3.keys.json \
   --out-hex signed13.hex
 ```
 
