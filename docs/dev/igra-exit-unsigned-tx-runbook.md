@@ -277,6 +277,7 @@ For mainnet:
 ./target/debug/cast igra build-exit \
   --network mainnet \
   --tx-id-prefix 97b1 \
+  --lane-id 97b10000 \
   --input exit-input.json \
   --out-json unsigned-exit.json \
   --out-hex unsigned-exit.hex
@@ -286,6 +287,9 @@ Useful optional flags:
 
 - `--mining-timeout-secs 0`: disable timeout while mining the payload nonce.
 - `--max-nonce <N>`: bound the nonce search for tests.
+- `--lane-id 97b10000`: set the canonical IGRA Kaspa lane/subnetwork id. The builder accepts the
+  4-byte namespace form (`97b10000`) or the full 20-byte subnetwork id
+  (`97b1000000000000000000000000000000000000`).
 - `--allow-non-igra-lock-script-for-testing`: permit non-official multisig UTXOs for signing
   rehearsals only. Do not use this for real bridge exits from the official IGRA lock script.
 - `--allow-mass-limit-override-for-testing`: emit artifacts even when Kaspa mass preflight says the
@@ -313,6 +317,8 @@ and change is recalculated.
 The output manifest echoes the normalized readable fields even if they were omitted from the input:
 
 - `protocol.nonce` as a fixed-width 4-byte hex string, for example `0x0000b1b0`
+- `protocol.lane_id`, for example `0x97b10000`
+- `protocol.subnetwork_id`, for example `0x97b1000000000000000000000000000000000000`
 - `locking_utxos[*].amount_kas` and `locking_utxos[*].address`
 - `exits[*].amount_kas`
 - `change.amount_kas` and `change.address`, when change is present
@@ -395,6 +401,8 @@ Each signer should inspect:
 - `kaspa_tx_id`
 - `payload_nonce`; in the manifest, `protocol.nonce` is the same value encoded as 4-byte hex
 - `payload_header` in the manifest, which must be `0x93`
+- `protocol.lane_id`, which should be `0x97b10000` for the canonical IGRA lane
+- `protocol.subnetwork_id`, which should be `0x97b1000000000000000000000000000000000000`
 - input UTXO txid, index, amount, locking script, and derivation path
 - exit recipient addresses and amounts
 - optional change amount and derivation path
@@ -504,12 +512,10 @@ Confirm recipient, amount, fee, mass, and fee rate.
 
 ## Broadcast
 
-With a synced official wallet daemon connected to mainnet:
-
-```bash
-kaspawallet broadcast \
-  --transaction-file signed2.hex
-```
+For lane/subnetwork v1 exit transactions, do not broadcast the signed PST directly
+with older `kaspawallet broadcast`. Older wallet builds sign the PST correctly, but
+their broadcast path can materialize v1 inputs with legacy `sigOpCount` instead of
+`computeBudget`.
 
 Only broadcast after the final artifact passes:
 
@@ -519,6 +525,17 @@ Only broadcast after the final artifact passes:
   --hex signed2.hex \
   --allow-signatures \
   --require-fully-signed
+```
+
+Then use the Foundry verifier/broadcaster with a synced Kaspa RPC endpoint:
+
+```bash
+./target/debug/cast igra verify-exit \
+  --manifest unsigned-exit.json \
+  --hex signed2.hex \
+  --broadcast \
+  --kaspa-rpc-url grpc://127.0.0.1:16110 \
+  --json
 ```
 
 ## Mainnet Checklist

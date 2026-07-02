@@ -63,7 +63,7 @@ Kaspa L1:
 
 Kaspa node / wallet:
 
-- `kaspawallet broadcast -F <signed.hex>` submits through a wallet daemon.
+- `cast igra verify-exit --broadcast` submits the fully signed lane v1 transaction through Kaspa RPC.
 - The wallet daemon can use an unrelated non-ECDSA `keys.json` for broadcast. It does not need official bridge private keys.
 - The daemon must connect to a synced mainnet `kaspad`.
 - Do not use an ECDSA daemon wallet for these bridge transactions because the official bridge multisig is `ecdsa=false`.
@@ -1020,6 +1020,7 @@ Build:
 ./target/debug/cast igra build-exit \
   --network mainnet \
   --tx-id-prefix 97b1 \
+  --lane-id 97b10000 \
   --input "$BASE/${BATCH_NAME}-official-bridge.input.json" \
   --out-json "$BASE/${BATCH_NAME}-official-bridge.unsigned.json" \
   --out-hex "$BASE/${BATCH_NAME}-official-bridge.unsigned.hex" \
@@ -1203,13 +1204,9 @@ curl -sS \
 jq '.[] | select(.outpoint.transactionId=="<funding-txid>" and (.outpoint.index|tonumber)==<index>)'
 ```
 
-Broadcast with official wallet:
-
-```bash
-./kaspawallet broadcast -F "$BASE/${BATCH_NAME}-official-bridge.signed-2.hex"
-```
-
-Broadcast directly from `cast`:
+Broadcast from `cast`; do not use older `kaspawallet broadcast` for lane v1
+exits because those wallet builds can materialize `sigOpCount` instead of
+`computeBudget`:
 
 ```bash
 ./target/debug/cast igra verify-exit \

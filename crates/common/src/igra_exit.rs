@@ -8,12 +8,19 @@ use kaspa_bip32::{
 };
 use kaspa_consensus_core::{
     config::params::Params as KaspaParams,
-    mass::{MassCalculator as KaspaMassCalculator, UtxoCell, calc_storage_mass},
+    constants::{
+        TX_VERSION as KASPA_TX_VERSION_NATIVE, TX_VERSION_TOCCATA as KASPA_TX_VERSION_TOCCATA,
+    },
+    hashing::tx as kaspa_tx_hashing,
+    mass::{
+        ContextualMasses as KaspaContextualMasses, Mass as KaspaMass,
+        MassCalculator as KaspaMassCalculator, UtxoCell, calc_storage_mass,
+    },
     network::NetworkType as KaspaNetworkType,
-    subnets::SubnetworkId,
+    subnets::{SUBNETWORK_ID_SIZE, SubnetworkId},
     tx::{
-        ScriptPublicKey, Transaction as KaspaTransaction, TransactionId,
-        TransactionInput as KaspaTransactionInput, TransactionOutpoint,
+        ComputeCommit as KaspaComputeCommit, ScriptPublicKey, Transaction as KaspaTransaction,
+        TransactionId, TransactionInput as KaspaTransactionInput, TransactionOutpoint,
         TransactionOutput as KaspaTransactionOutput, UtxoEntry,
     },
 };
@@ -39,11 +46,17 @@ const SOMPI_PER_KAS: u64 = 100_000_000;
 const KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS: u64 = 100_000;
 const KASPA_MINIMUM_RELAY_TRANSACTION_FEE: u64 = 1_000;
 const KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE: usize = 65;
+const KASPA_SUBNETWORK_NAMESPACE_LEN: usize = 4;
+const KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT: u16 = 10;
+const SUPPORTED_UNSIGNED_EXIT_SCHEMAS: &[&str] =
+    &["igra.exit.unsigned.v1", "igra.exit.unsigned.v2"];
+const CURRENT_UNSIGNED_EXIT_SCHEMA: &str = "igra.exit.unsigned.v2";
 
 #[derive(Clone, Debug)]
 pub struct BuildExitOptions {
     pub network: String,
     pub tx_id_prefix: String,
+    pub lane_id: String,
     pub mining_timeout: Duration,
     pub max_nonce: Option<u32>,
     pub allow_non_igra_lock_script_for_testing: bool,
@@ -173,6 +186,10 @@ pub struct ExitProtocolManifest {
     pub tx_type_id: u8,
     pub payload_header: String,
     pub tx_id_prefix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnetwork_id: Option<String>,
     #[serde(
         serialize_with = "serialize_u32_hex",
         deserialize_with = "deserialize_u32_hex_or_decimal"
@@ -327,6 +344,8 @@ struct TransactionInputProto {
     sequence: u64,
     #[prost(uint32, tag = "4")]
     sig_op_count: u32,
+    #[prost(uint32, tag = "6")]
+    compute_budget: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -377,6 +396,10 @@ pub fn build_unsigned_exit(
     if tx_id_prefix.len() > 4 {
         bail!("tx-id prefix cannot exceed 4 bytes; the IGRA payload nonce is only 4 bytes");
     }
+    let subnetwork_id = parse_igra_lane_id(&options.lane_id)?;
+    let lane_id = normalize_lane_id(&options.lane_id)?;
+    let subnetwork_id_hex = prefixed_hex(subnetwork_id.as_ref());
+    let tx_version = kaspa_tx_version_for_subnetwork_id(&subnetwork_id);
 
     let payload_l2data = exit_l2data(&input.exits)?;
     let outputs =
@@ -398,17 +421,17 @@ pub fn build_unsigned_exit(
         .iter()
         .map(|utxo| {
             let txid = parse_transaction_id(&utxo.transaction_id)?;
-            Ok(KaspaTransactionInput::new(
+            Ok(kaspa_transaction_input_for_version(
+                tx_version,
                 TransactionOutpoint::new(txid, utxo.index),
                 Vec::new(),
-                0,
                 0,
             ))
         })
         .collect::<Result<Vec<_>>>()?;
 
     let payload = build_payload_with_nonce(IGRA_EXIT_PAYLOAD_HEADER, &payload_l2data, 0);
-    let mut tx = KaspaTransaction::new(0, inputs, outputs, 0, SubnetworkId::default(), 0, payload);
+    let mut tx = KaspaTransaction::new(tx_version, inputs, outputs, 0, subnetwork_id, 0, payload);
     let mass = calculate_mass_preflight(&tx, &input, &options.network)?;
     validate_mass_preflight(
         &mass,
@@ -427,13 +450,15 @@ pub fn build_unsigned_exit(
     let kaspa_tx_id = tx.id().to_string();
 
     let manifest = UnsignedExitManifest {
-        schema: "igra.exit.unsigned.v1".to_string(),
+        schema: CURRENT_UNSIGNED_EXIT_SCHEMA.to_string(),
         network: options.network,
         protocol: ExitProtocolManifest {
             version: IGRA_PROTOCOL_VERSION,
             tx_type_id: IGRA_EXIT_TX_TYPE_ID,
             payload_header: prefixed_hex(&[IGRA_EXIT_PAYLOAD_HEADER]),
             tx_id_prefix: prefixed_hex(&tx_id_prefix),
+            lane_id: Some(lane_id),
+            subnetwork_id: Some(subnetwork_id_hex),
             nonce,
             kaspa_tx_id,
             payload_hex,
@@ -466,7 +491,7 @@ pub fn verify_unsigned_exit(
     wallet_hex: &str,
     options: VerifyExitOptions,
 ) -> Result<VerifyExitReport> {
-    if manifest.schema != "igra.exit.unsigned.v1" {
+    if !SUPPORTED_UNSIGNED_EXIT_SCHEMAS.contains(&manifest.schema.as_str()) {
         bail!("unsupported manifest schema: {}", manifest.schema);
     }
     validate_build_input(
@@ -519,6 +544,23 @@ pub fn verify_unsigned_exit(
     if tx.version != manifest.wallet.transaction_version {
         bail!("transaction version mismatch");
     }
+    let expected_subnetwork_id =
+        expected_manifest_subnetwork_id(&manifest.protocol)?.unwrap_or_default();
+    let expected_tx_version = kaspa_tx_version_for_subnetwork_id(&expected_subnetwork_id);
+    if tx.version != expected_tx_version {
+        bail!(
+            "transaction version mismatch for subnetwork: expected={}, actual={}",
+            expected_tx_version,
+            tx.version
+        );
+    }
+    if tx.subnetwork_id != expected_subnetwork_id {
+        bail!(
+            "transaction subnetwork id mismatch: manifest={}, actual=0x{}",
+            prefixed_hex(expected_subnetwork_id.as_ref()),
+            tx.subnetwork_id
+        );
+    }
     if tx.inputs.len() != manifest.locking_utxos.len() {
         bail!("input count mismatch");
     }
@@ -533,6 +575,14 @@ pub fn verify_unsigned_exit(
     let tx_id = tx.id();
     let tx_id_string = tx_id.to_string();
     if tx_id_string != manifest.protocol.kaspa_tx_id {
+        let legacy_tx_id = kaspa_tx_hashing::id_v0(&tx).to_string();
+        if legacy_tx_id == manifest.protocol.kaspa_tx_id {
+            bail!(
+                "kaspa txid mismatch: manifest={} matches legacy v0-style txid for a version {} transaction; current Kaspa v1 txid is {tx_id_string}",
+                manifest.protocol.kaspa_tx_id,
+                tx.version
+            );
+        }
         bail!(
             "kaspa txid mismatch: manifest={}, actual={tx_id_string}",
             manifest.protocol.kaspa_tx_id
@@ -617,6 +667,7 @@ pub fn materialize_signed_wallet_transaction(
 
     let sig_op_count = u8::try_from(manifest.multisig.extended_public_keys.len())
         .wrap_err("multisig key count exceeds Kaspa sigOpCount range")?;
+    let tx_version = tx.version;
 
     for (index, ((tx_input, partial_input), manifest_utxo)) in tx
         .inputs
@@ -656,7 +707,7 @@ pub fn materialize_signed_wallet_transaction(
             script_builder.add_data(signature)?;
         }
 
-        tx_input.sig_op_count = sig_op_count;
+        apply_kaspa_input_signature_mass(tx_input, tx_version, sig_op_count);
         tx_input.signature_script = script_builder.drain();
     }
 
@@ -990,9 +1041,7 @@ fn verify_inputs(
     for (index, ((tx_input, partial_input), manifest_utxo)) in
         tx.inputs.iter().zip(&pst.partially_signed_inputs).zip(&manifest.locking_utxos).enumerate()
     {
-        if !allow_signatures
-            && (!tx_input.signature_script.is_empty() || tx_input.sig_op_count != 0)
-        {
+        if !allow_signatures && tx_input_contains_signature_material(tx.version, tx_input) {
             bail!(
                 "input {index} contains signatures; pass --allow-signatures to verify signed artifacts"
             );
@@ -1115,6 +1164,7 @@ fn calculate_mass_preflight(
 ) -> Result<KaspaMassManifest> {
     let params = KaspaParams::from(parse_kaspa_network_type(network)?);
     let calculator = KaspaMassCalculator::new_with_consensus_params(&params);
+    let mass_cofactors = params.mempool_block_mass_cofactors().after();
     let storage_mass = calculate_storage_mass(tx, input, &params)?;
 
     let mut signed_tx_for_mass = tx.clone();
@@ -1123,7 +1173,8 @@ fn calculate_mass_preflight(
 
     let estimated_signed_compute_mass = non_contextual.compute_mass;
     let transient_mass = non_contextual.transient_mass;
-    let effective_mass = estimated_signed_compute_mass.max(transient_mass).max(storage_mass);
+    let effective_mass = KaspaMass::new(non_contextual, KaspaContextualMasses::new(storage_mass))
+        .normalized_max(&mass_cofactors);
     let minimum_relay_fee_sompi = minimum_required_transaction_relay_fee(effective_mass);
 
     Ok(KaspaMassManifest {
@@ -1136,12 +1187,12 @@ fn calculate_mass_preflight(
         minimum_relay_fee_sompi,
         minimum_relay_fee_kas: sompi_to_kas_string(minimum_relay_fee_sompi),
         standard_transaction_mass_limit: KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS,
-        block_mass_limit: params.max_block_mass,
+        block_mass_limit: mass_cofactors.reference,
         standard_limit_exceeded: estimated_signed_compute_mass
             > KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS
             || transient_mass > KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS
             || storage_mass > KASPA_MAXIMUM_STANDARD_TRANSACTION_MASS,
-        block_limit_exceeded: effective_mass > params.max_block_mass,
+        block_limit_exceeded: effective_mass > mass_cofactors.reference,
         fee_below_minimum_relay: input.fee_sompi < minimum_relay_fee_sompi,
     })
 }
@@ -1161,6 +1212,7 @@ fn calculate_storage_mass(
                 ScriptPublicKey::from_vec(utxo.script_public_key.version, script),
                 0,
                 false,
+                None,
             );
             Ok(UtxoCell::from(&entry))
         })
@@ -1181,9 +1233,10 @@ fn apply_kaspawallet_signature_placeholders(
 ) -> Result<()> {
     let sig_op_count = u8::try_from(input.multisig.extended_public_keys.len())
         .wrap_err("multisig key count exceeds Kaspa sigOpCount range")?;
+    let tx_version = tx.version;
 
     for (tx_input, utxo) in tx.inputs.iter_mut().zip(&input.locking_utxos) {
-        tx_input.sig_op_count = sig_op_count;
+        apply_kaspa_input_signature_mass(tx_input, tx_version, sig_op_count);
         tx_input.signature_script =
             signature_script_placeholder_for_mass(&input.multisig, &utxo.derivation_path)?;
     }
@@ -1482,29 +1535,34 @@ fn partially_signed_transaction_proto(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(PartiallySignedTransactionProto {
-        tx: Some(transaction_to_proto(tx)),
+        tx: Some(transaction_to_proto(tx)?),
         partially_signed_inputs: partial_inputs,
     })
 }
 
-fn transaction_to_proto(tx: &KaspaTransaction) -> TransactionMessageProto {
-    TransactionMessageProto {
+fn transaction_to_proto(tx: &KaspaTransaction) -> Result<TransactionMessageProto> {
+    Ok(TransactionMessageProto {
         version: tx.version as u32,
         inputs: tx
             .inputs
             .iter()
-            .map(|input| TransactionInputProto {
-                previous_outpoint: Some(OutpointProto {
-                    transaction_id: Some(TransactionIdProto {
-                        bytes: input.previous_outpoint.transaction_id.as_bytes().to_vec(),
+            .map(|input| {
+                let (sig_op_count, compute_budget) =
+                    kaspa_input_proto_mass_fields(tx.version, input)?;
+                Ok(TransactionInputProto {
+                    previous_outpoint: Some(OutpointProto {
+                        transaction_id: Some(TransactionIdProto {
+                            bytes: input.previous_outpoint.transaction_id.as_bytes().to_vec(),
+                        }),
+                        index: input.previous_outpoint.index,
                     }),
-                    index: input.previous_outpoint.index,
-                }),
-                signature_script: input.signature_script.clone(),
-                sequence: input.sequence,
-                sig_op_count: input.sig_op_count as u32,
+                    signature_script: input.signature_script.clone(),
+                    sequence: input.sequence,
+                    sig_op_count,
+                    compute_budget,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>>>()?,
         outputs: tx.outputs.iter().map(transaction_output_to_proto).collect(),
         lock_time: tx.lock_time,
         subnetwork_id: Some(SubnetworkIdProto {
@@ -1512,7 +1570,7 @@ fn transaction_to_proto(tx: &KaspaTransaction) -> TransactionMessageProto {
         }),
         gas: tx.gas,
         payload: tx.payload.clone(),
-    }
+    })
 }
 
 fn transaction_output_to_proto(output: &KaspaTransactionOutput) -> TransactionOutputProto {
@@ -1545,15 +1603,14 @@ fn transaction_from_proto(proto: &TransactionMessageProto) -> Result<KaspaTransa
             if txid.bytes.len() != 32 {
                 bail!("input {index} transactionId must be 32 bytes");
             }
-            if input.sig_op_count > u8::MAX as u32 {
-                bail!("input {index} sigOpCount is too large");
-            }
-            Ok(KaspaTransactionInput::new(
+            kaspa_transaction_input_from_proto(
+                proto.version as u16,
                 TransactionOutpoint::new(TransactionId::from_slice(&txid.bytes), outpoint.index),
                 input.signature_script.clone(),
                 input.sequence,
-                input.sig_op_count as u8,
-            ))
+                input.sig_op_count,
+                input.compute_budget,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1918,6 +1975,184 @@ fn build_payload_with_nonce(header: u8, l2data: &[u8], nonce: u32) -> Vec<u8> {
     payload
 }
 
+fn kaspa_tx_version_for_subnetwork_id(subnetwork_id: &SubnetworkId) -> u16 {
+    if *subnetwork_id == SubnetworkId::default() {
+        KASPA_TX_VERSION_NATIVE
+    } else {
+        KASPA_TX_VERSION_TOCCATA
+    }
+}
+
+fn kaspa_tx_version_uses_compute_budget(version: u16) -> bool {
+    KaspaComputeCommit::version_expects_compute_budget_field(version)
+}
+
+fn kaspa_transaction_input_for_version(
+    version: u16,
+    previous_outpoint: TransactionOutpoint,
+    signature_script: Vec<u8>,
+    sequence: u64,
+) -> KaspaTransactionInput {
+    if kaspa_tx_version_uses_compute_budget(version) {
+        KaspaTransactionInput::new_with_compute_budget(
+            previous_outpoint,
+            signature_script,
+            sequence,
+            KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT,
+        )
+    } else {
+        KaspaTransactionInput::new(previous_outpoint, signature_script, sequence, 0)
+    }
+}
+
+fn kaspa_transaction_input_from_proto(
+    version: u16,
+    previous_outpoint: TransactionOutpoint,
+    signature_script: Vec<u8>,
+    sequence: u64,
+    sig_op_count: u32,
+    compute_budget: u32,
+) -> Result<KaspaTransactionInput> {
+    if kaspa_tx_version_uses_compute_budget(version) {
+        let compute_field = if compute_budget == 0 {
+            // Older kaspawallet PSTs had no computeBudget field. Accept the
+            // legacy overloaded sigOpCount slot so previously built artifacts
+            // can still be decoded, then normalize before broadcast.
+            sig_op_count
+        } else {
+            compute_budget
+        };
+        let compute_budget = u16::try_from(compute_field)
+            .wrap_err("input computeBudget is too large for Kaspa v1 transaction")?;
+        Ok(KaspaTransactionInput::new_with_compute_budget(
+            previous_outpoint,
+            signature_script,
+            sequence,
+            compute_budget,
+        ))
+    } else {
+        if compute_budget != 0 {
+            bail!("input computeBudget is invalid for Kaspa v0 transaction");
+        }
+        let sig_op_count = u8::try_from(sig_op_count)
+            .wrap_err("input sigOpCount is too large for Kaspa v0 transaction")?;
+        Ok(KaspaTransactionInput::new(previous_outpoint, signature_script, sequence, sig_op_count))
+    }
+}
+
+fn kaspa_input_proto_mass_fields(
+    version: u16,
+    input: &KaspaTransactionInput,
+) -> Result<(u32, u32)> {
+    if kaspa_tx_version_uses_compute_budget(version) {
+        let compute_budget = input
+            .compute_commit
+            .compute_budget()
+            .ok_or_else(|| eyre!("Kaspa v1 input is missing compute budget"))?;
+        Ok((0, compute_budget as u32))
+    } else {
+        let sig_op_count = input
+            .compute_commit
+            .sig_op_count()
+            .ok_or_else(|| eyre!("Kaspa v0 input is missing sigOpCount"))?;
+        Ok((sig_op_count as u32, 0))
+    }
+}
+
+fn apply_kaspa_input_signature_mass(
+    input: &mut KaspaTransactionInput,
+    version: u16,
+    sig_op_count: u8,
+) {
+    if kaspa_tx_version_uses_compute_budget(version) {
+        let compute_budget = input
+            .compute_commit
+            .compute_budget()
+            .unwrap_or_default()
+            .max(KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT);
+        input.compute_commit = KaspaComputeCommit::ComputeBudget(compute_budget.into());
+    } else {
+        input.compute_commit = KaspaComputeCommit::SigopCount(sig_op_count.into());
+    }
+}
+
+fn tx_input_contains_signature_material(version: u16, input: &KaspaTransactionInput) -> bool {
+    !input.signature_script.is_empty()
+        || (!kaspa_tx_version_uses_compute_budget(version)
+            && input.compute_commit.sig_op_count().unwrap_or_default() != 0)
+}
+
+fn parse_igra_lane_id(value: &str) -> Result<SubnetworkId> {
+    let value = value.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if value.is_empty() {
+        bail!("lane-id cannot be empty");
+    }
+    if !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        bail!("lane-id must be hex-encoded");
+    }
+
+    let subnetwork_id = match value.len() {
+        8 => {
+            let mut namespace = [0u8; KASPA_SUBNETWORK_NAMESPACE_LEN];
+            hex::decode_to_slice(value, &mut namespace)
+                .wrap_err("failed to decode lane-id namespace hex")?;
+            let mut bytes = [0u8; SUBNETWORK_ID_SIZE];
+            bytes[..KASPA_SUBNETWORK_NAMESPACE_LEN].copy_from_slice(&namespace);
+            SubnetworkId::from_bytes(bytes)
+        }
+        40 => {
+            let mut bytes = [0u8; SUBNETWORK_ID_SIZE];
+            hex::decode_to_slice(value, &mut bytes)
+                .wrap_err("failed to decode lane-id subnetwork hex")?;
+            SubnetworkId::from_bytes(bytes)
+        }
+        len => {
+            bail!(
+                "lane-id expected 8 hex chars (4-byte namespace) or 40 hex chars (20-byte subnetwork id), got {len}"
+            );
+        }
+    };
+
+    let bytes: &[u8; SUBNETWORK_ID_SIZE] = subnetwork_id.as_ref();
+    if bytes[1..].iter().all(|byte| *byte == 0) {
+        bail!("lane-id reserved system lane shape is not allowed");
+    }
+    if bytes[KASPA_SUBNETWORK_NAMESPACE_LEN..].iter().any(|byte| *byte != 0) {
+        bail!("lane-id full lane id must use user-lane shape [namespace(4), zero_tail(16)]");
+    }
+
+    Ok(subnetwork_id)
+}
+
+fn normalize_lane_id(value: &str) -> Result<String> {
+    let value = value.trim().trim_start_matches("0x").trim_start_matches("0X");
+    parse_igra_lane_id(value)?;
+    Ok(format!("0x{}", value.to_ascii_lowercase()))
+}
+
+fn expected_manifest_subnetwork_id(
+    protocol: &ExitProtocolManifest,
+) -> Result<Option<SubnetworkId>> {
+    if let Some(subnetwork_id) = protocol.subnetwork_id.as_deref() {
+        let parsed = parse_igra_lane_id(subnetwork_id)
+            .wrap_err("manifest protocol.subnetwork_id is invalid")?;
+        if let Some(lane_id) = protocol.lane_id.as_deref() {
+            let lane =
+                parse_igra_lane_id(lane_id).wrap_err("manifest protocol.lane_id is invalid")?;
+            if lane != parsed {
+                bail!("manifest protocol.lane_id does not match protocol.subnetwork_id");
+            }
+        }
+        return Ok(Some(parsed));
+    }
+
+    protocol
+        .lane_id
+        .as_deref()
+        .map(|lane_id| parse_igra_lane_id(lane_id).wrap_err("manifest protocol.lane_id is invalid"))
+        .transpose()
+}
+
 fn kas_locking_script() -> Result<Vec<u8>> {
     decode_fixed_hex(KAS_LOCKING_SCRIPT_HEX, "KAS locking script")
 }
@@ -1982,12 +2217,37 @@ mod tests {
     }
 
     #[test]
+    fn igra_lane_id_parser_accepts_canonical_namespace_and_full_id() {
+        let shorthand = parse_igra_lane_id("97b10000").expect("canonical lane parses");
+        let full = parse_igra_lane_id("0x97b1000000000000000000000000000000000000")
+            .expect("full canonical lane parses");
+
+        assert_eq!(shorthand, full);
+        assert_eq!(prefixed_hex(shorthand.as_ref()), "0x97b1000000000000000000000000000000000000");
+        assert_eq!(normalize_lane_id("0X97B10000").unwrap(), "0x97b10000");
+    }
+
+    #[test]
+    fn igra_lane_id_parser_rejects_reserved_and_non_user_shapes() {
+        assert!(parse_igra_lane_id("").unwrap_err().to_string().contains("cannot be empty"));
+        assert!(parse_igra_lane_id("zzzzzzzz").unwrap_err().to_string().contains("hex"));
+        assert!(parse_igra_lane_id("01000000").unwrap_err().to_string().contains("reserved"));
+        assert!(
+            parse_igra_lane_id("97b1000000000000000000000000000000000001")
+                .unwrap_err()
+                .to_string()
+                .contains("user-lane shape")
+        );
+    }
+
+    #[test]
     fn build_and_verify_unsigned_exit_roundtrip() {
         let output = build_unsigned_exit(
             sample_input(),
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2002,6 +2262,29 @@ mod tests {
             serde_json::to_value(&output.manifest).unwrap()["protocol"]["nonce"],
             serde_json::Value::String(format!("0x{:08x}", output.manifest.protocol.nonce))
         );
+        assert_eq!(output.manifest.protocol.lane_id.as_deref(), Some("0x97b10000"));
+        assert_eq!(
+            output.manifest.protocol.subnetwork_id.as_deref(),
+            Some("0x97b1000000000000000000000000000000000000")
+        );
+        let decoded =
+            decode_wallet_transaction(&output.wallet_hex).expect("decode wallet transaction");
+        assert_eq!(decoded.version, KASPA_TX_VERSION_TOCCATA);
+        assert_eq!(
+            prefixed_hex(decoded.subnetwork_id.as_ref()),
+            "0x97b1000000000000000000000000000000000000"
+        );
+        assert!(decoded.inputs.iter().all(|input| {
+            input.compute_commit.compute_budget() == Some(KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT)
+        }));
+        let pst = PartiallySignedTransactionProto::decode(
+            decode_fixed_hex(&output.wallet_hex, "wallet hex").unwrap().as_slice(),
+        )
+        .expect("decode pst");
+        for input in &pst.tx.as_ref().expect("pst tx").inputs {
+            assert_eq!(input.sig_op_count, 0);
+            assert_eq!(input.compute_budget, KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT as u32);
+        }
         assert_eq!(output.manifest.locking_utxos[0].amount_kas.as_deref(), Some("3.00010000"));
         assert_eq!(output.manifest.exits[0].amount_kas.as_deref(), Some("3.00000000"));
         assert_eq!(output.manifest.fee_kas.as_deref(), Some("0.00010000"));
@@ -2049,6 +2332,25 @@ mod tests {
             .to_string()
             .contains("manifest mass preflight does not match transaction data")
         );
+
+        let mut tampered = output.manifest.clone();
+        tampered.protocol.lane_id = Some("97b20000".to_string());
+        tampered.protocol.subnetwork_id =
+            Some("0x97b2000000000000000000000000000000000000".to_string());
+        assert!(
+            verify_unsigned_exit(
+                &tampered,
+                &output.wallet_hex,
+                VerifyExitOptions {
+                    allow_signatures: false,
+                    require_fully_signed: false,
+                    allow_non_igra_lock_script_for_testing: false,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("transaction subnetwork id mismatch")
+        );
     }
 
     #[test]
@@ -2058,6 +2360,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2070,7 +2373,6 @@ mod tests {
             decode_fixed_hex(&output.wallet_hex, "wallet hex").unwrap().as_slice(),
         )
         .expect("decode pst");
-        pst.tx.as_mut().unwrap().inputs[0].sig_op_count = 3;
         pst.partially_signed_inputs[0].pub_key_signature_pairs[0].signature = vec![1; 64];
         let signed_hex = hex::encode(pst.encode_to_vec());
 
@@ -2111,6 +2413,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2151,6 +2454,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2233,6 +2537,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(1),
                 max_nonce: Some(1),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2257,6 +2562,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(1),
                 max_nonce: Some(1),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2273,6 +2579,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2297,6 +2604,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2334,6 +2642,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2344,8 +2653,12 @@ mod tests {
 
         let tx = decode_wallet_transaction(&output.wallet_hex).expect("decode wallet tx");
 
+        assert_eq!(tx.version, KASPA_TX_VERSION_TOCCATA);
         assert_eq!(tx.id().to_string(), output.manifest.protocol.kaspa_tx_id);
         assert_eq!(tx.inputs.len(), output.manifest.locking_utxos.len());
+        assert!(tx.inputs.iter().all(|input| {
+            input.compute_commit.compute_budget() == Some(KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT)
+        }));
         assert_eq!(
             tx.outputs.len(),
             output.manifest.exits.len() + usize::from(output.manifest.change.is_some())
@@ -2360,6 +2673,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(30),
                 max_nonce: Some(1_000_000),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2378,6 +2692,10 @@ mod tests {
             partial_input.pub_key_signature_pairs[1].signature =
                 vec![2_u8; KASPA_SIGNATURE_SIZE_WITH_HASH_TYPE];
         }
+        for input in &mut pst.tx.as_mut().expect("pst tx").inputs {
+            input.sig_op_count = 3;
+            input.compute_budget = 0;
+        }
         let wallet_hex = hex::encode(pst.encode_to_vec());
 
         let tx = materialize_signed_wallet_transaction(&output.manifest, &wallet_hex)
@@ -2385,7 +2703,9 @@ mod tests {
 
         assert_eq!(tx.id().to_string(), output.manifest.protocol.kaspa_tx_id);
         assert!(tx.inputs.iter().all(|input| !input.signature_script.is_empty()));
-        assert!(tx.inputs.iter().all(|input| input.sig_op_count == 3));
+        assert!(tx.inputs.iter().all(|input| {
+            input.compute_commit.compute_budget() == Some(KASPA_TOCCATA_COMPUTE_BUDGET_PER_INPUT)
+        }));
     }
 
     #[test]
@@ -2447,6 +2767,7 @@ mod tests {
                 BuildExitOptions {
                     network: "mainnet".to_string(),
                     tx_id_prefix: "00".to_string(),
+                    lane_id: "97b10000".to_string(),
                     mining_timeout: Duration::from_secs(1),
                     max_nonce: Some(1),
                     allow_non_igra_lock_script_for_testing: false,
@@ -2470,6 +2791,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(1),
                 max_nonce: Some(1),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2491,6 +2813,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(1),
                 max_nonce: Some(1_000_000),
                 allow_non_igra_lock_script_for_testing: true,
@@ -2533,6 +2856,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(1),
                 max_nonce: Some(1),
                 allow_non_igra_lock_script_for_testing: false,
@@ -2550,6 +2874,7 @@ mod tests {
             BuildExitOptions {
                 network: "mainnet".to_string(),
                 tx_id_prefix: "00".to_string(),
+                lane_id: "97b10000".to_string(),
                 mining_timeout: Duration::from_secs(1),
                 max_nonce: Some(1),
                 allow_non_igra_lock_script_for_testing: false,

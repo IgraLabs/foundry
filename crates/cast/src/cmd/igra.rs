@@ -48,6 +48,10 @@ pub struct BuildExitArgs {
     #[arg(long)]
     pub tx_id_prefix: String,
 
+    /// IGRA Kaspa lane id/subnetwork id. Use 97b10000 for the canonical IGRA lane.
+    #[arg(long)]
+    pub lane_id: String,
+
     /// JSON input describing KAS locking UTXOs, exit messages, recipients, fee, and multisig keys.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub input: PathBuf,
@@ -206,6 +210,7 @@ impl BuildExitArgs {
             BuildExitOptions {
                 network: self.network,
                 tx_id_prefix: self.tx_id_prefix,
+                lane_id: self.lane_id,
                 mining_timeout: Duration::from_secs(self.mining_timeout_secs),
                 max_nonce: self.max_nonce,
                 allow_non_igra_lock_script_for_testing: self.allow_non_igra_lock_script_for_testing,

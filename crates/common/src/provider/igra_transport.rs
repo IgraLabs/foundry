@@ -27,7 +27,7 @@ use kaspa_bip32::{
 };
 use kaspa_consensus_core::{
     config::params::Params as KaspaParams,
-    mass::MassCalculator as KaspaMassCalculator,
+    mass::{Mass as KaspaMass, MassCalculator as KaspaMassCalculator},
     network::NetworkType as KaspaNetworkType,
     sign::{sign_with_multiple_v2 as kaspa_sign_with_multiple_v2, verify as kaspa_verify},
     subnets::SubnetworkId,
@@ -1252,6 +1252,7 @@ fn mine_and_build_signed_payload_transaction(
             script_public_key: entry.utxo_entry.script_public_key.clone(),
             block_daa_score: entry.utxo_entry.block_daa_score,
             is_coinbase: entry.utxo_entry.is_coinbase,
+            covenant_id: entry.utxo_entry.covenant_id,
         })
         .collect::<Vec<_>>();
 
@@ -1266,14 +1267,16 @@ fn mine_and_build_signed_payload_transaction(
         return Err("IGRA submit error: mined Kaspa txid prefix changed after signing; refusing to broadcast".to_string());
     }
 
-    let mass_calculator =
-        KaspaMassCalculator::new_with_consensus_params(&KaspaParams::from(network_type));
+    let consensus_params = KaspaParams::from(network_type);
+    let mass_calculator = KaspaMassCalculator::new_with_consensus_params(&consensus_params);
+    let mass_cofactors = consensus_params.mempool_block_mass_cofactors().after();
     let non_contextual = mass_calculator.calc_non_contextual_masses(&signed.tx);
     let contextual =
         mass_calculator.calc_contextual_masses(&signed.as_verifiable()).ok_or_else(|| {
             "IGRA submit error: failed to calculate Kaspa tx storage mass".to_string()
         })?;
-    let mass = contextual.max(non_contextual);
+    let storage_mass = contextual.storage_mass;
+    let mass = KaspaMass::new(non_contextual, contextual).normalized_max(&mass_cofactors);
     if mass > MAX_STANDARD_KASPA_TX_MASS {
         return Err(format!(
             "IGRA submit error: Kaspa transaction mass {mass} exceeds standard limit {MAX_STANDARD_KASPA_TX_MASS}"
@@ -1281,7 +1284,7 @@ fn mine_and_build_signed_payload_transaction(
     }
 
     let tx = signed.tx;
-    tx.set_mass(mass);
+    tx.set_storage_mass(storage_mass);
     Ok((nonce as u64, tx))
 }
 
@@ -1294,11 +1297,7 @@ fn is_mature_kaspa_utxo(
         return true;
     }
 
-    current_daa_score
-        >= entry
-            .utxo_entry
-            .block_daa_score
-            .saturating_add(coinbase_maturity_daa)
+    current_daa_score >= entry.utxo_entry.block_daa_score.saturating_add(coinbase_maturity_daa)
 }
 
 fn now_ms() -> u64 {
@@ -1418,6 +1417,7 @@ mod tests {
                     ScriptPublicKey::default(),
                     block_daa_score,
                     is_coinbase,
+                    None,
                 ),
             }
         }
@@ -1425,11 +1425,7 @@ mod tests {
         let current_daa = 2_000;
         let coinbase_maturity_daa = 1_000;
 
-        assert!(is_mature_kaspa_utxo(
-            &entry(false, 1_999),
-            current_daa,
-            coinbase_maturity_daa
-        ));
+        assert!(is_mature_kaspa_utxo(&entry(false, 1_999), current_daa, coinbase_maturity_daa));
         assert!(!is_mature_kaspa_utxo(
             &entry(true, current_daa - coinbase_maturity_daa + 1),
             current_daa,
