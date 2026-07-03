@@ -425,8 +425,10 @@ impl SignExitArgs {
         if let Some(path) = self.keys_file.as_ref() {
             let keys_json = fs::read_to_string(path)?;
             let password = self.resolve_keys_file_password()?;
-            go_kaspawallet_mnemonics
-                .extend(decrypt_go_kaspawallet_mnemonics(&keys_json, password.as_bytes())?);
+            let decrypted_mnemonics =
+                decrypt_go_kaspawallet_mnemonics(&keys_json, password.as_bytes())?;
+            warn_go_kaspawallet_mnemonic_whitespace(&decrypted_mnemonics)?;
+            go_kaspawallet_mnemonics.extend(decrypted_mnemonics);
         }
         if let Some(path) = self.kprv_file.as_ref() {
             let kprv = fs::read_to_string(path)?;
@@ -590,6 +592,62 @@ fn decrypt_go_kaspawallet_mnemonic(
     String::from_utf8(plaintext).wrap_err("decrypted Go kaspawallet mnemonic is not UTF-8")
 }
 
+fn warn_go_kaspawallet_mnemonic_whitespace(mnemonics: &[String]) -> Result<()> {
+    for (index, mnemonic) in mnemonics.iter().enumerate() {
+        let issues = go_kaspawallet_mnemonic_whitespace_issues(mnemonic);
+        if issues.is_empty() {
+            continue;
+        }
+
+        foundry_common::sh_warn!(
+            "Go kaspawallet keys.json mnemonic #{} contains non-canonical whitespace at {}; old Go wallet derives keys from the exact encrypted text, so cast will preserve it",
+            index + 1,
+            issues.join(", ")
+        )?;
+    }
+
+    Ok(())
+}
+
+fn go_kaspawallet_mnemonic_whitespace_issues(mnemonic: &str) -> Vec<String> {
+    let mut issues = Vec::new();
+    let mut word_index = 0usize;
+    let mut in_word = false;
+    let mut pending_separator = String::new();
+
+    for ch in mnemonic.chars() {
+        if ch.is_whitespace() {
+            pending_separator.push(ch);
+            in_word = false;
+            continue;
+        }
+
+        if !in_word {
+            word_index += 1;
+            if word_index == 1 {
+                if !pending_separator.is_empty() {
+                    issues.push("before word #1".to_string());
+                }
+            } else if pending_separator != " " {
+                issues.push(format!("before word #{word_index}"));
+            }
+
+            pending_separator.clear();
+            in_word = true;
+        }
+    }
+
+    if !pending_separator.is_empty() {
+        if word_index == 0 {
+            issues.push("before word #1".to_string());
+        } else {
+            issues.push(format!("after word #{word_index}"));
+        }
+    }
+
+    issues
+}
+
 impl InspectExitArgs {
     fn run(self) -> Result<()> {
         let wallet_hex = fs::read_to_string(&self.hex)?;
@@ -740,5 +798,22 @@ mod tests {
         let mnemonics =
             decrypt_go_kaspawallet_mnemonics(&keys_json.to_string(), TEST_PASSWORD).unwrap();
         assert_eq!(mnemonics, vec![TEST_MNEMONIC]);
+    }
+
+    #[test]
+    fn detects_go_kaspawallet_mnemonic_whitespace_issues_without_words() {
+        let issues = go_kaspawallet_mnemonic_whitespace_issues(
+            " abandon abandon  abandon\tabandon\nabandon abandon ",
+        );
+        assert_eq!(
+            issues,
+            vec![
+                "before word #1",
+                "before word #3",
+                "before word #4",
+                "before word #5",
+                "after word #6"
+            ]
+        );
     }
 }
