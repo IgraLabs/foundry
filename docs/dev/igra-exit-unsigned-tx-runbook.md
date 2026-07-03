@@ -20,7 +20,7 @@ Every signer should receive both files and verify them before signing.
 From the Foundry repository:
 
 ```bash
-git switch roman/igra-exit-lane-id
+git switch igra-canonical-exit-toccata
 cargo build -p cast
 ```
 

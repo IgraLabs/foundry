@@ -21,8 +21,8 @@ These decisions are locked for v1 and must be implemented as written.
 5. Unsupported in v1: EIP-4844 (3), EIP-7702 and unknown future typed envelopes.
 6. Payload nonce is a per-transaction mining nonce (4 bytes), independent from L2 account nonce.
 7. Kaswallet and rusty-kaspa are used as in-process dependencies (no user daemon), pinned to commit SHA from:
-   - `IgraLabs/kaswallet` branch `roman/utxo-perf-opt`
-   - `IgraLabs/rusty-kaspa` branch `roman/devel`
+   - `IgraLabs/kaswallet` branch `<kaswallet-utxo-perf-branch>`
+   - `IgraLabs/rusty-kaspa` branch `<rusty-kaspa-dev-branch>`
 8. Transaction state and mapping are persisted in SQLite (`WAL`), with cross-process locking.
 9. Network safety is fail-fast: EL chain ID and Kaspa network must match selected profile.
 10. No dedicated cancellation command in v1; replacement is standard Ethereum nonce replacement semantics.

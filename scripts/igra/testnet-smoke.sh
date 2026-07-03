@@ -27,7 +27,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
 fi
 
 IGRA_EL_RPC_URL="${IGRA_EL_RPC_URL:-https://galleon-testnet.igralabs.com:8545}"
-IGRA_KASPA_RPC_URL="${IGRA_KASPA_RPC_URL:-grpc://stage-roman.igralabs.com:16210}"
+IGRA_KASPA_RPC_URL="${IGRA_KASPA_RPC_URL:-grpc://kaspa-testnet-rpc.example.com:16210}"
 IGRA_PRIVATE_KEY="${IGRA_PRIVATE_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 IGRA_PRIVATE_KEY_KASPA="${IGRA_PRIVATE_KEY_KASPA:-}"
 IGRA_MNEMONIC_KASPA="${IGRA_MNEMONIC_KASPA:-}"

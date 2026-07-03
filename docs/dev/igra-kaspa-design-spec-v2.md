@@ -147,7 +147,7 @@ burst = 40
 `testnet-10` defaults:
 
 1. `el_rpc_url = https://galleon-testnet.igralabs.com:8545`
-2. `kaspa_rpc_url = grpc://stage-roman.igralabs.com:16210`
+2. `kaspa_rpc_url = grpc://kaspa-testnet-rpc.example.com:16210`
 3. `kaspa_network = testnet-10`
 4. `tx_id_prefix = 97b4` (Viaduct Transaction ID Prefix)
 4. `el_confirmations = 1`
@@ -217,8 +217,8 @@ Required in IGRA write path:
 
 Use branches only to select provenance, then pin to commit SHA immediately:
 
-1. `IgraLabs/kaswallet`, branch `roman/utxo-perf-opt`
-2. `IgraLabs/rusty-kaspa`, branch `roman/devel`
+1. `IgraLabs/kaswallet`, branch `<kaswallet-utxo-perf-branch>`
+2. `IgraLabs/rusty-kaspa`, branch `<rusty-kaspa-dev-branch>`
 
 Rules:
 

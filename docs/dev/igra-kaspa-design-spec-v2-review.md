@@ -39,8 +39,8 @@ The v2 design spec provides clear architectural vision for in-process kaswallet 
 - Use GitHub branches (not pinned SHAs in v2):
 + Use GitHub branches to select initial commit, then pin to SHA:
 
-1. `IgraLabs/kaswallet`, branch `roman/utxo-perf-opt`
-2. `IgraLabs/rusty-kaspa`, branch `roman/devel`
+1. `IgraLabs/kaswallet`, branch `<kaswallet-utxo-perf-branch>`
+2. `IgraLabs/rusty-kaspa`, branch `<rusty-kaspa-dev-branch>`
 
 - Track branch head in this integration phase; add CI guard to record resolved commit in build logs.
 + Pin to commit SHA immediately in Cargo.toml (not floating branch refs).
@@ -640,7 +640,7 @@ Only testnet-10 defaults defined.
 
 ### testnet-10
 - `el_rpc_url = https://galleon-testnet.igralabs.com:8545`
-- `kaspa_rpc_url = grpc://stage-roman.igralabs.com:16210`
+- `kaspa_rpc_url = grpc://kaspa-testnet-rpc.example.com:16210`
 - `kaspa_network = testnet-10`
 - `el_confirmations = 1`
 

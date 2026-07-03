@@ -224,7 +224,7 @@ if provided_fee < min_fee {
 
 **Hypothesis**: The indexer is watching a different Kaspa network than where you're broadcasting.
 
-**Your Kaspa RPC**: `grpc://stage-roman.igralabs.com:16210`
+**Your Kaspa RPC**: `grpc://kaspa-testnet-rpc.example.com:16210`
 **Indexer watching**: ❓
 
 **How to Verify**:
@@ -267,7 +267,7 @@ Our transaction uses: ~2 Gwei (default foundry gas price)
 ```
 Q: What Kaspa RPC URL is your Viaduct instance connected to?
 
-We're broadcasting to: grpc://stage-roman.igralabs.com:16210
+We're broadcasting to: grpc://kaspa-testnet-rpc.example.com:16210
 These must match for the indexer to see our transactions.
 ```
 
@@ -430,7 +430,7 @@ kaspad --atan-transaction-id-prefix=97b1 ...
 
 ```
 What is the --atan-transaction-id-prefix value on your kaspad instance
-running at grpc://stage-roman.igralabs.com:16210?
+running at grpc://kaspa-testnet-rpc.example.com:16210?
 
 Our Foundry implementation mines prefix: 97b1
 Our Kaspa TX ID: 97b182fa1710c23ea18f468d0c41500fa074ad1f4a9ce421f9ddbf5def1920bd

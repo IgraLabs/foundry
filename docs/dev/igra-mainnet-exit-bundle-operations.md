@@ -70,7 +70,7 @@ Kaspa node / wallet:
 
 Optional staging node context observed during investigation:
 
-- Host mentioned: `stage-roman.igralabs.com`
+- Host mentioned: `kaspa-testnet-rpc.example.com`
 - Public `16110` was refused during checks.
 - Public `26210` answered but did not expose gRPC reflection.
 - This was not required for the successful production verification flow; public Kaspa explorer API plus `kaspawallet` broadcast was used.

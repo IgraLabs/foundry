@@ -8,8 +8,7 @@ fn main() {
     // Usage:
     //   cargo run -p foundry-common --bin kaspa_utxos -- <grpc_url> <addr1> [addr2...]
     let mut args = std::env::args().skip(1);
-    let rpc_url =
-        args.next().unwrap_or_else(|| "grpc://stage-roman.igralabs.com:16210".to_string());
+    let rpc_url = args.next().unwrap_or_else(|| "grpc://127.0.0.1:16210".to_string());
     let addrs: Vec<String> = args.collect();
     if addrs.is_empty() {
         eprintln!("usage: kaspa_utxos <grpc_url> <addr1> [addr2...]");
