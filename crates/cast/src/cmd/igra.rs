@@ -415,6 +415,7 @@ impl SignExitArgs {
         let manifest = serde_json::from_str(&manifest_json)?;
         let wallet_hex = fs::read_to_string(&self.hex)?;
         let mut mnemonics = Vec::new();
+        let mut go_kaspawallet_mnemonics = Vec::new();
         let mut master_private_keys = Vec::new();
 
         if let Some(path) = self.mnemonic_file.as_ref() {
@@ -424,7 +425,8 @@ impl SignExitArgs {
         if let Some(path) = self.keys_file.as_ref() {
             let keys_json = fs::read_to_string(path)?;
             let password = self.resolve_keys_file_password()?;
-            mnemonics.extend(decrypt_go_kaspawallet_mnemonics(&keys_json, password.as_bytes())?);
+            go_kaspawallet_mnemonics
+                .extend(decrypt_go_kaspawallet_mnemonics(&keys_json, password.as_bytes())?);
         }
         if let Some(path) = self.kprv_file.as_ref() {
             let kprv = fs::read_to_string(path)?;
@@ -436,6 +438,7 @@ impl SignExitArgs {
             &wallet_hex,
             SignExitOptions {
                 mnemonics,
+                go_kaspawallet_mnemonics,
                 master_private_keys,
                 clear_existing_signatures: self.clear_existing_signatures,
                 allow_non_igra_lock_script_for_testing: false,

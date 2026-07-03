@@ -49,7 +49,7 @@ use kaspa_txscript::{
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use std::{str::FromStr, time::Duration};
 
 pub const IGRA_PROTOCOL_VERSION: u8 = 0x9;
@@ -251,6 +251,7 @@ pub struct BuildExitOutput {
 #[derive(Clone, Debug, Default)]
 pub struct SignExitOptions {
     pub mnemonics: Vec<String>,
+    pub go_kaspawallet_mnemonics: Vec<String>,
     pub master_private_keys: Vec<String>,
     pub clear_existing_signatures: bool,
     pub allow_non_igra_lock_script_for_testing: bool,
@@ -1065,6 +1066,7 @@ pub fn sign_exit_wallet_transaction(
     let input = build_input_from_manifest(manifest);
     let populated_tx = KaspaPopulatedTransaction::new(&tx, input_utxo_entries(&input)?);
     let mut signed_pairs_added = 0usize;
+    let mut already_filled_pairs_matched = 0usize;
 
     for (input_index, partial_input) in pst.partially_signed_inputs.iter_mut().enumerate() {
         let derivation_path =
@@ -1073,6 +1075,11 @@ pub fn sign_exit_wallet_transaction(
             })?;
         for pair in &mut partial_input.pub_key_signature_pairs {
             if !pair.signature.is_empty() {
+                if matching_signer_child_key(&signer_keys, &derivation_path, output_prefix, pair)?
+                    .is_some()
+                {
+                    already_filled_pairs_matched += 1;
+                }
                 continue;
             }
             let Some(child_key) =
@@ -1087,6 +1094,11 @@ pub fn sign_exit_wallet_transaction(
     }
 
     if signed_pairs_added == 0 {
+        if already_filled_pairs_matched > 0 {
+            bail!(
+                "no signatures were added; provided signer keys match only already-filled PST public keys"
+            );
+        }
         bail!(
             "no signatures were added; provided signer keys did not match any empty PST public key"
         );
@@ -1116,7 +1128,11 @@ pub fn sign_exit_wallet_transaction(
 fn exit_signer_master_private_keys(
     options: &SignExitOptions,
 ) -> Result<Vec<KaspaExtendedPrivateKey<KaspaSecretKey>>> {
-    let mut keys = Vec::with_capacity(options.mnemonics.len() + options.master_private_keys.len());
+    let mut keys = Vec::with_capacity(
+        options.mnemonics.len()
+            + options.go_kaspawallet_mnemonics.len()
+            + options.master_private_keys.len(),
+    );
     let master_path = KASPAWALLET_MULTISIG_MASTER_DERIVATION_PATH
         .parse::<KaspaDerivationPath>()
         .expect("hard-coded kaspawallet multisig master path is valid");
@@ -1130,6 +1146,10 @@ fn exit_signer_master_private_keys(
         keys.push(master);
     }
 
+    for mnemonic in &options.go_kaspawallet_mnemonics {
+        keys.push(go_kaspawallet_master_private_key_from_mnemonic(mnemonic, &master_path)?);
+    }
+
     for key in &options.master_private_keys {
         keys.push(
             key.trim()
@@ -1139,6 +1159,31 @@ fn exit_signer_master_private_keys(
     }
 
     Ok(keys)
+}
+
+fn go_kaspawallet_master_private_key_from_mnemonic(
+    mnemonic: &str,
+    master_path: &KaspaDerivationPath,
+) -> Result<KaspaExtendedPrivateKey<KaspaSecretKey>> {
+    let canonical_mnemonic = mnemonic.split_whitespace().collect::<Vec<_>>().join(" ");
+    KaspaMnemonic::new(&canonical_mnemonic, KaspaLanguage::English)
+        .wrap_err("invalid Go kaspawallet mnemonic")?;
+
+    let seed = go_bip39_seed(mnemonic, "");
+    KaspaExtendedPrivateKey::<KaspaSecretKey>::new(seed)?
+        .derive_path(master_path)
+        .wrap_err("failed to derive Go kaspawallet multisig master key from mnemonic")
+}
+
+fn go_bip39_seed(mnemonic: &str, password: &str) -> [u8; 64] {
+    let mut seed = [0u8; 64];
+    pbkdf2::pbkdf2_hmac::<Sha512>(
+        mnemonic.as_bytes(),
+        format!("mnemonic{password}").as_bytes(),
+        2048,
+        &mut seed,
+    );
+    seed
 }
 
 fn matching_signer_child_key(
@@ -3432,6 +3477,22 @@ mod tests {
         assert_eq!(signed_1.signed_inputs, 1);
         assert!(!signed_1.fully_signed);
 
+        let already_signed_err = sign_exit_wallet_transaction(
+            &output.manifest,
+            &signed_1.wallet_hex,
+            SignExitOptions {
+                master_private_keys: vec![
+                    "kprv5y2qurMHCsXYqr9oKku3Ry75DcZgdraE3SFPPh1SKp4qKtr61qQeNypYTGztwUUiVauHWmjxaQXeUKHxj4QCuDG4ULpZHkvBoH9XX19ynXm".to_string(),
+                ],
+                allow_non_igra_lock_script_for_testing: true,
+                ..SignExitOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            already_signed_err.to_string().contains("match only already-filled PST public keys")
+        );
+
         let signed_2 = sign_exit_wallet_transaction(
             &output.manifest,
             &signed_1.wallet_hex,
@@ -3457,6 +3518,35 @@ mod tests {
             },
         )
         .expect("fully signed tx verifies scripts");
+    }
+
+    #[test]
+    fn go_kaspawallet_mnemonic_derivation_preserves_import_whitespace() {
+        let mnemonic = "cruise village slam canyon monster scrub myself farm add riot large board sentence outer nice coast raven bird scheme undo december blanket trim hero";
+        let go_spaced_mnemonic = "cruise  village slam canyon monster scrub myself farm add riot large board sentence outer nice coast raven bird scheme undo december blanket trim hero";
+        let master_path =
+            KASPAWALLET_MULTISIG_MASTER_DERIVATION_PATH.parse::<KaspaDerivationPath>().unwrap();
+
+        let canonical_go_key =
+            go_kaspawallet_master_private_key_from_mnemonic(mnemonic, &master_path).unwrap();
+        let canonical_rust_key = exit_signer_master_private_keys(&SignExitOptions {
+            mnemonics: vec![mnemonic.to_string()],
+            ..SignExitOptions::default()
+        })
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            canonical_go_key.public_key().to_string(Some(KaspaBip32Prefix::KPUB)),
+            canonical_rust_key.public_key().to_string(Some(KaspaBip32Prefix::KPUB))
+        );
+
+        let spaced_go_key =
+            go_kaspawallet_master_private_key_from_mnemonic(go_spaced_mnemonic, &master_path)
+                .unwrap();
+        assert_ne!(
+            spaced_go_key.public_key().to_string(Some(KaspaBip32Prefix::KPUB)),
+            canonical_rust_key.public_key().to_string(Some(KaspaBip32Prefix::KPUB))
+        );
     }
 
     #[test]

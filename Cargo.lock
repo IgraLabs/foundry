@@ -5300,6 +5300,7 @@ dependencies = [
  "kaspa-txscript",
  "num-format",
  "path-slash",
+ "pbkdf2 0.12.2",
  "prost 0.13.5",
  "regex",
  "reqwest",
