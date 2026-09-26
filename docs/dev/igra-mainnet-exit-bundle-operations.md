@@ -510,15 +510,29 @@ Expected:
 }
 ```
 
+`canonicalization` is `json-c14n-sorted-keys-no-whitespace-utf8` for
+bundle-identity `payloadVersion` 1 and 2, and `rfc8785-jcs-utf8` for
+`payloadVersion` 3.
+
 This verifier applies the producer-side rules:
 
-1. start from `manifest.json`
+1. start from `manifest.json`, parsed strictly: duplicate object keys, keys
+   starting with `$serde_json::private::`, and numbers that are not 64-bit
+   integers are rejected
 2. remove top-level `signature`
 3. keep `bundleIntegral`, but remove `bundleIntegral.value`
-4. canonicalize JSON with lexicographically sorted object keys, preserved array order, and no extra whitespace
+4. canonicalize JSON with the canonicalization selected by
+   `bundleIdentity.payloadVersion`:
+   - `payloadVersion` 1 and 2, or no `bundleIdentity`: lexicographically sorted
+     object keys, preserved array order, and no extra whitespace
+   - `payloadVersion` 3: RFC 8785 JCS, with object keys ordered by UTF-16 code
+     units; numbers must be integers with `|n| <= 2^53 - 1`
 5. UTF-8 encode that canonical JSON
 6. compute SHA-256
 7. compare against `manifest.bundleIntegral.value`
+
+An unknown `payloadVersion`, or a `bundleIntegral.canonicalization` that does
+not match the one its `payloadVersion` selects, is rejected.
 
 Save the machine-readable result:
 

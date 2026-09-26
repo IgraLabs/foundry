@@ -1,15 +1,24 @@
 use eyre::{Result, bail, eyre};
-use serde::Serialize;
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, MapAccess, SeqAccess, Visitor},
+};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
+use std::{collections::HashSet, fmt};
 
-/// Canonicalization of bundle-identity `payloadVersion` 1 and 2 (legacy bundles).
+/// Canonicalization of bundle-identity `payloadVersion` 1 and 2, and of manifests without
+/// `bundleIdentity` (legacy bundles).
 const LEGACY_CANONICALIZATION: &str = "json-c14n-sorted-keys-no-whitespace-utf8";
 /// Canonicalization of bundle-identity `payloadVersion` 3.
 const JCS_CANONICALIZATION: &str = "rfc8785-jcs-utf8";
 /// `Number.MAX_SAFE_INTEGER`: the largest integer whose ES6 serialization, which RFC 8785
 /// mandates, is guaranteed to be its plain decimal form.
 const JCS_MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+/// Prefix of the object keys that serde_json reserves for its `arbitrary_precision` and
+/// `raw_value` features, both enabled in this workspace. An object with such a key is read as a
+/// number or as embedded JSON, not as an object.
+const SERDE_JSON_RESERVED_KEY_PREFIX: &str = "$serde_json::private::";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct VerifyBundleIntegralReport {
@@ -19,6 +28,19 @@ pub struct VerifyBundleIntegralReport {
     pub expected_value: String,
     pub computed_value: String,
     pub matches: bool,
+}
+
+/// Parses a bundle manifest for [`verify_bundle_integral`], refusing JSON that other parsers
+/// could read differently:
+///
+/// - duplicate object keys, of which serde_json keeps the last and other parsers may keep the
+///   first. RFC 8785 also requires I-JSON input (RFC 7493), which forbids them;
+/// - keys starting with `$serde_json::private::`, which serde_json does not read as objects;
+/// - numbers that are not 64-bit integers, because serde_json passes them through the same reserved
+///   key. Manifests only carry integers.
+pub fn parse_bundle_manifest(json: &str) -> Result<Value> {
+    serde_json::from_str::<StrictJson>(json)?;
+    Ok(serde_json::from_str(json)?)
 }
 
 pub fn verify_bundle_integral(manifest: &Value) -> Result<VerifyBundleIntegralReport> {
@@ -76,25 +98,32 @@ pub fn verify_bundle_integral(manifest: &Value) -> Result<VerifyBundleIntegralRe
     })
 }
 
-/// `payloadVersion` 1 and 2 use the legacy canonicalization and `payloadVersion` 3 uses RFC 8785
-/// JCS; a manifest never mixes the two.
+/// The bundle-identity `payloadVersion` selects the canonicalization: 1 and 2 use the legacy
+/// one and 3 uses RFC 8785 JCS, so a manifest never mixes the two. Any other `payloadVersion` is
+/// refused. Manifests without `bundleIdentity` predate it and use the legacy canonicalization.
 fn check_canonicalization_matches_payload_version(
     root: &Map<String, Value>,
     canonicalization: &str,
 ) -> Result<()> {
-    let payload_version = root
-        .get("bundleIdentity")
-        .and_then(|identity| identity.get("payloadVersion"))
-        .and_then(Value::as_u64);
-
-    if canonicalization == JCS_CANONICALIZATION && payload_version != Some(3) {
+    let expected = match root.get("bundleIdentity") {
+        None => LEGACY_CANONICALIZATION,
+        Some(identity) => {
+            let payload_version = identity
+                .as_object()
+                .ok_or_else(|| eyre!("manifest bundleIdentity must be a JSON object"))?
+                .get("payloadVersion")
+                .unwrap_or(&Value::Null);
+            match payload_version.as_u64() {
+                Some(1 | 2) => LEGACY_CANONICALIZATION,
+                Some(3) => JCS_CANONICALIZATION,
+                _ => bail!("unsupported bundleIdentity.payloadVersion: {payload_version}"),
+            }
+        }
+    };
+    if canonicalization != expected {
         bail!(
-            "{JCS_CANONICALIZATION} requires bundleIdentity.payloadVersion 3, found {payload_version:?}"
-        );
-    }
-    if canonicalization != JCS_CANONICALIZATION && payload_version == Some(3) {
-        bail!(
-            "bundleIdentity.payloadVersion 3 requires {JCS_CANONICALIZATION}, found {canonicalization}"
+            "bundleIntegral.canonicalization {canonicalization} does not match \
+             bundleIdentity.payloadVersion, which requires {expected}"
         );
     }
     Ok(())
@@ -214,10 +243,10 @@ fn jcs_number(number: &Number) -> Result<String> {
         if value <= JCS_MAX_SAFE_INTEGER {
             return Ok(value.to_string());
         }
-    } else if let Some(value) = number.as_i64() {
-        if value.unsigned_abs() <= JCS_MAX_SAFE_INTEGER {
-            return Ok(value.to_string());
-        }
+    } else if let Some(value) = number.as_i64()
+        && value.unsigned_abs() <= JCS_MAX_SAFE_INTEGER
+    {
+        return Ok(value.to_string());
     }
     bail!(
         "{JCS_CANONICALIZATION}: number {number} is outside the supported exact-integer subset \
@@ -225,9 +254,71 @@ fn jcs_number(number: &Number) -> Result<String> {
     )
 }
 
+/// Validation-only view of a JSON document, see [`parse_bundle_manifest`].
+struct StrictJson;
+
+impl<'de> Deserialize<'de> for StrictJson {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = StrictJson;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JSON with unique keys and only 64-bit integer numbers")
+    }
+
+    fn visit_unit<E>(self) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<StrictJson, E> {
+        Ok(StrictJson)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<StrictJson, A::Error> {
+        while seq.next_element::<StrictJson>()?.is_some() {}
+        Ok(StrictJson)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<StrictJson, A::Error> {
+        let mut keys = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if key.starts_with(SERDE_JSON_RESERVED_KEY_PREFIX) {
+                return Err(de::Error::custom(format_args!(
+                    "unsupported number or reserved key {key:?}: only 64-bit integers are \
+                     accepted, and keys must not start with {SERDE_JSON_RESERVED_KEY_PREFIX:?}"
+                )));
+            }
+            if keys.contains(&key) {
+                return Err(de::Error::custom(format_args!("duplicate object key {key:?}")));
+            }
+            map.next_value::<StrictJson>()?;
+            keys.insert(key);
+        }
+        Ok(StrictJson)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{canonical_json_string, jcs_string, verify_bundle_integral};
+    use super::{canonical_json_string, jcs_string, parse_bundle_manifest, verify_bundle_integral};
     use serde_json::json;
 
     // Expected values in the rfc8785-jcs-utf8 tests below were produced by an
@@ -350,6 +441,93 @@ mod tests {
         let mut manifest = legacy_manifest();
         manifest["bundleIntegral"]["canonicalization"] = json!("rfc8785-something-else");
         assert!(verify_bundle_integral(&manifest).is_err());
+    }
+
+    #[test]
+    fn parse_bundle_manifest_round_trips_manifests() {
+        for manifest in [jcs_manifest(), legacy_manifest()] {
+            assert_eq!(parse_bundle_manifest(&manifest.to_string()).expect("parse"), manifest);
+        }
+    }
+
+    #[test]
+    fn parse_bundle_manifest_rejects_duplicate_keys() {
+        for json in [
+            r#"{"a":1,"a":2}"#,
+            r#"{"files":[{"path":"a","path":"b"}]}"#,
+            r#"{"a":{"b":1},"c":{"d":{"e":1,"e":1}}}"#,
+            r#"{"a":1,"\u0061":2}"#,
+        ] {
+            let err = parse_bundle_manifest(json).expect_err(json);
+            assert!(err.to_string().contains("duplicate object key"), "{json}: {err}");
+        }
+        // The same key in different objects is not a duplicate.
+        assert!(
+            parse_bundle_manifest(r#"{"a":{"k":1},"b":{"k":1},"k":[{"k":1},{"k":2}]}"#).is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_bundle_manifest_rejects_reserved_keys_and_non_integer_numbers() {
+        // With the arbitrary_precision and raw_value features enabled in this workspace,
+        // serde_json reads these objects as a number or as embedded JSON, not as objects.
+        // Numbers that are not 64-bit integers reach it through the same reserved key.
+        for json in [
+            r#"{"a":{"$serde_json::private::Number":"5"}}"#,
+            r#"{"a":{"\u0024serde_json::private::Number":"5"}}"#,
+            r#"{"a":{"$serde_json::private::RawValue":"{}"}}"#,
+            r#"{"a":1.5}"#,
+            r#"{"a":1e2}"#,
+            r#"{"a":18446744073709551616}"#,
+            r#"{"a":-9223372036854775809}"#,
+        ] {
+            let err = parse_bundle_manifest(json).expect_err(json);
+            assert!(
+                err.to_string().contains("unsupported number or reserved key"),
+                "{json}: {err}"
+            );
+        }
+
+        let manifest =
+            parse_bundle_manifest(r#"{"a":18446744073709551615,"b":-9223372036854775808}"#)
+                .expect("64-bit integers are accepted");
+        assert_eq!(manifest, json!({"a": u64::MAX, "b": i64::MIN}));
+    }
+
+    #[test]
+    fn unknown_payload_versions_are_rejected() {
+        for payload_version in [json!(0), json!(4), json!("2"), json!(2.0), json!(null)] {
+            let mut manifest = legacy_manifest();
+            manifest["bundleIdentity"] = json!({"payloadVersion": payload_version, "value": "00"});
+            assert!(verify_bundle_integral(&manifest).is_err(), "{payload_version}");
+        }
+
+        let mut manifest = legacy_manifest();
+        manifest["bundleIdentity"] = json!({"value": "00"});
+        assert!(verify_bundle_integral(&manifest).is_err());
+
+        let mut manifest = legacy_manifest();
+        manifest["bundleIdentity"] = json!("00");
+        assert!(verify_bundle_integral(&manifest).is_err());
+
+        // payloadVersion 1 selects the legacy canonicalization.
+        let mut manifest = legacy_manifest();
+        manifest["bundleIdentity"] = json!({"payloadVersion": 1, "value": "00"});
+        assert!(verify_bundle_integral(&manifest).is_ok());
+    }
+
+    #[test]
+    fn jcs_escapes_strings_like_rfc8785_example() {
+        // RFC 8785 section 3.2.2 example without its "numbers" member (non-integers are
+        // outside the supported subset), parsed from its escaped input text.
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"string": "\u20ac$\u000F\u000aA'\u0042\u0022\u005c\\\"\/", "literals": [null, true, false]}"#,
+        )
+        .expect("valid JSON");
+        assert_eq!(
+            jcs_string(&value).expect("jcs"),
+            r#"{"literals":[null,true,false],"string":"€$\u000f\nA'B\"\\\\\"/"}"#
+        );
     }
 
     #[test]
