@@ -5,7 +5,7 @@ use chacha20poly1305::{
 };
 use clap::{Args, Subcommand};
 use eyre::{Result, WrapErr, bail, eyre};
-use foundry_common::igra_bundle::verify_bundle_integral;
+use foundry_common::igra_bundle::{parse_bundle_manifest, verify_bundle_integral};
 use foundry_common::igra_exit::{
     BuildExitInput, BuildExitOptions, MultisigAddressInput, SignExitOptions, VerifyExitOptions,
     broadcast_wallet_transaction, build_unsigned_exit, check_multisig_derivation_path,
@@ -724,7 +724,7 @@ impl CheckMsigPathArgs {
 impl VerifyBundleIntegralArgs {
     fn run(self) -> Result<()> {
         let manifest_json = fs::read_to_string(&self.manifest_json)?;
-        let manifest: serde_json::Value = serde_json::from_str(&manifest_json)?;
+        let manifest = parse_bundle_manifest(&manifest_json)?;
         let report = verify_bundle_integral(&manifest)?;
         foundry_common::sh_println!("{}", serde_json::to_string_pretty(&report)?)?;
         if !report.matches {
